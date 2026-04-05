@@ -171,7 +171,10 @@ async def snapshot_worker(project_id: int) -> None:
         if project["height"]:
             kwargs["height"] = project["height"]
 
-        snapshot_bytes: bytes = await cam.get_snapshot(**kwargs)
+        raw = await cam.get_snapshot(**kwargs)
+        if raw is None:
+            raise RuntimeError("NVR returned empty snapshot")
+        snapshot_bytes: bytes = raw
         _reset_failures(project_id)
 
     except (httpx.ReadTimeout, httpx.ConnectError, Exception) as exc:
@@ -309,7 +312,7 @@ def _is_daylight(settings) -> bool:  # type: ignore[no-untyped-def]
     )
     now = datetime.now(UTC)
     try:
-        s = sun(city.observer, date=now.date(), tzinfo=now.tzinfo)
+        s = sun(city.observer, date=now.date(), tzinfo=settings.tz)
         return s["sunrise"] <= now <= s["sunset"]
     except Exception:
         # If astral fails (e.g. polar night), allow capture
@@ -451,6 +454,8 @@ async def run_historical_extraction(project_id: int) -> None:
 
         try:
             video_bytes = await cam.get_video(chunk_start, chunk_end)
+            if video_bytes is None:
+                raise RuntimeError("NVR returned empty video chunk")
             with open(tmp_path, "wb") as f:
                 f.write(video_bytes)
 

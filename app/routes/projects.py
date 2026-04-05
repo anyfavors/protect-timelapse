@@ -149,7 +149,8 @@ async def create_project(payload: ProjectCreate) -> dict:
                 "active" if payload.project_type == "live" else "active",
             ),
         )
-        project_id = cur.lastrowid
+        assert cur.lastrowid is not None
+        project_id: int = cur.lastrowid
         conn.commit()
 
     # Create frame / thumbnail directories on disk

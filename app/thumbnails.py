@@ -17,10 +17,10 @@ def generate_thumbnail(image_bytes: bytes) -> bytes:
     Resize *image_bytes* (JPEG) to THUMBNAIL_WIDTH px wide (aspect-ratio
     preserved) and return the result as a JPEG byte string.
     """
-    img = Image.open(io.BytesIO(image_bytes))
-    orig_w, orig_h = img.size
+    src = Image.open(io.BytesIO(image_bytes))
+    orig_w, orig_h = src.size
     new_h = int(orig_h * THUMBNAIL_WIDTH / orig_w)
-    img = img.resize((THUMBNAIL_WIDTH, new_h), Image.LANCZOS)
+    img = src.resize((THUMBNAIL_WIDTH, new_h), Image.Resampling.LANCZOS)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=THUMBNAIL_QUALITY, optimize=True)
@@ -35,7 +35,7 @@ def generate_thumbnail_from_pillow(img: Image.Image) -> bytes:
     """
     orig_w, orig_h = img.size
     new_h = int(orig_h * THUMBNAIL_WIDTH / orig_w)
-    resized = img.resize((THUMBNAIL_WIDTH, new_h), Image.LANCZOS)
+    resized = img.resize((THUMBNAIL_WIDTH, new_h), Image.Resampling.LANCZOS)
 
     buf = io.BytesIO()
     resized.save(buf, format="JPEG", quality=THUMBNAIL_QUALITY, optimize=True)

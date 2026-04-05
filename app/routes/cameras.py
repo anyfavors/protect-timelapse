@@ -47,9 +47,11 @@ async def camera_preview(camera_id: str) -> Response:
         raise HTTPException(status_code=404, detail=f"Camera {camera_id!r} not found")
 
     try:
-        snapshot: bytes = await cam.get_snapshot(width=640)
+        snapshot = await cam.get_snapshot(width=640)
     except Exception as exc:
         log.warning("Preview snapshot failed for camera %s: %s", camera_id, exc)
         raise HTTPException(status_code=503, detail="Could not fetch snapshot from NVR") from exc
 
+    if snapshot is None:
+        raise HTTPException(status_code=503, detail="Could not fetch snapshot from NVR")
     return Response(content=snapshot, media_type="image/jpeg")

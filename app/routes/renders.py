@@ -88,6 +88,7 @@ def create_render(payload: RenderCreate) -> dict:
         )
         conn.commit()
 
+    assert cur.lastrowid is not None
     result = _get_render_or_404(cur.lastrowid)
     result.update(
         {

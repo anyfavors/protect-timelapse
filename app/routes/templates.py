@@ -97,6 +97,7 @@ def create_template(payload: TemplateCreate) -> dict:
                 ) from exc
             raise
 
+    assert cur.lastrowid is not None
     return _get_template_or_404(cur.lastrowid)
 
 
