@@ -217,7 +217,9 @@ async def test_blurry_frame_flagged(tmp_db: Path, monkeypatch, tmp_path: Path) -
     await _run_worker(pid, jpeg, monkeypatch, tmp_path)
 
     with get_connection() as conn:
-        row = conn.execute("SELECT is_blurry, sharpness_score FROM frames WHERE project_id = ?", (pid,)).fetchone()
+        row = conn.execute(
+            "SELECT is_blurry, sharpness_score FROM frames WHERE project_id = ?", (pid,)
+        ).fetchone()
     assert row is not None
     # sharpness pipeline ran and stored a score regardless of threshold outcome
     assert row["sharpness_score"] is not None
@@ -226,16 +228,19 @@ async def test_blurry_frame_flagged(tmp_db: Path, monkeypatch, tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_motion_filter_skips_static_frame(tmp_db: Path, monkeypatch, tmp_path: Path) -> None:
     """When use_motion_filter=1 and the scene hasn't changed, the second frame should be skipped."""
+    import shutil
+
     import app.capture as capture_mod
     import app.config as config_mod
     import app.protect as protect_mod
-    import shutil
 
     monkeypatch.setattr(config_mod, "_settings", None)
     monkeypatch.setenv("FRAMES_PATH", str(tmp_path / "frames"))
     monkeypatch.setenv("THUMBNAILS_PATH", str(tmp_path / "thumbs"))
     monkeypatch.setenv("RENDERS_PATH", str(tmp_path / "renders"))
-    monkeypatch.setattr(shutil, "disk_usage", lambda _: MagicMock(free=50 * 1024**3, total=100 * 1024**3))
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _: MagicMock(free=50 * 1024**3, total=100 * 1024**3)
+    )
     monkeypatch.setattr(capture_mod, "broadcast", AsyncMock())
 
     with get_connection() as conn:
@@ -251,20 +256,27 @@ async def test_motion_filter_skips_static_frame(tmp_db: Path, monkeypatch, tmp_p
     mock_cam.get_snapshot = AsyncMock(return_value=jpeg)
     mock_client = MagicMock()
     mock_client.bootstrap.cameras = {"cam-1": mock_cam}
-    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+    monkeypatch.setattr(
+        protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client)
+    )
 
     # First capture — no previous frame, so it always saves
     from app.capture import snapshot_worker
+
     await snapshot_worker(pid)
 
     with get_connection() as conn:
-        count1 = conn.execute("SELECT frame_count FROM projects WHERE id = ?", (pid,)).fetchone()["frame_count"]
+        count1 = conn.execute("SELECT frame_count FROM projects WHERE id = ?", (pid,)).fetchone()[
+            "frame_count"
+        ]
     assert count1 == 1
 
     # Second capture — identical frame, motion < threshold=50 → should be skipped
     await snapshot_worker(pid)
 
     with get_connection() as conn:
-        count2 = conn.execute("SELECT frame_count FROM projects WHERE id = ?", (pid,)).fetchone()["frame_count"]
+        count2 = conn.execute("SELECT frame_count FROM projects WHERE id = ?", (pid,)).fetchone()[
+            "frame_count"
+        ]
     # Frame count should still be 1 (second frame skipped)
     assert count2 == 1

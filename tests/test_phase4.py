@@ -17,7 +17,6 @@ from PIL import Image
 
 from app.database import get_connection
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -47,8 +46,15 @@ def _make_app(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         yield
 
     application = FastAPI(lifespan=_noop)
-    for r in (frames.router, health.router, projects.router, renders.router,
-              settings.router, notifications.router, cameras.router):
+    for r in (
+        frames.router,
+        health.router,
+        projects.router,
+        renders.router,
+        settings.router,
+        notifications.router,
+        cameras.router,
+    ):
         application.include_router(r)
     return TestClient(application)
 
@@ -165,7 +171,7 @@ def test_blurry_frames(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_cursor_pagination(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid = _insert_project(tmp_path)
-    ids = [_insert_frame(pid, tmp_path) for _ in range(5)]
+    [_insert_frame(pid, tmp_path) for _ in range(5)]
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
     # First page (no cursor)
@@ -211,7 +217,9 @@ def test_thumbnail_etag(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.Monkey
 # ---------------------------------------------------------------------------
 
 
-def test_global_renders_queue(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_global_renders_queue(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pid = _insert_project(tmp_path)
     with get_connection() as conn:
         conn.execute(
@@ -288,9 +296,7 @@ def test_watermark_upload_and_clear(
 # ---------------------------------------------------------------------------
 
 
-def test_nvr_test_connected(
-    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_nvr_test_connected(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.protect as protect_mod
 
     cam = MagicMock()
@@ -309,9 +315,7 @@ def test_nvr_test_connected(
     assert data["camera_count"] == 2
 
 
-def test_nvr_test_offline(
-    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_nvr_test_offline(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.protect as protect_mod
 
     monkeypatch.setattr(
@@ -353,7 +357,9 @@ def test_gif_status_no_job(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.Mon
     assert r.status_code == 404
 
 
-def test_gif_download_not_ready(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gif_download_not_ready(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pid = _insert_project(tmp_path)
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
@@ -411,8 +417,7 @@ def test_bulk_delete_notifications(
     with get_connection() as conn:
         for i in range(3):
             conn.execute(
-                "INSERT INTO notifications (event, level, message, is_read)"
-                " VALUES (?,?,?,?)",
+                "INSERT INTO notifications (event, level, message, is_read) VALUES (?,?,?,?)",
                 ("test", "info", f"msg{i}", i % 2),
             )
         conn.commit()
@@ -461,6 +466,7 @@ async def test_ws_manager_broadcast_sends_message() -> None:
     await mgr.broadcast("render_progress", {"render_id": 1, "progress_pct": 50})
     assert len(ws.sent) == 1
     import json
+
     data = json.loads(ws.sent[0])
     assert data["event"] == "render_progress"
 
