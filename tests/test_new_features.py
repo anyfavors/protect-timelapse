@@ -6,7 +6,6 @@ Covers: batch frame delete, CSV export, analyze-interval, render cancel,
 """
 
 import io
-import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +15,6 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.database import get_connection
-
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_phase4.py)
@@ -415,6 +413,7 @@ def test_liveness_probe_stalled(
     tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
+
     import app.routes.health as health_mod
 
     # Simulate a heartbeat from 200s ago
@@ -544,8 +543,8 @@ async def test_schedule_auto_renders_no_frames(
     tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no frames, no auto-render should be scheduled."""
-    import app.maintenance as maint
     import app.database as db_mod
+    import app.maintenance as maint
     monkeypatch.setattr(maint, "get_connection", db_mod.get_connection)
 
     _insert_project()
@@ -714,9 +713,8 @@ def test_thumbnail_zero_dimensions() -> None:
     fake_img = MagicMock()
     fake_img.size = (0, 0)
 
-    with patch("app.thumbnails.Image.open", return_value=fake_img):
-        with pytest.raises(ValueError, match="Invalid image dimensions"):
-            generate_thumbnail(b"fake")
+    with patch("app.thumbnails.Image.open", return_value=fake_img), pytest.raises(ValueError, match="Invalid image dimensions"):
+        generate_thumbnail(b"fake")
 
 
 def test_thumbnail_from_pillow_zero_dimensions() -> None:
