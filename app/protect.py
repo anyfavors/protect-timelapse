@@ -26,16 +26,23 @@ class ProtectClientManager:
 
     async def setup(self) -> None:
         """Authenticate with the NVR and load the bootstrap data."""
+        from app.database import get_db_overrides
+
         settings = get_settings()
+        overrides = get_db_overrides()
+        host = overrides.get("protect_host") or settings.protect_host
+        port = int(overrides.get("protect_port") or settings.protect_port)
+        verify_ssl = bool(overrides.get("protect_verify_ssl", settings.protect_verify_ssl))
+
         async with self._lock:
             if self._client is not None:
                 return
             self._client = ProtectApiClient(
-                host=settings.protect_host,
-                port=settings.protect_port,
+                host=host,
+                port=port,
                 username=settings.protect_username,
                 password=settings.protect_password,
-                verify_ssl=settings.protect_verify_ssl,
+                verify_ssl=verify_ssl,
             )
             try:
                 await self._client.update()
@@ -49,6 +56,11 @@ class ProtectClientManager:
             except Exception as exc:
                 self._connected = False
                 log.warning("Could not connect to NVR at startup: %s", exc)
+
+    async def reconnect(self) -> None:
+        """Tear down and re-setup the client (e.g. after NVR settings change)."""
+        await self.teardown()
+        await self.setup()
 
     async def teardown(self) -> None:
         """Close the NVR websocket session."""

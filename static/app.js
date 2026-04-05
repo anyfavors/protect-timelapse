@@ -54,14 +54,27 @@ document.addEventListener('alpine:init', () => {
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
     async init() {
-      this.loadTheme();
+      // Load settings first so theme is applied before anything renders
+      const s = await this.api('/api/settings');
+      if (s) this.loadTheme(s.dark_mode);
+      else this.loadTheme(true);
       this.initKeyboardShortcuts();
       await this.loadAll();
       this.connectWebSocket();
     },
 
-    loadTheme() {
-      document.documentElement.classList.add('dark');
+    darkMode: true,
+
+    loadTheme(darkMode) {
+      this.darkMode = darkMode !== false && darkMode !== 0;
+      document.documentElement.classList.toggle('dark', this.darkMode);
+    },
+
+    toggleDark() {
+      this.darkMode = !this.darkMode;
+      document.documentElement.classList.toggle('dark', this.darkMode);
+      // Persist immediately — fire-and-forget
+      this.api('/api/settings', 'PUT', { dark_mode: this.darkMode });
     },
 
     async loadAll() {
@@ -587,12 +600,19 @@ document.addEventListener('alpine:init', () => {
     async openSettings() {
       this.view = 'settings';
       const data = await this.api('/api/settings');
-      if (data) this.settingsData = data;
+      if (data) {
+        this.settingsData = data;
+        this.loadTheme(data.dark_mode);
+      }
     },
 
     async saveSettings() {
       const data = await this.api('/api/settings', 'PUT', this.settingsData);
-      if (data) { this.settingsData = data; this.toast('Settings saved'); }
+      if (data) {
+        this.settingsData = data;
+        this.loadTheme(data.dark_mode);
+        this.toast('Settings saved');
+      }
     },
 
     async deleteTemplate(id) {

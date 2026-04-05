@@ -167,12 +167,35 @@ CREATE INDEX IF NOT EXISTS idx_notifications_unread
 # ---------------------------------------------------------------------------
 
 
+_SCHEMA_V1 = """
+ALTER TABLE settings ADD COLUMN protect_host TEXT;
+ALTER TABLE settings ADD COLUMN protect_port INTEGER;
+ALTER TABLE settings ADD COLUMN protect_verify_ssl INTEGER;
+ALTER TABLE settings ADD COLUMN latitude REAL;
+ALTER TABLE settings ADD COLUMN longitude REAL;
+ALTER TABLE settings ADD COLUMN tz TEXT;
+ALTER TABLE settings ADD COLUMN dark_mode INTEGER DEFAULT 1;
+"""
+
+
 def _migrate_v0(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_V0)
 
 
+def _migrate_v1(conn: sqlite3.Connection) -> None:
+    # ALTER TABLE does not support multi-statement executescript in all SQLite
+    # versions — run each statement individually, ignoring "duplicate column" errors.
+    import contextlib
+
+    for stmt in [s.strip() for s in _SCHEMA_V1.strip().split(";") if s.strip()]:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(stmt)
+    conn.commit()
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
+    1: _migrate_v1,
 }
 
 
@@ -219,3 +242,23 @@ def init_database() -> None:
         if zombies:
             conn.commit()
             log.info("Recovered %d zombie render(s)", len(zombies))
+
+
+# ---------------------------------------------------------------------------
+# Runtime overrides
+# ---------------------------------------------------------------------------
+
+
+def get_db_overrides() -> dict:
+    """
+    Return the non-NULL override columns from the settings row.
+    Used by protect.py and capture.py to let DB values supersede env vars.
+    """
+    try:
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM settings WHERE id = 1").fetchone()
+        if not row:
+            return {}
+        return {k: v for k, v in dict(row).items() if v is not None}
+    except Exception:
+        return {}

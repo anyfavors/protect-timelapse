@@ -150,7 +150,10 @@ async def snapshot_worker(project_id: int) -> None:
         return
 
     # --- 4. Schedule window filter ------------------------------------------
-    if project["capture_mode"] == "schedule" and not _is_in_schedule(project, settings.tz):
+    from app.database import get_db_overrides
+
+    tz_name: str = get_db_overrides().get("tz") or settings.tz  # type: ignore[assignment]
+    if project["capture_mode"] == "schedule" and not _is_in_schedule(project, tz_name):
         log.debug("Project %d: outside schedule window, skipping", project_id)
         return
 
@@ -303,16 +306,23 @@ def _is_daylight(settings) -> bool:  # type: ignore[no-untyped-def]
     from astral import LocationInfo
     from astral.sun import sun
 
+    from app.database import get_db_overrides
+
+    overrides = get_db_overrides()
+    tz: str = overrides.get("tz") or settings.tz  # type: ignore[assignment]
+    lat: float = overrides.get("latitude") or settings.latitude  # type: ignore[assignment]
+    lon: float = overrides.get("longitude") or settings.longitude  # type: ignore[assignment]
+
     city = LocationInfo(
         name="custom",
         region="custom",
-        timezone=settings.tz,
-        latitude=settings.latitude,
-        longitude=settings.longitude,
+        timezone=tz,
+        latitude=lat,
+        longitude=lon,
     )
     now = datetime.now(UTC)
     try:
-        s = sun(city.observer, date=now.date(), tzinfo=settings.tz)
+        s = sun(city.observer, date=now.date(), tzinfo=tz)
         return s["sunrise"] <= now <= s["sunset"]
     except Exception:
         # If astral fails (e.g. polar night), allow capture
