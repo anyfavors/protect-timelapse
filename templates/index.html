@@ -42,18 +42,37 @@
   </div>
 
   <div class="flex items-center gap-4">
-    <!-- Disk gauge (click to open breakdown modal) -->
-    <button class="hidden sm:flex items-center gap-2 text-xs text-slate-400 hover:text-slate-200 transition"
-            @click="openDiskModal()">
-      <span :class="diskCritical ? 'text-red-400' : ''">
-        <span x-text="diskSpace.free_gb !== null ? diskSpace.free_gb.toFixed(1) + ' GB free' : 'Disk —'"></span>
-      </span>
-      <div class="w-20 h-1.5 bg-slate-700 rounded-full overflow-hidden">
-        <div class="h-full rounded-full transition-all"
-             :class="diskCritical ? 'bg-red-500' : 'bg-blue-500'"
-             :style="`width:${diskPercent}%`"></div>
+    <!-- Disk gauge (click to open breakdown modal, hover tooltip shows breakdown UI4) -->
+    <div class="hidden sm:block relative group">
+      <button class="flex items-center gap-2 text-xs text-slate-400 hover:text-slate-200 transition"
+              @click="openDiskModal()">
+        <span :class="diskCritical ? 'text-red-400' : ''">
+          <span x-text="diskSpace.free_gb !== null ? diskSpace.free_gb.toFixed(1) + ' GB free' : 'Disk —'"></span>
+        </span>
+        <div class="w-20 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+          <div class="h-full rounded-full transition-all"
+               :class="diskCritical ? 'bg-red-500' : 'bg-blue-500'"
+               :style="`width:${diskPercent}%`"></div>
+        </div>
+      </button>
+      <!-- Hover tooltip — shows breakdown without opening modal (UI4) -->
+      <div class="absolute right-0 top-7 hidden group-hover:block bg-slate-800 border border-slate-700 rounded-lg p-2 text-xs w-48 z-50 shadow-xl pointer-events-none"
+           x-show="diskBreakdown.total_gb">
+        <div class="text-slate-300 font-medium mb-1">Disk Breakdown</div>
+        <div class="flex justify-between text-slate-400">
+          <span>Used</span>
+          <span x-text="(diskBreakdown.used_gb || 0).toFixed(1) + ' GB'"></span>
+        </div>
+        <div class="flex justify-between text-slate-400">
+          <span>Free</span>
+          <span x-text="(diskBreakdown.free_gb || 0).toFixed(1) + ' GB'"></span>
+        </div>
+        <div class="flex justify-between text-slate-400">
+          <span>Total</span>
+          <span x-text="(diskBreakdown.total_gb || 0).toFixed(1) + ' GB'"></span>
+        </div>
       </div>
-    </button>
+    </div>
 
     <!-- Notification bell -->
     <div class="relative">
@@ -194,10 +213,21 @@
   <div x-show="view === 'renders_queue'">
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-2xl font-bold text-slate-100">Render Queue</h1>
-      <button @click="loadRendersQueue()"
-              class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition">
-        Refresh
-      </button>
+      <div class="flex items-center gap-2">
+        <!-- Auto-refresh toggle (UX10) -->
+        <button @click="toggleRenderAutoRefresh()"
+                :class="renderAutoRefresh ? 'bg-blue-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'"
+                class="text-xs px-3 py-1.5 rounded-lg transition"
+                :title="renderAutoRefresh ? 'Auto-refresh on (every 7s)' : 'Enable auto-refresh'">
+          <span x-text="renderAutoRefresh ? '⟳ Auto' : '⟳ Auto'"></span>
+          <span class="ml-1 w-1.5 h-1.5 rounded-full inline-block"
+                :class="renderAutoRefresh ? 'bg-blue-300 animate-pulse' : 'bg-slate-600'"></span>
+        </button>
+        <button @click="loadRendersQueue()"
+                class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition">
+          Refresh
+        </button>
+      </div>
     </div>
 
     <template x-if="allRenders.length === 0">
@@ -332,13 +362,24 @@
         </button>
       </div>
     </div>
-    <!-- Bulk action bar -->
+    <!-- Select all + bulk action bar (UX3, UX4) -->
+    <div x-show="selectMode" class="flex items-center gap-2 mb-3">
+      <label class="flex items-center gap-2 cursor-pointer text-sm text-slate-400">
+        <input type="checkbox" :checked="allSelected" @change="toggleSelectAll()" class="accent-blue-500 w-4 h-4" />
+        <span x-text="allSelected ? 'Deselect all' : 'Select all'"></span>
+      </label>
+    </div>
     <div x-show="selectMode && selectedProjectIds.length > 0"
          class="flex items-center gap-2 mb-4 bg-blue-900/40 border border-blue-700 rounded-xl px-4 py-2">
       <span class="text-sm text-blue-300 flex-1" x-text="`${selectedProjectIds.length} selected`"></span>
-      <button @click="bulkPause()" class="text-xs bg-slate-700 hover:bg-yellow-800 text-slate-300 hover:text-yellow-100 px-3 py-1.5 rounded-lg transition">Pause all</button>
-      <button @click="bulkResume()" class="text-xs bg-slate-700 hover:bg-emerald-800 text-slate-300 hover:text-emerald-100 px-3 py-1.5 rounded-lg transition">Resume all</button>
-      <button @click="bulkDelete()" class="text-xs bg-red-900/60 hover:bg-red-800 text-red-300 hover:text-red-100 px-3 py-1.5 rounded-lg transition">Delete selected</button>
+      <!-- Batch progress (UX4) -->
+      <template x-if="batchProgress">
+        <span class="text-xs text-slate-300 mr-2"
+              x-text="`${batchProgress.label} ${batchProgress.done}/${batchProgress.total}`"></span>
+      </template>
+      <button @click="bulkPause()" :disabled="!!batchProgress" class="text-xs bg-slate-700 hover:bg-yellow-800 disabled:opacity-40 text-slate-300 hover:text-yellow-100 px-3 py-1.5 rounded-lg transition">Pause all</button>
+      <button @click="bulkResume()" :disabled="!!batchProgress" class="text-xs bg-slate-700 hover:bg-emerald-800 disabled:opacity-40 text-slate-300 hover:text-emerald-100 px-3 py-1.5 rounded-lg transition">Resume all</button>
+      <button @click="bulkDelete()" :disabled="!!batchProgress" class="text-xs bg-red-900/60 hover:bg-red-800 disabled:opacity-40 text-red-300 hover:text-red-100 px-3 py-1.5 rounded-lg transition">Delete selected</button>
     </div>
 
     <!-- Onboarding empty state -->
@@ -361,7 +402,9 @@
         <!-- Camera section header -->
         <div class="flex items-center gap-3 mb-3">
           <span class="w-2 h-2 rounded-full flex-shrink-0"
-                :class="cam.is_online ? 'bg-emerald-500' : 'bg-red-500'"></span>
+                :class="cam.is_online ? 'bg-emerald-500' : 'bg-red-500'"
+                :aria-label="cam.is_online ? 'Camera online' : 'Camera offline'"
+                role="img"></span>
           <span class="font-semibold text-slate-200" x-text="cam.name || cam.id"></span>
           <span class="text-xs text-slate-500" x-text="cam.type || ''"></span>
           <span class="ml-auto text-xs bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full"
@@ -404,7 +447,9 @@
                     </svg>
                   </template>
                   <span class="w-2.5 h-2.5 rounded-full"
-                        :class="statusDot(proj.status)"></span>
+                        :class="statusDot(proj.status)"
+                        :aria-label="'Status: ' + proj.status.replace('_',' ')"
+                        role="img"></span>
                 </div>
               </div>
               <div class="text-xs text-slate-400 space-y-1">
@@ -557,8 +602,11 @@
                       class="text-xs text-slate-600 hover:text-red-400 transition px-2 py-0.5 rounded" title="Delete this frame">🗑</button>
             </div>
             <template x-if="scrubberFrameUrl">
-              <img :src="scrubberFrameUrl" alt="Frame preview"
-                   class="rounded-lg max-h-64 object-contain bg-slate-900 w-full" />
+              <!-- Tap on mobile opens full preview (UX8) -->
+              <img :src="scrubberFrameUrl"
+                   :alt="scrubberTimestamp ? 'Frame at ' + formatDate(scrubberTimestamp) : 'Frame preview'"
+                   class="rounded-lg max-h-64 object-contain bg-slate-900 w-full cursor-pointer"
+                   @touchend.prevent="onFrameTap(activeProjectFrames[scrubberIndex])" />
             </template>
             <template x-if="rangeStart">
               <div class="mt-2 flex items-center gap-2 text-xs text-slate-400">
@@ -575,9 +623,24 @@
           <p class="text-sm text-slate-500">No frames captured yet.</p>
         </template>
         <template x-if="activeProjectFrames.length > 0">
-          <p class="text-xs text-slate-500 mt-2">
-            Press <kbd class="bg-slate-700 px-1 rounded text-slate-300">C</kbd> at two positions to open side-by-side frame comparison.
-          </p>
+          <div class="mt-2">
+            <p class="text-xs text-slate-500">
+              Press <kbd class="bg-slate-700 px-1 rounded text-slate-300">C</kbd> at two positions to open side-by-side frame comparison.
+            </p>
+            <!-- Frame pagination (FE3) -->
+            <template x-if="frameTotalPages > 1">
+              <div class="flex items-center gap-2 mt-2">
+                <span class="text-xs text-slate-500"
+                      x-text="`Page ${framePage + 1} of ${frameTotalPages} (${framePageSize} frames/page)`"></span>
+                <button @click="framePage = Math.max(0, framePage - 1); updateScrubberFrame()"
+                        :disabled="framePage === 0"
+                        class="text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 text-slate-300 px-2 py-0.5 rounded transition">←</button>
+                <button @click="framePage = Math.min(frameTotalPages - 1, framePage + 1); updateScrubberFrame()"
+                        :disabled="framePage >= frameTotalPages - 1"
+                        class="text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 text-slate-300 px-2 py-0.5 rounded transition">→</button>
+              </div>
+            </template>
+          </div>
         </template>
       </div>
 
@@ -585,7 +648,8 @@
       <template x-if="activeProjectTimeline.length > 0">
         <div class="mb-6">
           <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wide">Hourly Captures</h3>
-          <div class="flex items-end gap-0.5 h-16 overflow-x-auto pb-1">
+          <!-- Horizontal scroll with snap on mobile (UI6) -->
+          <div class="flex items-end gap-0.5 h-16 overflow-x-auto pb-1 snap-x snap-mandatory sm:overflow-x-visible">
             <template x-for="slot in activeProjectTimeline" :key="slot.hour">
               <div class="flex flex-col items-center min-w-[6px] group relative"
                    :style="`height:100%`">
@@ -638,7 +702,10 @@
               </button>
             </template>
             <input x-model="renderResolution"
+                   @blur="validateResolution()"
                    placeholder="custom e.g. 1600x900"
+                   pattern="^\d+x\d+$"
+                   title="Format: WxH (e.g. 1920x1080)"
                    class="bg-slate-700 border border-slate-600 text-slate-200 text-xs rounded-lg px-2 py-1.5 w-36 focus:outline-none focus:ring-1 focus:ring-blue-500" />
           </div>
         </div>
@@ -775,7 +842,13 @@
                 <div class="w-full bg-slate-700 rounded-full h-1.5">
                   <div class="bg-blue-500 h-1.5 rounded-full transition-all" :style="`width:${r.progress_pct}%`"></div>
                 </div>
-                <span class="text-xs text-slate-400 mt-1" x-text="r.progress_pct + '%'"></span>
+                <div class="flex justify-between text-xs text-slate-400 mt-1">
+                  <span x-text="r.progress_pct + '%'"></span>
+                  <!-- ETA estimate based on elapsed time and progress (UI2) -->
+                  <span x-text="r.progress_pct > 5 && r.started_at
+                    ? (Math.round((Date.now() - new Date(r.started_at).getTime()) / r.progress_pct * (100 - r.progress_pct) / 1000) + 's remaining')
+                    : ''"></span>
+                </div>
               </div>
             </template>
             <div class="flex flex-wrap gap-2 mt-3">
@@ -818,9 +891,13 @@
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <template x-for="frame in activeProjectBookmarks" :key="frame.id">
           <div class="bg-slate-800 rounded-lg overflow-hidden hover:ring-1 hover:ring-blue-500 transition">
-            <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
-                 class="w-full h-24 object-cover bg-slate-900 cursor-pointer" alt=""
-                 @click="detailTab='overview'; scrubberIndex = activeProjectFrames.findIndex(f => f.id === frame.id); updateScrubberFrame()" />
+            <div class="relative w-full h-24 bg-slate-700 cursor-pointer"
+                 @click="detailTab='overview'; scrubberIndex = activeProjectFrames.findIndex(f => f.id === frame.id); updateScrubberFrame()">
+              <div class="absolute inset-0 animate-pulse bg-slate-700 rounded-t-lg"></div>
+              <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                   class="absolute inset-0 w-full h-full object-cover"
+                   :alt="'Bookmarked: ' + (frame.bookmark_note || formatDate(frame.captured_at))"
+                   @load="$el.previousElementSibling.style.display='none'" /></div>
             <div class="p-2 flex items-start justify-between gap-1">
               <div class="min-w-0">
                 <p class="text-xs text-slate-300 truncate" x-text="frame.bookmark_note"></p>
@@ -845,8 +922,13 @@
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
           <template x-for="frame in activeProjectDarkFrames" :key="frame.id">
             <div class="bg-slate-800 rounded-lg overflow-hidden">
-              <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
-                   class="w-full h-24 object-cover bg-slate-900" alt="" />
+              <!-- Skeleton shown while image loads (UI1) -->
+              <div class="relative w-full h-24 bg-slate-700">
+                <div class="absolute inset-0 animate-pulse bg-slate-700 rounded-t-lg"></div>
+                <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                     class="absolute inset-0 w-full h-full object-cover"
+                     :alt="'Dark frame ' + formatDate(frame.captured_at)"
+                     @load="$el.previousElementSibling.style.display='none'" /></div>
               <div class="p-2 flex items-center justify-between">
                 <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
                 <button @click="deleteFrame(frame.id)" class="text-slate-600 hover:text-red-400 text-xs" title="Delete frame">🗑</button>
@@ -865,8 +947,12 @@
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
           <template x-for="frame in activeProjectBlurryFrames" :key="frame.id">
             <div class="bg-slate-800 rounded-lg overflow-hidden">
-              <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
-                   class="w-full h-24 object-cover bg-slate-900" alt="" />
+              <div class="relative w-full h-24 bg-slate-700">
+                <div class="absolute inset-0 animate-pulse bg-slate-700 rounded-t-lg"></div>
+                <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                     class="absolute inset-0 w-full h-full object-cover"
+                     :alt="'Blurry frame ' + formatDate(frame.captured_at)"
+                     @load="$el.previousElementSibling.style.display='none'" /></div>
               <div class="p-2 flex items-start justify-between gap-1">
                 <div>
                   <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
@@ -1417,6 +1503,7 @@
       <div class="flex justify-between"><span class="text-slate-400">Compare frames (mark 2)</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">C</kbd></div>
       <div class="flex justify-between"><span class="text-slate-400">Step frame</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">← →</kbd></div>
       <div class="flex justify-between"><span class="text-slate-400">Jump 10 frames</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">Shift + ← →</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Range preset 24h/7d/30d</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">1 2 3</kbd></div>
       <div class="flex justify-between"><span class="text-slate-400">This help</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">?</kbd></div>
     </div>
     <button @click="showShortcutHelp = false" class="mt-5 w-full bg-slate-700 hover:bg-slate-600 text-slate-200 py-2 rounded-lg text-sm transition">
@@ -1424,6 +1511,63 @@
     </button>
   </div>
 </div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- CUSTOM CONFIRM MODAL (UX7)                                               -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div x-show="showConfirmModal"
+     x-transition:enter="transition ease-out duration-150"
+     x-transition:enter-start="opacity-0"
+     x-transition:enter-end="opacity-100"
+     class="fixed inset-0 bg-black/60 flex items-center justify-center z-[100]">
+  <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl" @click.stop>
+    <h2 class="font-bold text-slate-100 text-lg mb-2" x-text="confirmTitle"></h2>
+    <p class="text-sm text-slate-300 mb-6" x-text="confirmMessage"></p>
+    <div class="flex gap-3">
+      <button @click="_confirmNo()"
+              class="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-200 py-2 rounded-lg text-sm transition">
+        Cancel
+      </button>
+      <button @click="_confirmYes()"
+              class="flex-1 bg-red-700 hover:bg-red-600 text-white py-2 rounded-lg text-sm font-medium transition">
+        Confirm
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- MOBILE TAP-TO-PREVIEW OVERLAY (UX8)                                     -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div x-show="tapPreviewFrame"
+     @click="closeTapPreview()"
+     class="fixed inset-0 bg-black/80 flex flex-col items-center justify-center z-[90] p-4">
+  <template x-if="tapPreviewFrame">
+    <div class="w-full max-w-lg" @click.stop>
+      <img :src="`/api/projects/${activeProject?.id}/frames/${tapPreviewFrame?.id}/full`"
+           :alt="formatDate(tapPreviewFrame?.captured_at)"
+           class="w-full rounded-xl object-contain max-h-[70vh] bg-black" />
+      <p class="text-xs text-slate-400 text-center mt-2" x-text="formatDate(tapPreviewFrame?.captured_at)"></p>
+      <button @click="closeTapPreview()"
+              class="mt-3 w-full bg-slate-700 hover:bg-slate-600 text-slate-200 py-2 rounded-lg text-sm transition">
+        Close
+      </button>
+    </div>
+  </template>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- UNSAVED CHANGES WARNING (UX2) — browser beforeunload                    -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<script>
+  window.addEventListener('beforeunload', e => {
+    const app = document.querySelector('[x-data]')?._x_dataStack?.[0];
+    if (app && app.formIsDirty) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
+</script>
 
 <!-- Footer -->
 <footer class="text-center text-xs text-slate-700 py-6 mt-8">

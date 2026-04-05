@@ -1,3 +1,26 @@
 @import "tailwindcss";
 
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Dark mode CSS custom properties (UI10) ─────────────────────────────── */
+/* Base theme tokens — override in :root for light mode, .dark for dark */
+:root {
+  --color-bg-primary: theme(colors.slate.950);
+  --color-bg-surface: theme(colors.slate.800);
+  --color-bg-elevated: theme(colors.slate.700);
+  --color-text-primary: theme(colors.slate.100);
+  --color-text-secondary: theme(colors.slate.400);
+  --color-border: theme(colors.slate.700);
+  --color-accent: theme(colors.blue.500);
+  --color-danger: theme(colors.red.500);
+  --color-success: theme(colors.emerald.500);
+}
+
+html:not(.dark) {
+  --color-bg-primary: theme(colors.slate.100);
+  --color-bg-surface: theme(colors.white);
+  --color-bg-elevated: theme(colors.slate.200);
+  --color-text-primary: theme(colors.slate.900);
+  --color-text-secondary: theme(colors.slate.600);
+  --color-border: theme(colors.slate.300);
+}

@@ -96,6 +96,9 @@ document.addEventListener('alpine:init', () => {
       this.initKeyboardShortcuts();
       await this.loadAll();
       this.connectWebSocket();
+      // Real-time render estimate: update whenever framerate or resolution changes (UX5)
+      this.$watch('renderFramerate', () => this.updateRenderEstimate(this.renderFramerate));
+      this.$watch('renderResolution', () => this.updateRenderEstimate(this.renderFramerate));
     },
 
     loadTheme(darkMode) {
@@ -247,7 +250,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async deleteProject(id) {
-      if (!confirm('Delete this project and all its frames? This cannot be undone.')) return;
+      if (!await this.confirm('Delete this project and all its frames?', 'Delete Project')) return;
       await this.api(`/api/projects/${id}`, 'DELETE');
       await this.loadProjects();
       if (this.activeProject?.id === id) this.view = 'dashboard';
@@ -277,24 +280,40 @@ document.addEventListener('alpine:init', () => {
     },
 
     async bulkPause() {
-      await Promise.all(this.selectedProjectIds.map(id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'paused' })));
+      const ids = [...this.selectedProjectIds];
+      await this._runBatch(ids, 'Pausing', id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'paused' }));
       await this.loadProjects();
-      this.toast(`Paused ${this.selectedProjectIds.length} project(s)`);
+      this.toast(`Paused ${ids.length} project(s)`);
       this.selectedProjectIds = [];
     },
 
     async bulkResume() {
-      await Promise.all(this.selectedProjectIds.map(id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'active' })));
+      const ids = [...this.selectedProjectIds];
+      await this._runBatch(ids, 'Resuming', id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'active' }));
       await this.loadProjects();
-      this.toast(`Resumed ${this.selectedProjectIds.length} project(s)`);
+      this.toast(`Resumed ${ids.length} project(s)`);
       this.selectedProjectIds = [];
     },
 
+    // ── Select all (UX3) ─────────────────────────────────────────────────
+    get allSelected() {
+      return this.projects.length > 0 && this.projects.every(p => this.selectedProjectIds.includes(p.id));
+    },
+
+    toggleSelectAll() {
+      if (this.allSelected) {
+        this.selectedProjectIds = [];
+      } else {
+        this.selectedProjectIds = this.projects.map(p => p.id);
+      }
+    },
+
     async bulkDelete() {
-      if (!confirm(`Delete ${this.selectedProjectIds.length} project(s)? This cannot be undone.`)) return;
-      await Promise.all(this.selectedProjectIds.map(id => this.api(`/api/projects/${id}`, 'DELETE')));
+      if (!await this.confirm(`Delete ${this.selectedProjectIds.length} project(s)?`, 'Delete Projects')) return;
+      const ids = [...this.selectedProjectIds];
+      await this._runBatch(ids, 'Deleting', id => this.api(`/api/projects/${id}`, 'DELETE'));
       await this.loadProjects();
-      this.toast(`Deleted ${this.selectedProjectIds.length} project(s)`);
+      this.toast(`Deleted ${ids.length} project(s)`);
       this.selectedProjectIds = [];
     },
 
@@ -304,6 +323,7 @@ document.addEventListener('alpine:init', () => {
       this.detailTab = 'overview';
       this.view = 'project_detail';
       this.scrubberIndex = 0;
+      this.framePage = 0;  // reset pagination (FE3)
       this.rangeStart = null;
       this.rangeEnd = null;
       this.gifJobStatus = null;
@@ -314,12 +334,17 @@ document.addEventListener('alpine:init', () => {
     async loadProjectDetail() {
       if (!this.activeProject) return;
       const id = this.activeProject.id;
-      const [frames, renders, daily, timeline] = await Promise.all([
+      // Use allSettled so one failing request doesn't abort the rest (FE2)
+      const [framesR, rendersR, dailyR, timelineR] = await Promise.allSettled([
         this.api(`/api/projects/${id}/frames?fields=id,captured_at&limit=500`),
         this.api(`/api/projects/${id}/renders`),
         this.api(`/api/projects/${id}/stats/daily`),
         this.api(`/api/projects/${id}/stats/timeline`),
       ]);
+      const frames = framesR.status === 'fulfilled' ? framesR.value : null;
+      const renders = rendersR.status === 'fulfilled' ? rendersR.value : null;
+      const daily = dailyR.status === 'fulfilled' ? dailyR.value : null;
+      const timeline = timelineR.status === 'fulfilled' ? timelineR.value : null;
       if (frames) this.activeProjectFrames = frames;
       if (renders) this.activeProjectRenders = renders;
       if (daily) this.activeProjectDailyStats = daily;
@@ -387,7 +412,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async deleteFrame(frameId) {
-      if (!confirm('Delete this frame permanently? This cannot be undone.')) return;
+      if (!await this.confirm('Delete this frame permanently?', 'Delete Frame')) return;
       const id = this.activeProject.id;
       await this.api(`/api/projects/${id}/frames/${frameId}`, 'DELETE');
       this.activeProjectFrames = this.activeProjectFrames.filter(f => f.id !== frameId);
@@ -599,7 +624,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async deleteRender(renderId) {
-      if (!confirm('Delete this render file?')) return;
+      if (!await this.confirm('Delete this render file?', 'Delete Render')) return;
       await this.api(`/api/renders/${renderId}`, 'DELETE');
       this.allRenders = this.allRenders.filter(r => r.id !== renderId);
       if (this.view === 'project_detail') await this.loadDetailTab('renders');
@@ -625,6 +650,14 @@ document.addEventListener('alpine:init', () => {
       }[status] || 'text-slate-400';
     },
 
+    // ── Shared speed buttons builder (FE9 — DRY) ─────────────────────────
+    _buildSpeedButtons(videoSelector, btnClass) {
+      return [0.5, 1, 2, 4].map(r =>
+        `<button onclick="[...document.querySelectorAll('${videoSelector}')].forEach(v=>v.playbackRate=${r});[...document.querySelectorAll('.${btnClass}')].forEach(b=>b.classList.remove('bg-blue-600','text-white'));this.classList.add('bg-blue-600','text-white')"
+                 class="${btnClass} text-sm px-3 py-1 rounded ${r===1?'bg-blue-600 text-white':'bg-slate-700 text-slate-300'} hover:bg-blue-500 transition">${r}×</button>`
+      ).join('');
+    },
+
     // ── Video player ──────────────────────────────────────────────────────
     openVideoPlayer(renderId) {
       const url = `/api/renders/${renderId}/download`;
@@ -633,12 +666,9 @@ document.addEventListener('alpine:init', () => {
       overlay.className = 'fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90';
       overlay.innerHTML = `
         <div class="relative w-full max-w-5xl px-4">
-          <!-- Prominent × close button pinned top-right -->
           <button id="video-close-btn"
-                  onclick="document.getElementById('video-overlay').remove()"
                   class="fixed top-4 right-4 z-60 w-10 h-10 flex items-center justify-center rounded-full bg-slate-800 hover:bg-red-700 text-white text-xl font-bold shadow-lg transition"
                   title="Close (Esc)">×</button>
-          <!-- Esc hint overlaid on video — fades out after 3s -->
           <div id="video-esc-hint"
                class="absolute top-2 left-1/2 -translate-x-1/2 text-xs text-white/70 bg-black/50 px-3 py-1 rounded-full pointer-events-none transition-opacity duration-1000">
             Press Esc to close
@@ -647,23 +677,30 @@ document.addEventListener('alpine:init', () => {
                  class="w-full rounded-xl max-h-[80vh] bg-black"></video>
           <div class="flex items-center justify-between mt-3 gap-4">
             <div class="flex gap-2">
-              ${[0.5, 1, 2, 4].map(r =>
-                `<button onclick="document.getElementById('overlay-video').playbackRate=${r};[...document.querySelectorAll('.speed-btn')].forEach(b=>b.classList.remove('bg-blue-600','text-white'));this.classList.add('bg-blue-600','text-white')"
-                         class="speed-btn text-sm px-3 py-1 rounded ${r===1?'bg-blue-600 text-white':'bg-slate-700 text-slate-300'} hover:bg-blue-500 transition">${r}×</button>`
-              ).join('')}
+              ${this._buildSpeedButtons('#overlay-video', 'speed-btn')}
             </div>
-            <button onclick="document.getElementById('video-overlay').remove()"
+            <button id="video-close-btn2"
                     class="text-slate-400 hover:text-white text-sm bg-slate-800 px-4 py-2 rounded-lg transition">
               Close [Esc]
             </button>
           </div>
         </div>`;
-      overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+      // Named handlers for cleanup (FE5)
+      const onBgClick = e => { if (e.target === overlay) cleanup(); };
+      const onEsc = e => { if (e.key === 'Escape') cleanup(); };
+      const cleanup = () => {
+        overlay.removeEventListener('click', onBgClick);
+        document.removeEventListener('keydown', onEsc);
+        overlay.remove();
+      };
+
+      overlay.addEventListener('click', onBgClick);
       document.body.appendChild(overlay);
-      const esc = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); } };
-      document.addEventListener('keydown', esc);
+      document.addEventListener('keydown', onEsc);
+      document.getElementById('video-close-btn').onclick = cleanup;
+      document.getElementById('video-close-btn2').onclick = cleanup;
       document.getElementById('overlay-video').play();
-      // Fade out the Esc hint after 3s
       setTimeout(() => {
         const hint = document.getElementById('video-esc-hint');
         if (hint) hint.style.opacity = '0';
@@ -690,17 +727,24 @@ document.addEventListener('alpine:init', () => {
       const overlay = document.createElement('div');
       overlay.id = 'compare-overlay';
       overlay.className = 'fixed inset-0 z-50 flex flex-col bg-black/95 p-4';
+
+      // Named handlers for cleanup (FE5)
+      const onBgClick = e => { if (e.target === overlay) cleanup(); };
+      const onEsc = e => { if (e.key === 'Escape') cleanup(); };
+      const cleanup = () => {
+        overlay.removeEventListener('click', onBgClick);
+        document.removeEventListener('keydown', onEsc);
+        overlay.remove();
+      };
+
       overlay.innerHTML = `
         <div class="flex items-center justify-between mb-3">
           <div class="flex gap-2">
-            ${[0.5, 1, 2, 4].map(r =>
-              `<button onclick="[document.getElementById('cmp-a'),document.getElementById('cmp-b')].forEach(v=>v.playbackRate=${r});[...document.querySelectorAll('.cspeed-btn')].forEach(b=>b.classList.remove('bg-blue-600','text-white'));this.classList.add('bg-blue-600','text-white')"
-                       class="cspeed-btn text-sm px-3 py-1 rounded ${r===1?'bg-blue-600 text-white':'bg-slate-700 text-slate-300'} hover:bg-blue-500 transition">${r}×</button>`
-            ).join('')}
-            <button onclick="const va=document.getElementById('cmp-a'),vb=document.getElementById('cmp-b');va.paused?va.play()&&vb.play():va.pause()&&vb.pause()"
+            ${this._buildSpeedButtons('#cmp-a, #cmp-b', 'cspeed-btn')}
+            <button id="cmp-playpause"
                     class="text-sm px-4 py-1 rounded bg-slate-700 text-slate-300 hover:bg-slate-500 transition ml-2">Play/Pause</button>
           </div>
-          <button onclick="document.getElementById('compare-overlay').remove()"
+          <button id="cmp-close-btn"
                   class="text-slate-400 hover:text-white text-sm bg-slate-800 px-4 py-2 rounded-lg transition">Close [Esc]</button>
         </div>
         <div class="flex flex-col sm:flex-row flex-1 gap-2 min-h-0">
@@ -715,10 +759,16 @@ document.addEventListener('alpine:init', () => {
                    class="flex-1 w-full object-contain bg-black rounded-lg min-h-0"></video>
           </div>
         </div>`;
-      overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+      overlay.addEventListener('click', onBgClick);
       document.body.appendChild(overlay);
-      const esc = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); } };
-      document.addEventListener('keydown', esc);
+      document.addEventListener('keydown', onEsc);
+      document.getElementById('cmp-close-btn').onclick = cleanup;
+      document.getElementById('cmp-playpause').onclick = () => {
+        const va2 = document.getElementById('cmp-a'), vb2 = document.getElementById('cmp-b');
+        if (va2) { va2.paused ? va2.play() : va2.pause(); }
+        if (vb2) { vb2.paused ? vb2.play() : vb2.pause(); }
+      };
       // Sync seek: when one video seeked, sync the other
       const sync = (src, dst) => src.addEventListener('seeked', () => { dst.currentTime = src.currentTime; });
       const va = document.getElementById('cmp-a'), vb = document.getElementById('cmp-b');
@@ -737,6 +787,16 @@ document.addEventListener('alpine:init', () => {
       return `${parseInt(h)}h`;
     },
 
+    // ── Resolution validation (FE10) ─────────────────────────────────────
+    _resolutionPattern: /^\d+x\d+$/,
+
+    validateResolution() {
+      if (!this._resolutionPattern.test(this.renderResolution)) {
+        this.toast('Resolution must be in WxH format (e.g. 1920x1080)', 'error');
+        this.renderResolution = '1920x1080';
+      }
+    },
+
     // ── Render estimate ───────────────────────────────────────────────────
     lastRenderEstimate: null,
 
@@ -746,6 +806,107 @@ document.addEventListener('alpine:init', () => {
       this.lastRenderEstimate = fc > 0
         ? `~${dur}s video · ${fc} frames`
         : 'No frames yet';
+    },
+
+    // ── Render auto-refresh (UX10) ────────────────────────────────────────
+    renderAutoRefresh: false,
+    _renderAutoRefreshTimer: null,
+
+    toggleRenderAutoRefresh() {
+      this.renderAutoRefresh = !this.renderAutoRefresh;
+      if (this.renderAutoRefresh) {
+        this._renderAutoRefreshTimer = setInterval(() => this.loadRendersQueue(), 7000);
+      } else {
+        clearInterval(this._renderAutoRefreshTimer);
+        this._renderAutoRefreshTimer = null;
+      }
+    },
+
+    // ── Custom confirm dialog (UX7) ───────────────────────────────────────
+    _confirmResolve: null,
+    showConfirmModal: false,
+    confirmMessage: '',
+    confirmTitle: '',
+
+    async confirm(message, title = 'Confirm') {
+      this.confirmMessage = message;
+      this.confirmTitle = title;
+      this.showConfirmModal = true;
+      return new Promise(resolve => { this._confirmResolve = resolve; });
+    },
+
+    _confirmYes() {
+      this.showConfirmModal = false;
+      if (this._confirmResolve) { this._confirmResolve(true); this._confirmResolve = null; }
+    },
+
+    _confirmNo() {
+      this.showConfirmModal = false;
+      if (this._confirmResolve) { this._confirmResolve(false); this._confirmResolve = null; }
+    },
+
+    // ── Undo delete (UX1) ─────────────────────────────────────────────────
+    _undoQueue: [],  // { id, type, data, timer }
+
+    _pushUndo(item) {
+      this._undoQueue.push(item);
+      const undoId = item.id;
+      this.toast(`${item.label} deleted — Undo?`, 'info', null, undoId);
+      item.timer = setTimeout(() => {
+        // Grace period expired — execute real delete
+        item.doDelete();
+        this._undoQueue = this._undoQueue.filter(u => u.id !== undoId);
+      }, 5000);
+    },
+
+    undoDelete(undoId) {
+      const item = this._undoQueue.find(u => u.id === undoId);
+      if (!item) return;
+      clearTimeout(item.timer);
+      this._undoQueue = this._undoQueue.filter(u => u.id !== undoId);
+      item.doRestore();
+      this.dismissToastsForUndo(undoId);
+      this.toast('Delete undone', 'success');
+    },
+
+    dismissToastsForUndo(undoId) {
+      this.toasts = this.toasts.filter(t => t.undoId !== undoId);
+    },
+
+    // ── Dirty form tracking (UX2) ─────────────────────────────────────────
+    _formOriginal: null,
+
+    get formIsDirty() {
+      if (!this._formOriginal) return false;
+      return JSON.stringify(this.form) !== JSON.stringify(this._formOriginal);
+    },
+
+    // ── Frame pagination (FE3) ────────────────────────────────────────────
+    framePageSize: 100,
+    framePage: 0,
+
+    get pagedFrames() {
+      const start = this.framePage * this.framePageSize;
+      return this.activeProjectFrames.slice(start, start + this.framePageSize);
+    },
+
+    get frameTotalPages() {
+      return Math.max(1, Math.ceil(this.activeProjectFrames.length / this.framePageSize));
+    },
+
+    // ── Batch progress tracking (UX4) ─────────────────────────────────────
+    batchProgress: null,  // null | { done: N, total: N, label: string }
+
+    async _runBatch(ids, label, fn) {
+      this.batchProgress = { done: 0, total: ids.length, label };
+      const results = [];
+      for (const id of ids) {
+        const r = await fn(id);
+        results.push(r);
+        this.batchProgress = { done: results.length, total: ids.length, label };
+      }
+      this.batchProgress = null;
+      return results;
     },
 
     // ── Historical date range helpers ─────────────────────────────────────
@@ -818,6 +979,7 @@ document.addEventListener('alpine:init', () => {
     openEditForm(project) {
       this.formMode = 'edit';
       this.form = { ...project };
+      this._formOriginal = { ...project };  // for dirty tracking (UX2)
       this.view = 'create_project';
     },
 
@@ -847,8 +1009,24 @@ document.addEventListener('alpine:init', () => {
 
     _submitting: false,
 
+    _validateForm() {
+      // Client-side validation before API call (FE4)
+      if (!this.form.name || !this.form.name.trim()) {
+        this.toast('Project name is required', 'error'); return false;
+      }
+      if (!this.form.camera_id) {
+        this.toast('Please select a camera', 'error'); return false;
+      }
+      const interval = parseInt(this.form.interval_seconds);
+      if (!interval || interval < 1) {
+        this.toast('Interval must be at least 1 second', 'error'); return false;
+      }
+      return true;
+    },
+
     async submitForm() {
       if (this._submitting) return;  // prevent double-submit (#27)
+      if (!this._validateForm()) return;
       this._submitting = true;
       try {
         if (this.formMode === 'create') {
@@ -1073,6 +1251,33 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    // ── Centralized timer cleanup (FE1) ───────────────────────────────────
+    clearAllPollingTimers() {
+      if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
+      if (this._renderPollTimer) { clearInterval(this._renderPollTimer); this._renderPollTimer = null; }
+      if (this._cameraGridTimer) { clearInterval(this._cameraGridTimer); this._cameraGridTimer = null; }
+      if (this.gifPollTimer) { clearInterval(this.gifPollTimer); this.gifPollTimer = null; }
+      if (this.previewTimer) { clearInterval(this.previewTimer); this.previewTimer = null; }
+      if (this._renderAutoRefreshTimer) { clearInterval(this._renderAutoRefreshTimer); this._renderAutoRefreshTimer = null; }
+    },
+
+    // ── Mobile tap-to-preview (UX8) ───────────────────────────────────────
+    tapPreviewFrame: null,
+
+    onFrameTap(frame) {
+      // On touch devices, show a larger preview overlay
+      if (!window.matchMedia('(pointer: coarse)').matches) return;
+      if (this.tapPreviewFrame?.id === frame.id) {
+        this.tapPreviewFrame = null;
+        return;
+      }
+      this.tapPreviewFrame = frame;
+    },
+
+    closeTapPreview() {
+      this.tapPreviewFrame = null;
+    },
+
     _pollTimer: null,
     startPolling() {
       this._pollTimer = setInterval(() => this.loadAll(), 30000);
@@ -1085,10 +1290,12 @@ document.addEventListener('alpine:init', () => {
     },
 
     // ── Toast ─────────────────────────────────────────────────────────────
-    toast(message, type = 'success', projectId = null) {
-      const id = Date.now();
-      this.toasts.push({ id, message, type, projectId });
-      setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 4000);
+    _toastCounter: 0,
+
+    toast(message, type = 'success', projectId = null, undoId = null) {
+      const id = ++this._toastCounter;  // monotonic counter avoids Date.now() collisions (FE7)
+      this.toasts.push({ id, message, type, projectId, undoId });
+      setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, undoId ? 5500 : 4000);
     },
 
     dismissToast(id) {
@@ -1096,6 +1303,17 @@ document.addEventListener('alpine:init', () => {
     },
 
     clickToast(t) {
+      if (t.undoId) {
+        // Undo action toast — trigger undo rather than navigate (UX1)
+        this.undoDelete(t.undoId);
+        return;
+      }
+      // Click-to-copy error text (UX6)
+      if (t.type === 'error' && navigator.clipboard) {
+        navigator.clipboard.writeText(t.message).catch(() => {});
+        this.dismissToast(t.id);
+        return;
+      }
       this.dismissToast(t.id);
       if (t.projectId) {
         const proj = this.projects.find(p => p.id === t.projectId);
@@ -1136,6 +1354,22 @@ document.addEventListener('alpine:init', () => {
             if (this.view === 'project_detail' && this.detailTab === 'overview') {
               e.preventDefault();
               this.markCompareFrame();
+            }
+            break;
+          // Historical range preset shortcuts: 1=24h, 2=7d, 3=30d (UX9)
+          case '1':
+            if (this.view === 'project_detail') {
+              this.applyHistoricalPreset(this.historicalPresets[0]); e.preventDefault();
+            }
+            break;
+          case '2':
+            if (this.view === 'project_detail') {
+              this.applyHistoricalPreset(this.historicalPresets[1]); e.preventDefault();
+            }
+            break;
+          case '3':
+            if (this.view === 'project_detail') {
+              this.applyHistoricalPreset(this.historicalPresets[2]); e.preventDefault();
             }
             break;
           case 'ArrowLeft':

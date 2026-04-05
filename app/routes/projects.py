@@ -262,7 +262,14 @@ async def update_project(project_id: int, payload: ProjectUpdate) -> dict:
 
 
 @router.post("/projects/{project_id}/clone", status_code=201)
-async def clone_project(project_id: int) -> dict:
+async def clone_project(
+    project_id: int,
+    copy_frames_days: int | None = None,
+) -> dict:
+    """Clone a project config. Optionally copy the last N days of frames (F10).
+
+    copy_frames_days: if set, copies frame DB records (and files) from the last N days.
+    """
     import os
 
     source = _get_project_or_404(project_id)
@@ -318,7 +325,113 @@ async def clone_project(project_id: int) -> dict:
     if source["project_type"] == "live":
         await add_project_job(new_id, source["interval_seconds"])
 
+    # Optionally copy last N days of frames (F10)
+    if copy_frames_days and copy_frames_days > 0:
+        import contextlib
+        from datetime import UTC, datetime, timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(days=copy_frames_days)).isoformat()
+        src_frame_dir = f"{settings.frames_path}/{project_id}"
+        dst_frame_dir = f"{settings.frames_path}/{new_id}"
+        src_thumb_dir = f"{settings.thumbnails_path}/{project_id}"
+        dst_thumb_dir = f"{settings.thumbnails_path}/{new_id}"
+
+        with get_connection() as conn:
+            frame_rows = conn.execute(
+                "SELECT * FROM frames WHERE project_id = ? AND captured_at >= ? ORDER BY captured_at ASC",
+                (project_id, cutoff),
+            ).fetchall()
+
+        copied = 0
+        for frame in frame_rows:
+            new_file_path = None
+            new_thumb_path = None
+
+            if frame["file_path"]:
+                src = frame["file_path"]
+                dst = src.replace(src_frame_dir, dst_frame_dir, 1)
+                try:
+                    import shutil as _shutil
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    _shutil.copy2(src, dst)
+                    new_file_path = dst
+                except OSError:
+                    continue
+
+            if frame["thumbnail_path"]:
+                tsrc = frame["thumbnail_path"]
+                tdst = tsrc.replace(src_thumb_dir, dst_thumb_dir, 1)
+                with contextlib.suppress(OSError):
+                    import shutil as _shutil
+                    os.makedirs(os.path.dirname(tdst), exist_ok=True)
+                    _shutil.copy2(tsrc, tdst)
+                    new_thumb_path = tdst
+
+            with get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path,
+                        file_size, is_dark, bookmark_note, sharpness_score, is_blurry)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        new_id, frame["captured_at"], new_file_path, new_thumb_path,
+                        frame["file_size"], frame["is_dark"], frame["bookmark_note"],
+                        frame["sharpness_score"], frame["is_blurry"],
+                    ),
+                )
+                conn.commit()
+            copied += 1
+
+        # Sync frame_count
+        with get_connection() as conn:
+            conn.execute("UPDATE projects SET frame_count = ? WHERE id = ?", (copied, new_id))
+            conn.commit()
+
     return _get_project_or_404(new_id)
+
+
+@router.get("/projects/{project_id}/schedule-test")
+def schedule_test(
+    project_id: int,
+    timestamp: str | None = None,
+) -> dict:
+    """Test whether a project would capture at a given ISO timestamp (or now). (F8)"""
+    from app.capture import _check_capture_mode  # type: ignore[attr-defined]
+    from datetime import datetime, timezone
+
+    project = _get_project_or_404(project_id)
+
+    if timestamp:
+        try:
+            test_time = datetime.fromisoformat(timestamp)
+            if test_time.tzinfo is None:
+                test_time = test_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid timestamp: {timestamp!r}")
+    else:
+        test_time = datetime.now(timezone.utc)
+
+    # _check_capture_mode uses datetime.now() internally — patch it temporarily
+    import unittest.mock as _mock
+    with _mock.patch("app.capture.datetime") as mock_dt:
+        mock_dt.now.return_value = test_time
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        try:
+            would_capture = _check_capture_mode(project)
+        except Exception as exc:
+            would_capture = None
+            error = str(exc)
+        else:
+            error = None
+
+    return {
+        "project_id": project_id,
+        "timestamp": test_time.isoformat(),
+        "capture_mode": project.get("capture_mode"),
+        "would_capture": would_capture,
+        "error": error,
+    }
 
 
 @router.delete("/projects/{project_id}", status_code=204)

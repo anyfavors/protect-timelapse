@@ -33,6 +33,7 @@ async def run_maintenance() -> None:
     await _prune_old_frames()
     await _prune_old_renders()
     await _schedule_auto_renders()
+    await _backup_database()
     log.info("Maintenance run complete")
 
 
@@ -175,6 +176,22 @@ async def _schedule_auto_renders() -> None:
             await _maybe_insert_render(
                 project_id, framerate, "auto_monthly", month_start, yesterday_end
             )
+
+
+async def _backup_database() -> None:
+    """Create a daily SQLite backup alongside the main DB (B5)."""
+    import shutil as _shutil
+    from app.config import get_settings
+    settings = get_settings()
+    src = settings.database_path
+    if not os.path.exists(src):
+        return
+    backup_path = src + ".backup"
+    try:
+        _shutil.copy2(src, backup_path)
+        log.info("Database backed up to %s", backup_path)
+    except OSError as exc:
+        log.error("Database backup failed: %s", exc)
 
 
 async def _maybe_insert_render(

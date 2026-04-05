@@ -5,12 +5,12 @@ import logging
 import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.database import get_connection
-from app.render import estimate_render
+from app.render import cancel_active_render, estimate_render
 
 router = APIRouter(prefix="/api", tags=["renders"])
 log = logging.getLogger("app.routes.renders")
@@ -31,6 +31,7 @@ class RenderCreate(BaseModel):
     frame_blend: bool = False
     stabilize: bool = False
     color_grade: str = Field(default="none", pattern="^(none|neutral|warm|cool|cinematic)$")
+    priority: int = Field(default=5, ge=1, le=10, description="Queue priority 1 (low) to 10 (high)")
 
 
 def _row_to_dict(row: Any) -> dict:
@@ -77,8 +78,8 @@ def create_render(payload: RenderCreate) -> dict:
                 project_id, framerate, resolution, render_type, label,
                 range_start, range_end,
                 estimated_duration_seconds, estimated_file_size_bytes,
-                quality, flicker_reduction, frame_blend, stabilize, color_grade
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                quality, flicker_reduction, frame_blend, stabilize, color_grade, priority
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload.project_id,
@@ -95,6 +96,7 @@ def create_render(payload: RenderCreate) -> dict:
                 int(payload.frame_blend),
                 int(payload.stabilize),
                 payload.color_grade,
+                payload.priority,
             ),
         )
         conn.commit()
@@ -160,6 +162,66 @@ def download_render(render_id: int) -> FileResponse:
         media_type="video/mp4",
         filename=filename,
     )
+
+
+@router.put("/renders/{render_id}/priority", status_code=200)
+def set_render_priority(render_id: int, priority: int = Query(ge=1, le=10)) -> dict:
+    """Update render queue priority 1 (low) to 10 (high) (F5)."""
+    render = _get_render_or_404(render_id)
+    if render["status"] not in ("pending",):
+        raise HTTPException(status_code=409, detail="Can only reprioritize pending renders")
+    with get_connection() as conn:
+        conn.execute("UPDATE renders SET priority = ? WHERE id = ?", (priority, render_id))
+        conn.commit()
+    return {"render_id": render_id, "priority": priority}
+
+
+@router.post("/renders/{render_id}/cancel", status_code=200)
+async def cancel_render(render_id: int) -> dict:
+    """Cancel a pending or in-progress render (F1)."""
+    render = _get_render_or_404(render_id)
+    if render["status"] not in ("pending", "rendering"):
+        raise HTTPException(status_code=409, detail=f"Render {render_id} is not cancellable (status={render['status']})")
+
+    # Kill ffmpeg if this render is currently running
+    killed = await cancel_active_render(render_id)
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE renders SET status='error', error_msg='Cancelled by user' WHERE id = ? AND status IN ('pending','rendering')",
+            (render_id,),
+        )
+        conn.commit()
+
+    log.info("Render id=%d cancelled (ffmpeg_killed=%s)", render_id, killed)
+    return {"render_id": render_id, "cancelled": True, "ffmpeg_killed": killed}
+
+
+@router.get("/renders/{render_id_a}/compare/{render_id_b}")
+def compare_renders(render_id_a: int, render_id_b: int) -> dict:
+    """Return metadata diff between two renders for side-by-side comparison (F9)."""
+    a = _get_render_or_404(render_id_a)
+    b = _get_render_or_404(render_id_b)
+
+    def _summary(r: dict) -> dict:
+        return {
+            "id": r["id"],
+            "label": r.get("label"),
+            "status": r["status"],
+            "resolution": r.get("resolution"),
+            "framerate": r.get("framerate"),
+            "quality": r.get("quality"),
+            "flicker_reduction": r.get("flicker_reduction"),
+            "color_grade": r.get("color_grade"),
+            "frame_blend": bool(r.get("frame_blend")),
+            "stabilize": bool(r.get("stabilize")),
+            "file_size_bytes": r.get("file_size"),
+            "estimated_duration_seconds": r.get("estimated_duration_seconds"),
+            "completed_at": r.get("completed_at"),
+            "priority": r.get("priority"),
+        }
+
+    return {"a": _summary(a), "b": _summary(b)}
 
 
 @router.delete("/renders/{render_id}", status_code=204)

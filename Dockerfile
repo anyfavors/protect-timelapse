@@ -12,6 +12,13 @@ RUN npx @tailwindcss/cli -i app.css.src -o app.css --minify
 # ── Stage 2: Python runtime ──────────────────────────────────────────────────
 FROM python:3.12-slim
 
+ARG BUILD_DATE
+ARG VERSION=dev
+
+LABEL org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.title="protect-timelapse"
+
 WORKDIR /app
 
 # System deps: ffmpeg for rendering, curl for healthcheck
@@ -27,6 +34,13 @@ COPY . .
 
 # Inject compiled CSS from the CSS build stage
 COPY --from=css-build /src/app.css ./static/app.css
+
+# Non-root user for security (B9)
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /data && \
+    chown -R appuser:appuser /app /data
+
+USER appuser
 
 # Storage volume — must be mounted at runtime
 VOLUME ["/data"]

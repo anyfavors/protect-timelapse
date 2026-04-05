@@ -3,6 +3,7 @@ import shutil
 import time
 
 from fastapi import APIRouter
+from fastapi.responses import Response
 
 from app.config import get_settings
 from app.database import get_connection
@@ -14,6 +15,14 @@ router = APIRouter(tags=["health"])
 _disk_cache: dict | None = None
 _disk_cache_ts: float = 0.0
 _DISK_CACHE_TTL = 60.0
+
+# Render worker heartbeat tracking (B2)
+_last_render_worker_heartbeat: float = 0.0
+
+
+def update_render_worker_heartbeat() -> None:
+    global _last_render_worker_heartbeat
+    _last_render_worker_heartbeat = time.monotonic()
 
 
 def _dir_size_gb(path: str) -> float:
@@ -45,6 +54,44 @@ async def health() -> dict:
         "nvr_connected": protect_manager.is_connected,
         "disk_free_gb": free_gb,
         "disk_total_gb": total_gb,
+    }
+
+
+@router.get("/api/health/live")
+async def liveness() -> Response:
+    """Liveness probe: 200 if render worker polled in last 120s (B2)."""
+    now = time.monotonic()
+    # First 120s after startup — always healthy (worker may not have polled yet)
+    if _last_render_worker_heartbeat == 0.0 or (now - _last_render_worker_heartbeat) < 120.0:
+        return Response(content='{"status":"ok"}', media_type="application/json", status_code=200)
+    return Response(
+        content='{"status":"unhealthy","reason":"render_worker_stalled"}',
+        media_type="application/json",
+        status_code=503,
+    )
+
+
+@router.get("/api/health/ready")
+async def readiness() -> Response:
+    """Readiness probe: 200 if NVR is connected (B2)."""
+    if protect_manager.is_connected:
+        return Response(content='{"status":"ok"}', media_type="application/json", status_code=200)
+    return Response(
+        content='{"status":"not_ready","reason":"nvr_disconnected"}',
+        media_type="application/json",
+        status_code=503,
+    )
+
+
+@router.get("/api/admin/pool-stats")
+def pool_stats() -> dict:
+    """Connection pool diagnostics (B10)."""
+    from app.database import _pool, _POOL_SIZE
+    idle = _pool.qsize()
+    return {
+        "pool_size": _POOL_SIZE,
+        "idle_connections": idle,
+        "active_connections": _POOL_SIZE - idle,
     }
 
 

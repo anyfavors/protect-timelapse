@@ -22,6 +22,27 @@ log = logging.getLogger("app.render")
 _stop_event: asyncio.Event | None = None
 _worker_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
+# Track the currently-running render so it can be cancelled (F1)
+_active_render_id: int | None = None
+_active_proc: asyncio.subprocess.Process | None = None  # type: ignore[type-arg]
+
+
+def get_active_render_id() -> int | None:
+    return _active_render_id
+
+
+async def cancel_active_render(render_id: int) -> bool:
+    """Kill the ffmpeg process if render_id is currently rendering. Returns True if killed."""
+    global _active_proc, _active_render_id
+    if _active_render_id != render_id or _active_proc is None:
+        return False
+    try:
+        _active_proc.kill()
+        log.info("Render id=%d cancelled by user request", render_id)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
 
 async def start_render_worker() -> "asyncio.Task[None]":
     global _stop_event, _worker_task
@@ -49,6 +70,9 @@ async def stop_render_worker(task: "asyncio.Task[None]") -> None:
 async def _render_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
+            # Update heartbeat so liveness probe knows worker is alive (B2)
+            from app.routes.health import update_render_worker_heartbeat
+            update_render_worker_heartbeat()
             await _process_next_render()
         except Exception as exc:
             log.error("Render loop error: %s", exc)
@@ -67,7 +91,8 @@ async def _render_loop(stop: asyncio.Event) -> None:
 async def _process_next_render() -> None:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM renders WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+            # Higher priority (larger number) runs first; ties broken by created_at (F5)
+            "SELECT * FROM renders WHERE status = 'pending' ORDER BY COALESCE(priority,5) DESC, created_at ASC LIMIT 1"
         ).fetchone()
     if row is None:
         return
@@ -81,6 +106,9 @@ async def _process_next_render() -> None:
     with get_connection() as conn:
         conn.execute("UPDATE renders SET status = 'rendering' WHERE id = ?", (render_id,))
         conn.commit()
+
+    global _active_render_id
+    _active_render_id = render_id
 
     log.info(
         "Starting render id=%d project=%d type=%s", render_id, project_id, render["render_type"]
@@ -160,8 +188,16 @@ async def _process_next_render() -> None:
             stderr=asyncio.subprocess.PIPE,
         )
 
+        global _active_proc
+        _active_proc = proc  # expose for cancellation (F1)
+
+        # Adaptive timeout: base + 2s per frame, capped at configured max (B8)
+        base_timeout = getattr(settings, "ffmpeg_timeout_seconds", 7200)
+        adaptive_timeout = min(base_timeout, max(300, total_frames * 2))
+        log.debug("Render id=%d: adaptive timeout=%ds for %d frames", render_id, adaptive_timeout, total_frames)
+
         # Progress monitoring
-        await _monitor_progress(proc, render_id, total_frames, settings.ffmpeg_timeout_seconds)
+        await _monitor_progress(proc, render_id, total_frames, adaptive_timeout)
 
         if proc.returncode != 0:
             stderr_bytes = await proc.stderr.read() if proc.stderr else b""  # type: ignore[union-attr]
@@ -236,6 +272,8 @@ async def _process_next_render() -> None:
         )
 
     finally:
+        _active_render_id = None
+        _active_proc = None
         with contextlib.suppress(FileNotFoundError):
             os.remove(concat_file)
         if "transforms_file" in locals() and transforms_file:

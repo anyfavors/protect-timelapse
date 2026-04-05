@@ -279,6 +279,10 @@ _SCHEMA_V6 = """
 ALTER TABLE projects ADD COLUMN solar_noon_window_minutes INTEGER DEFAULT 30;
 """
 
+_SCHEMA_V7 = """
+ALTER TABLE renders ADD COLUMN priority INTEGER DEFAULT 5;
+"""
+
 
 def _migrate_v5(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_V5)
@@ -289,6 +293,10 @@ def _migrate_v6(conn: sqlite3.Connection) -> None:
     _migrate_alter(conn, _SCHEMA_V6)
 
 
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, _SCHEMA_V7)
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
@@ -297,6 +305,7 @@ MIGRATIONS: dict[int, object] = {
     4: _migrate_v4,
     5: _migrate_v5,
     6: _migrate_v6,
+    7: _migrate_v7,
 }
 
 

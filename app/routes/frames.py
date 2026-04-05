@@ -1,6 +1,7 @@
 """Frame listing, serving, bookmarks, stats, and export routes."""
 
 import asyncio
+import csv
 import io
 import logging
 import os
@@ -57,6 +58,12 @@ def list_frames(
     fields: str | None = Query(
         default=None, description="Comma-separated field names (e.g. id,captured_at)"
     ),
+    # F7: search/filter parameters
+    after: str | None = Query(default=None, description="ISO timestamp lower bound (inclusive)"),
+    before: str | None = Query(default=None, description="ISO timestamp upper bound (inclusive)"),
+    bookmarked: bool | None = Query(default=None, description="Filter to bookmarked frames only"),
+    is_dark: bool | None = Query(default=None, description="Filter by dark flag"),
+    is_blurry: bool | None = Query(default=None, description="Filter by blurry flag"),
 ) -> list[dict]:
     _get_project_or_404(project_id)
 
@@ -79,19 +86,41 @@ def list_frames(
 
     direction = "ASC" if order == "asc" else "DESC"
 
+    # Build filter conditions (F7)
+    conditions = ["project_id = ?"]
+    params: list = [project_id]
+
     if after_id is not None:
-        # Cursor-based: avoids full-table scan on large projects
         op = ">" if direction == "ASC" else "<"
-        with get_connection() as conn:
+        conditions.append(f"id {op} ?")
+        params.append(after_id)
+    if after:
+        conditions.append("captured_at >= ?")
+        params.append(after)
+    if before:
+        conditions.append("captured_at <= ?")
+        params.append(before)
+    if bookmarked is True:
+        conditions.append("bookmark_note IS NOT NULL")
+    if is_dark is not None:
+        conditions.append("is_dark = ?")
+        params.append(1 if is_dark else 0)
+    if is_blurry is not None:
+        conditions.append("(is_blurry IS NOT NULL AND is_blurry = ?)")
+        params.append(1 if is_blurry else 0)
+
+    where = " AND ".join(conditions)
+
+    with get_connection() as conn:
+        if after_id is not None:
             rows = conn.execute(
-                f"SELECT {select_cols} FROM frames WHERE project_id = ? AND id {op} ? ORDER BY id {direction} LIMIT ?",
-                (project_id, after_id, limit),
+                f"SELECT {select_cols} FROM frames WHERE {where} ORDER BY id {direction} LIMIT ?",
+                params + [limit],
             ).fetchall()
-    else:
-        with get_connection() as conn:
+        else:
             rows = conn.execute(
-                f"SELECT {select_cols} FROM frames WHERE project_id = ? ORDER BY captured_at {direction} LIMIT ? OFFSET ?",
-                (project_id, limit, offset),
+                f"SELECT {select_cols} FROM frames WHERE {where} ORDER BY captured_at {direction} LIMIT ? OFFSET ?",
+                params + [limit, offset],
             ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
@@ -224,6 +253,63 @@ def delete_frame(project_id: int, frame_id: int) -> None:
 
 
 # -------------------------------------------------------------------------
+# Batch frame delete (F2)
+# -------------------------------------------------------------------------
+
+
+@router.delete("/projects/{project_id}/frames", status_code=200)
+def delete_frames_batch(
+    project_id: int,
+    filter: str = Query(pattern="^(is_blurry|is_dark|all)$"),
+    limit: int = Query(default=500, ge=1, le=5000),
+) -> dict:
+    """Bulk delete frames by quality filter. Returns count of deleted frames."""
+    import contextlib
+
+    _get_project_or_404(project_id)
+
+    if filter == "is_blurry":
+        where = "project_id = ? AND is_blurry = 1"
+    elif filter == "is_dark":
+        where = "project_id = ? AND is_dark = 1"
+    else:
+        where = "project_id = ?"
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT id, file_path, thumbnail_path FROM frames WHERE {where} LIMIT ?",
+            (project_id, limit),
+        ).fetchall()
+
+    if not rows:
+        return {"deleted": 0}
+
+    # Delete files from disk
+    for frame in rows:
+        for path_key in ("file_path", "thumbnail_path"):
+            path = frame[path_key]
+            if path:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
+
+    # Delete DB rows then update frame_count
+    frame_ids = [r["id"] for r in rows]
+    placeholders = ",".join("?" * len(frame_ids))
+    with get_connection() as conn:
+        conn.execute(f"DELETE FROM frames WHERE id IN ({placeholders})", frame_ids)
+        count_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM frames WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        conn.execute(
+            "UPDATE projects SET frame_count = ? WHERE id = ?",
+            (count_row["cnt"], project_id),
+        )
+        conn.commit()
+
+    return {"deleted": len(frame_ids)}
+
+
+# -------------------------------------------------------------------------
 # Blurry frames gallery
 # -------------------------------------------------------------------------
 
@@ -292,6 +378,103 @@ def export_frames(project_id: int) -> StreamingResponse:
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=project_{project_id}_frames.zip"},
     )
+
+
+# -------------------------------------------------------------------------
+# CSV metadata export (F6)
+# -------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/frames/export/csv")
+def export_frames_csv(project_id: int) -> StreamingResponse:
+    """Export frame metadata (timestamps, quality, bookmarks) as CSV."""
+    _get_project_or_404(project_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, captured_at, file_size, is_dark, is_blurry, sharpness_score, bookmark_note
+            FROM frames WHERE project_id = ? ORDER BY captured_at ASC
+            """,
+            (project_id,),
+        ).fetchall()
+
+    from collections.abc import Iterator
+
+    def _generate_csv() -> Iterator[bytes]:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "captured_at", "file_size", "is_dark", "is_blurry", "sharpness_score", "bookmark_note"])
+        for row in rows:
+            writer.writerow([
+                row["id"], row["captured_at"], row["file_size"],
+                bool(row["is_dark"]), bool(row["is_blurry"]),
+                row["sharpness_score"], row["bookmark_note"],
+            ])
+        yield buf.getvalue().encode()
+
+    return StreamingResponse(
+        _generate_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=project_{project_id}_frames.csv"},
+    )
+
+
+# -------------------------------------------------------------------------
+# Frame interval analyzer (F4)
+# -------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/frames/analyze-interval")
+def analyze_interval(
+    project_id: int,
+    target_duration_seconds: int = Query(default=60, ge=5, le=600, description="Target video length in seconds"),
+    target_fps: int = Query(default=30, ge=1, le=120),
+) -> dict:
+    """Suggest optimal capture interval to hit a target video duration at given fps."""
+    _get_project_or_404(project_id)
+    with get_connection() as conn:
+        count_row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM frames WHERE project_id = ? AND is_dark = 0",
+            (project_id,),
+        ).fetchone()
+        span_row = conn.execute(
+            "SELECT MIN(captured_at) as first, MAX(captured_at) as last FROM frames WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+
+    total_frames = count_row["cnt"] if count_row else 0
+    first_ts = span_row["first"] if span_row else None
+    last_ts = span_row["last"] if span_row else None
+
+    target_frames = target_duration_seconds * target_fps
+    current_video_seconds = total_frames / target_fps if target_fps else 0
+
+    suggestion = None
+    if first_ts and last_ts and total_frames > 1:
+        from datetime import datetime
+        try:
+            span_secs = (
+                datetime.fromisoformat(last_ts) - datetime.fromisoformat(first_ts)
+            ).total_seconds()
+            if span_secs > 0 and target_frames > 0:
+                suggested_interval = max(1, int(span_secs / target_frames))
+                suggestion = suggested_interval
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "total_non_dark_frames": total_frames,
+        "current_video_seconds_at_target_fps": round(current_video_seconds, 1),
+        "target_duration_seconds": target_duration_seconds,
+        "target_fps": target_fps,
+        "target_frames_needed": target_frames,
+        "suggested_interval_seconds": suggestion,
+        "note": (
+            f"To produce a ~{target_duration_seconds}s video at {target_fps}fps you need "
+            f"~{target_frames} frames. "
+            + (f"Based on your recording span, capture every ~{suggestion}s." if suggestion else "Not enough data yet.")
+        ),
+    }
 
 
 # -------------------------------------------------------------------------
