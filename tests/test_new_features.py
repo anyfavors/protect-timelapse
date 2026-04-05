@@ -44,8 +44,15 @@ def _make_app(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         yield
 
     application = FastAPI(lifespan=_noop)
-    for r in (frames.router, health.router, projects.router, renders.router,
-              settings.router, notifications.router, cameras.router):
+    for r in (
+        frames.router,
+        health.router,
+        projects.router,
+        renders.router,
+        settings.router,
+        notifications.router,
+        cameras.router,
+    ):
         application.include_router(r)
     return TestClient(application)
 
@@ -82,8 +89,15 @@ def _insert_frame(
         cur = conn.execute(
             "INSERT INTO frames (project_id, file_path, thumbnail_path, file_size,"
             " is_blurry, is_dark, captured_at) VALUES (?,?,?,?,?,?,?)",
-            (project_id, str(frame_file), str(thumb_file), len(jpeg),
-             is_blurry, is_dark, captured_at),
+            (
+                project_id,
+                str(frame_file),
+                str(thumb_file),
+                len(jpeg),
+                is_blurry,
+                is_dark,
+                captured_at,
+            ),
         )
         conn.execute(
             "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?", (project_id,)
@@ -209,7 +223,9 @@ def test_analyze_interval_with_frames(
     _insert_frame(pid, tmp_path, captured_at="2024-01-01T10:00:00+00:00")
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
-    r = client.get(f"/api/projects/{pid}/frames/analyze-interval?target_duration_seconds=60&target_fps=30")
+    r = client.get(
+        f"/api/projects/{pid}/frames/analyze-interval?target_duration_seconds=60&target_fps=30"
+    )
     assert r.status_code == 200
     data = r.json()
     assert data["total_non_dark_frames"] == 3
@@ -270,9 +286,7 @@ def test_frame_filter_after_before(
 # ---------------------------------------------------------------------------
 
 
-def test_set_render_priority(
-    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_set_render_priority(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid = _insert_project()
     rid = _insert_render(pid, status="pending")
     client = _make_app(tmp_db, tmp_path, monkeypatch)
@@ -306,6 +320,7 @@ def test_cancel_pending_render(
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
     from app.routes import renders as renders_mod
+
     monkeypatch.setattr(renders_mod, "cancel_active_render", AsyncMock(return_value=False))
 
     r = client.post(f"/api/renders/{rid}/cancel")
@@ -333,9 +348,7 @@ def test_cancel_done_render_rejected(
 # ---------------------------------------------------------------------------
 
 
-def test_compare_renders(
-    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_compare_renders(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid = _insert_project()
     rid_a = _insert_render(pid, status="done")
     rid_b = _insert_render(pid, status="done")
@@ -354,13 +367,12 @@ def test_compare_renders(
 # ---------------------------------------------------------------------------
 
 
-def test_schedule_test_now(
-    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_schedule_test_now(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pid = _insert_project()
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
     import app.capture as capture_mod
+
     monkeypatch.setattr(capture_mod, "_check_capture_mode", lambda p: True, raising=False)
 
     r = client.get(f"/api/projects/{pid}/schedule-test")
@@ -377,11 +389,10 @@ def test_schedule_test_with_timestamp(
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
     import app.capture as capture_mod
+
     monkeypatch.setattr(capture_mod, "_check_capture_mode", lambda p: True, raising=False)
 
-    r = client.get(
-        f"/api/projects/{pid}/schedule-test?timestamp=2024-06-15T12:00:00%2B00:00"
-    )
+    r = client.get(f"/api/projects/{pid}/schedule-test?timestamp=2024-06-15T12:00:00%2B00:00")
     assert r.status_code == 200
     assert r.json()["capture_mode"] == "continuous"
 
@@ -428,6 +439,7 @@ def test_readiness_probe_disconnected(
     tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import app.protect as protect_mod
+
     monkeypatch.setattr(protect_mod.protect_manager, "_connected", False)
 
     client = _make_app(tmp_db, tmp_path, monkeypatch)
@@ -439,6 +451,7 @@ def test_readiness_probe_connected(
     tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import app.protect as protect_mod
+
     monkeypatch.setattr(protect_mod.protect_manager, "_connected", True)
 
     client = _make_app(tmp_db, tmp_path, monkeypatch)
@@ -467,7 +480,9 @@ def test_pool_stats(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
-async def test_backup_database(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_backup_database(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.config as config_mod
     import app.maintenance as maint
 
@@ -500,7 +515,9 @@ async def test_backup_database_missing_src(
 
 
 @pytest.mark.asyncio
-async def test_prune_old_renders(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_prune_old_renders(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.maintenance as maint
 
     pid = _insert_project()
@@ -509,6 +526,7 @@ async def test_prune_old_renders(tmp_db: Path, tmp_path: Path, monkeypatch: pyte
 
     # Use monkeypatched get_connection in maintenance module
     import app.database as db_mod
+
     monkeypatch.setattr(maint, "get_connection", db_mod.get_connection)
 
     # Insert 9 daily auto-renders with distinct timestamps (keep limit is 7)
@@ -545,6 +563,7 @@ async def test_schedule_auto_renders_no_frames(
     """With no frames, no auto-render should be scheduled."""
     import app.database as db_mod
     import app.maintenance as maint
+
     monkeypatch.setattr(maint, "get_connection", db_mod.get_connection)
 
     _insert_project()
@@ -599,6 +618,7 @@ async def test_send_notification_no_webhook(
     """send_notification should write DB row and not crash without webhook."""
     import app.database as db_mod
     import app.notifications as notif_mod
+
     monkeypatch.setattr(notif_mod, "get_connection", db_mod.get_connection)
 
     # Stub out websocket broadcast
@@ -621,6 +641,7 @@ async def test_send_notification_ssrf_blocked(
     """SSRF-blocked webhook should log warning and not make HTTP call."""
     import app.database as db_mod
     import app.notifications as notif_mod
+
     monkeypatch.setattr(notif_mod, "get_connection", db_mod.get_connection)
     monkeypatch.setattr(notif_mod, "_get_webhook_url", lambda: "http://localhost/hook")
 
@@ -661,6 +682,7 @@ def test_clone_project_with_frames(
     client = _make_app(tmp_db, tmp_path, monkeypatch)
 
     import app.capture as capture_mod
+
     monkeypatch.setattr(capture_mod, "add_project_job", AsyncMock())
 
     r = client.post(f"/api/projects/{pid}/clone?copy_frames_days=30")
@@ -713,7 +735,10 @@ def test_thumbnail_zero_dimensions() -> None:
     fake_img = MagicMock()
     fake_img.size = (0, 0)
 
-    with patch("app.thumbnails.Image.open", return_value=fake_img), pytest.raises(ValueError, match="Invalid image dimensions"):
+    with (
+        patch("app.thumbnails.Image.open", return_value=fake_img),
+        pytest.raises(ValueError, match="Invalid image dimensions"),
+    ):
         generate_thumbnail(b"fake")
 
 
