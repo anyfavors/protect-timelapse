@@ -21,10 +21,11 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
 
 WORKDIR /app
 
-# System deps: ffmpeg for rendering, curl for healthcheck
+# System deps: ffmpeg for rendering, curl for healthcheck, gosu for entrypoint privilege drop
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
+        gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -40,7 +41,8 @@ RUN useradd -m -u 1000 appuser && \
     mkdir -p /data && \
     chown -R appuser:appuser /app /data
 
-USER appuser
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Storage volume — must be mounted at runtime
 VOLUME ["/data"]
@@ -50,4 +52,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/api/health || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Entrypoint runs as root to fix /data ownership, then drops to appuser via gosu
+ENTRYPOINT ["/entrypoint.sh"]
