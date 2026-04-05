@@ -8,6 +8,7 @@ clients when many projects fire simultaneously at the same interval.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 from typing import Any
@@ -41,6 +42,8 @@ class ConnectionManager:
         if not self._clients:
             return
         # Coalesce capture_event messages
+        # Note: the check+assign below is race-free in single-threaded asyncio —
+        # no two coroutines run concurrently without an await, so this is atomic (#18)
         if event == "capture_event":
             self._pending.setdefault(event, []).append(payload)
             if self._flush_task is None or self._flush_task.done():
@@ -68,8 +71,6 @@ class ConnectionManager:
 
     async def close_all(self) -> None:
         for ws in list(self._clients):
-            import contextlib
-
             with contextlib.suppress(Exception):
                 await ws.close()
         self._clients.clear()

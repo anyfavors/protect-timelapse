@@ -523,3 +523,235 @@ async def test_ws_manager_dead_client_removed() -> None:
     await mgr.connect(ws)  # type: ignore[arg-type]
     await mgr.broadcast("render_progress", {"render_id": 99, "progress_pct": 0})
     assert ws not in mgr._clients
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg filter chain — deflicker guard
+# ---------------------------------------------------------------------------
+
+
+def test_build_ffmpeg_cmd_no_vf_when_no_filters(tmp_db: Path, tmp_path: Path) -> None:
+    """With flicker_reduction='off' and no other filters, -vf must not appear in cmd."""
+    from app.render import _build_ffmpeg_cmd
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "framerate": 30,
+        "render_type": "manual",
+        "resolution": "1920x1080",
+        "quality": "standard",
+        "flicker_reduction": "off",
+        "frame_blend": 0,
+        "stabilize": 0,
+        "color_grade": "none",
+        "range_start": None,
+        "range_end": None,
+    }
+
+    class _S:
+        ffmpeg_threads = 4
+        ffmpeg_timeout_seconds = 3600
+
+    cmd = _build_ffmpeg_cmd(render, "/tmp/c.txt", "/tmp/out.mp4", 5, _S())
+    assert "-vf" not in cmd
+    assert "null" not in cmd
+
+
+def test_build_ffmpeg_cmd_deflicker_skipped_for_small_count(tmp_db: Path, tmp_path: Path) -> None:
+    """deflicker=size=10 must not be added when total_frames < 10."""
+    from app.render import _build_ffmpeg_cmd
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "framerate": 30,
+        "render_type": "manual",
+        "resolution": "1920x1080",
+        "quality": "standard",
+        "flicker_reduction": "standard",
+        "frame_blend": 0,
+        "stabilize": 0,
+        "color_grade": "none",
+        "range_start": None,
+        "range_end": None,
+    }
+
+    class _S:
+        ffmpeg_threads = 4
+        ffmpeg_timeout_seconds = 3600
+
+    cmd = _build_ffmpeg_cmd(render, "/tmp/c.txt", "/tmp/out.mp4", 3, _S())
+    assert "deflicker" not in " ".join(cmd)
+
+
+def test_build_ffmpeg_cmd_deflicker_present_for_large_count(tmp_db: Path, tmp_path: Path) -> None:
+    """deflicker must appear when frame count >= window size."""
+    from app.render import _build_ffmpeg_cmd
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "framerate": 30,
+        "render_type": "manual",
+        "resolution": "1920x1080",
+        "quality": "standard",
+        "flicker_reduction": "standard",
+        "frame_blend": 0,
+        "stabilize": 0,
+        "color_grade": "none",
+        "range_start": None,
+        "range_end": None,
+    }
+
+    class _S:
+        ffmpeg_threads = 4
+        ffmpeg_timeout_seconds = 3600
+
+    cmd = _build_ffmpeg_cmd(render, "/tmp/c.txt", "/tmp/out.mp4", 20, _S())
+    assert "deflicker" in " ".join(cmd)
+
+
+# ---------------------------------------------------------------------------
+# Solar noon capture mode — schedule logic
+# ---------------------------------------------------------------------------
+
+
+def test_solar_noon_capture_mode_accepted(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /api/projects with capture_mode=solar_noon should be accepted (201)."""
+    import app.capture as capture_mod
+    import app.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_settings", None)
+    monkeypatch.setenv("FRAMES_PATH", str(tmp_path / "frames"))
+    monkeypatch.setenv("THUMBNAILS_PATH", str(tmp_path / "thumbs"))
+    monkeypatch.setenv("RENDERS_PATH", str(tmp_path / "renders"))
+
+    jobs: list = []
+    monkeypatch.setattr(capture_mod, "add_project_job", lambda *a, **kw: jobs.append(a))
+
+    client = _make_app(tmp_db, tmp_path, monkeypatch)
+    resp = client.post(
+        "/api/projects",
+        json={
+            "name": "Solar test",
+            "camera_id": "cam-solar",
+            "project_type": "live",
+            "interval_seconds": 60,
+            "capture_mode": "solar_noon",
+            "solar_noon_window_minutes": 30,
+        },
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["capture_mode"] == "solar_noon"
+    assert data["solar_noon_window_minutes"] == 30
+
+
+def test_get_location_uses_db_overrides(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_location() returns DB-overridden tz/lat/lon when set."""
+    import app.capture as capture_mod
+    import app.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_settings", None)
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_db))
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE settings SET tz='Europe/London', latitude=51.5, longitude=-0.1 WHERE id=1"
+        )
+        conn.commit()
+
+    tz, lat, lon = capture_mod._get_location()
+    assert tz == "Europe/London"
+    assert lat == 51.5
+    assert lon == -0.1
+
+
+def test_is_solar_noon_window_returns_bool(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_is_solar_noon_window returns a bool without raising."""
+    import app.capture as capture_mod
+    import app.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_settings", None)
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_db))
+    monkeypatch.setenv("LATITUDE", "55.6")
+    monkeypatch.setenv("LONGITUDE", "12.6")
+    monkeypatch.setenv("TZ", "Europe/Copenhagen")
+
+    project = {"solar_noon_window_minutes": 60}
+    result = capture_mod._is_solar_noon_window(project)
+    assert isinstance(result, bool)
+
+
+# ---------------------------------------------------------------------------
+# Historical extraction error handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_historical_extraction_missing_dates(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extraction with no start/end date must set status=error and not crash."""
+    import app.capture as capture_mod
+    import app.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_settings", None)
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_db))
+    monkeypatch.setenv("FRAMES_PATH", "/tmp/frames_test")
+    monkeypatch.setenv("THUMBNAILS_PATH", "/tmp/thumbs_test")
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (name, camera_id, project_type, interval_seconds, status)"
+            " VALUES (?,?,?,?,?)",
+            ("hist", "cam-1", "historical", 60, "extracting"),
+        )
+        conn.commit()
+    pid = cur.lastrowid
+
+    await capture_mod.run_historical_extraction(pid)
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT status FROM projects WHERE id = ?", (pid,)).fetchone()
+    assert row["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_historical_extraction_end_before_start(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extraction where end <= start must set status=error."""
+    import app.capture as capture_mod
+    import app.config as config_mod
+
+    monkeypatch.setattr(config_mod, "_settings", None)
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_db))
+    monkeypatch.setenv("FRAMES_PATH", "/tmp/frames_test2")
+    monkeypatch.setenv("THUMBNAILS_PATH", "/tmp/thumbs_test2")
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (name, camera_id, project_type, interval_seconds, status, start_date, end_date)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                "hist2",
+                "cam-1",
+                "historical",
+                60,
+                "extracting",
+                "2024-01-02T00:00:00",
+                "2024-01-01T00:00:00",
+            ),
+        )
+        conn.commit()
+    pid = cur.lastrowid
+
+    await capture_mod.run_historical_extraction(pid)
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT status FROM projects WHERE id = ?", (pid,)).fetchone()
+    assert row["status"] == "error"

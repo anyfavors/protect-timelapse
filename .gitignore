@@ -33,6 +33,7 @@ htmlcov/
 *.swp
 *.swo
 *~
+fixes.md
 
 # OS
 .DS_Store

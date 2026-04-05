@@ -58,23 +58,15 @@ async def _prune_old_frames() -> None:
                 (project_id, cutoff_iso),
             ).fetchall()
 
-        deleted = 0
-        for frame in old_frames:
-            with contextlib.suppress(FileNotFoundError):
-                if frame["file_path"]:
-                    os.remove(frame["file_path"])
-            with contextlib.suppress(FileNotFoundError):
-                if frame["thumbnail_path"]:
-                    os.remove(frame["thumbnail_path"])
-            deleted += 1
-
         if old_frames:
+            # Delete DB rows first, then files — prevents a new frame with the same
+            # path from being orphaned if it arrives between fetch and disk delete (#10)
+            frame_ids = [f["id"] for f in old_frames]
+            placeholders = ",".join("?" * len(frame_ids))
             with get_connection() as conn:
                 conn.execute(
-                    "DELETE FROM frames WHERE project_id = ? AND captured_at < ?",
-                    (project_id, cutoff_iso),
+                    f"DELETE FROM frames WHERE id IN ({placeholders})", frame_ids
                 )
-                # Recalculate frame_count to fix potential drift
                 count_row = conn.execute(
                     "SELECT COUNT(*) as cnt FROM frames WHERE project_id = ?", (project_id,)
                 ).fetchone()
@@ -83,6 +75,17 @@ async def _prune_old_frames() -> None:
                     (count_row["cnt"], project_id),
                 )
                 conn.commit()
+
+            deleted = 0
+            for frame in old_frames:
+                with contextlib.suppress(FileNotFoundError):
+                    if frame["file_path"]:
+                        os.remove(frame["file_path"])
+                with contextlib.suppress(FileNotFoundError):
+                    if frame["thumbnail_path"]:
+                        os.remove(frame["thumbnail_path"])
+                deleted += 1
+
             log.info(
                 "Project %d: pruned %d frames older than %d days",
                 project_id,
@@ -118,12 +121,13 @@ async def _prune_old_renders() -> None:
         stale = conn.execute(query).fetchall()
 
     for render in stale:
-        with contextlib.suppress(FileNotFoundError):
-            if render["output_path"]:
-                os.remove(render["output_path"])
+        # Delete DB row before file — prevents inconsistency if process crashes mid-cleanup (#23)
         with get_connection() as conn:
             conn.execute("DELETE FROM renders WHERE id = ?", (render["id"],))
             conn.commit()
+        with contextlib.suppress(FileNotFoundError):
+            if render["output_path"]:
+                os.remove(render["output_path"])
 
     if stale:
         log.info("Pruned %d stale auto-renders", len(stale))

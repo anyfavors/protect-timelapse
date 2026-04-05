@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import tempfile
 import time
 from datetime import UTC, datetime
 
@@ -85,7 +86,11 @@ async def _process_next_render() -> None:
         "Starting render id=%d project=%d type=%s", render_id, project_id, render["render_type"]
     )
 
-    concat_file = f"/tmp/render_{render_id}.txt"
+    # Use unpredictable temp files to prevent symlink/collision attacks (#12)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix=f"render_{render_id}_", delete=False
+    ) as _tf:
+        concat_file = _tf.name
     output_path = os.path.join(settings.renders_path, str(project_id), f"{render_id}.mp4")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -105,7 +110,10 @@ async def _process_next_render() -> None:
         # Stabilization pre-pass (vidstabdetect)
         transforms_file: str | None = None
         if render.get("stabilize"):
-            transforms_file = f"/tmp/transforms_{render_id}.trf"
+            with tempfile.NamedTemporaryFile(
+                suffix=".trf", prefix=f"transforms_{render_id}_", delete=False
+            ) as _tf2:
+                transforms_file = _tf2.name
             stab_cmd = [
                 "ffmpeg",
                 "-y",
@@ -276,7 +284,20 @@ def _get_frame_paths(render: dict) -> list[str]:
                 (project_id,),
             ).fetchall()
 
-    return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+    paths = [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+
+    # Cap frame list to prevent memory exhaustion on huge projects (#21)
+    _MAX_FRAMES_PER_RENDER = 50_000
+    if len(paths) > _MAX_FRAMES_PER_RENDER:
+        log.warning(
+            "Render project=%d: truncating frame list from %d to %d",
+            render["project_id"],
+            len(paths),
+            _MAX_FRAMES_PER_RENDER,
+        )
+        paths = paths[:_MAX_FRAMES_PER_RENDER]
+
+    return paths
 
 
 _QUALITY_MAP = {
@@ -342,22 +363,20 @@ def _build_ffmpeg_cmd(
             "setpts=N/FRAME_RATE/TB",
         ]
 
-    # Frame blend — cinematic motion smoothness
-    if render.get("frame_blend"):
+    # Frame blend — cinematic motion smoothness (needs ≥3 frames)
+    if render.get("frame_blend") and total_frames >= 3:
         filters.append("tmix=frames=3:weights='1 2 1'")
 
-    # Deflicker
+    # Deflicker — needs at least `size` frames or ffmpeg aborts (exit -6 / SIGABRT)
     flicker = render.get("flicker_reduction") or "standard"
-    if flicker == "standard":
+    if flicker == "standard" and total_frames >= 10:
         filters.append("deflicker=mode=pm:size=10")
-    elif flicker == "strong":
+    elif flicker in ("strong", "holy_grail") and total_frames >= 50:
         filters.append("deflicker=mode=pm:size=50")
-    elif flicker == "holy_grail":
-        # Holy Grail: large-window deflicker; the pre-pass luminance correction
-        # requires CPU preprocessing and is handled separately before ffmpeg.
-        # Fall back to a large deflicker window here for the ffmpeg stage.
-        filters.append("deflicker=mode=pm:size=50")
-    # "off" → no deflicker filter added
+    elif flicker in ("strong", "holy_grail") and total_frames >= 10:
+        # Fall back to smaller window when not enough frames for size=50
+        filters.append("deflicker=mode=pm:size=10")
+    # "off" or too few frames → no deflicker filter added
 
     # Resolution / scale
     resolution = render.get("resolution") or "1920x1080"
@@ -374,18 +393,22 @@ def _build_ffmpeg_cmd(
         # Always scale for preview even if no source info
         filters.append(f"scale={out_w}:{out_h}:flags=lanczos")
 
-    # Color grade LUT
+    # Color grade LUT — validate path stays inside _LUT_DIR to prevent traversal (#2)
     grade = render.get("color_grade") or "none"
     if grade != "none":
-        lut_path = os.path.join(_LUT_DIR, f"{grade}.cube")
-        if os.path.exists(lut_path):
+        lut_path = os.path.realpath(os.path.join(_LUT_DIR, f"{grade}.cube"))
+        lut_dir_real = os.path.realpath(_LUT_DIR)
+        if lut_path.startswith(lut_dir_real + os.sep) and os.path.exists(lut_path):
             filters.append(f"lut3d={lut_path}")
+        else:
+            log.warning("Render id=%d: rejected LUT path traversal attempt: %r", render.get("id"), grade)
 
     # Stabilization transform pass (requires pre-pass transforms file)
+    # unsharp is a separate filter — embedding it after a comma inside vidstabtransform
+    # breaks filter chain parsing when other filters are present.
     if transforms_file and os.path.exists(transforms_file):
-        filters.append(
-            f"vidstabtransform=input={transforms_file}:zoom=1:smoothing=30,unsharp=5:5:0.8:3:3:0.4"
-        )
+        filters.append(f"vidstabtransform=input={transforms_file}:zoom=1:smoothing=30")
+        filters.append("unsharp=5:5:0.8:3:3:0.4")
 
     # Timestamp burn-in
     try:
@@ -402,26 +425,32 @@ def _build_ffmpeg_cmd(
             "x=w-tw-20:y=h-th-20:fontcolor=white:fontsize=32:box=1:boxcolor=black@0.6"
         )
 
-    # Watermark overlay (movie filter + overlay)
+    # Watermark overlay (movie filter + overlay) — validate path to prevent traversal (#3)
     watermark_path: str | None = None
     try:
         with get_connection() as conn:
             wm_row = conn.execute("SELECT watermark_path FROM settings WHERE id = 1").fetchone()
-        if wm_row and wm_row["watermark_path"] and os.path.exists(wm_row["watermark_path"]):
-            watermark_path = wm_row["watermark_path"]
+        if wm_row and wm_row["watermark_path"]:
+            wm_real = os.path.realpath(wm_row["watermark_path"])
+            # Only allow paths inside /data/ to prevent arbitrary file inclusion
+            if wm_real.startswith("/data/") and os.path.exists(wm_real):
+                watermark_path = wm_real
+            else:
+                log.warning("Render: rejected watermark path outside /data/: %r", wm_row["watermark_path"])
     except Exception:
         pass
 
     # Build final vf / filter_complex
     filter_complex: str | None = None
+    vf: str | None = None
     if watermark_path:
         chain = ",".join(filters) if filters else "null"
         filter_complex = (
             f"[0:v]{chain}[main];movie={watermark_path}[wm];[main][wm]overlay=W-w-10:H-h-10[out]"
         )
-        vf = None
-    else:
-        vf = ",".join(filters) if filters else "null"
+    elif filters:
+        vf = ",".join(filters)
+    # No filters and no watermark → omit -vf entirely (passing -vf null is invalid)
 
     # ── Encode settings ───────────────────────────────────────────────────────
     if is_preview:
@@ -435,6 +464,9 @@ def _build_ffmpeg_cmd(
         "-y",
         "-threads",
         str(ffmpeg_threads),
+        # Increase demuxer queue to avoid SIGABRT on large frame counts with filters
+        "-thread_queue_size",
+        "512",
         "-r",
         str(framerate),
         "-f",
@@ -446,8 +478,8 @@ def _build_ffmpeg_cmd(
     ]
     if filter_complex:
         cmd += ["-filter_complex", filter_complex, "-map", "[out]"]
-    else:
-        cmd += ["-vf", vf or "null"]
+    elif vf:
+        cmd += ["-vf", vf]
     cmd += [
         "-c:v",
         codec,
@@ -457,6 +489,9 @@ def _build_ffmpeg_cmd(
         crf,
         "-pix_fmt",
         "yuv420p",
+        # Avoid muxer queue overflow on variable-framerate filter outputs
+        "-max_muxing_queue_size",
+        "1024",
         output_path,
     ]
     return cmd

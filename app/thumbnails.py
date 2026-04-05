@@ -19,7 +19,9 @@ def generate_thumbnail(image_bytes: bytes) -> bytes:
     """
     src = Image.open(io.BytesIO(image_bytes))
     orig_w, orig_h = src.size
-    new_h = int(orig_h * THUMBNAIL_WIDTH / orig_w)
+    if orig_w == 0 or orig_h == 0:
+        raise ValueError(f"Invalid image dimensions: {orig_w}x{orig_h}")  # prevents ZeroDivisionError (#15)
+    new_h = max(1, int(orig_h * THUMBNAIL_WIDTH / orig_w))
     img = src.resize((THUMBNAIL_WIDTH, new_h), Image.Resampling.LANCZOS)
 
     buf = io.BytesIO()
@@ -34,7 +36,9 @@ def generate_thumbnail_from_pillow(img: Image.Image) -> bytes:
     a second decode.
     """
     orig_w, orig_h = img.size
-    new_h = int(orig_h * THUMBNAIL_WIDTH / orig_w)
+    if orig_w == 0 or orig_h == 0:
+        raise ValueError(f"Invalid image dimensions: {orig_w}x{orig_h}")  # prevents ZeroDivisionError (#15)
+    new_h = max(1, int(orig_h * THUMBNAIL_WIDTH / orig_w))
     resized = img.resize((THUMBNAIL_WIDTH, new_h), Image.Resampling.LANCZOS)
 
     buf = io.BytesIO()

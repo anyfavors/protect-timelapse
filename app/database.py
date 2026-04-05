@@ -24,7 +24,8 @@ PRAGMA temp_store = MEMORY;
 """
 
 _POOL_SIZE = 4
-_pool: queue.SimpleQueue[sqlite3.Connection] = queue.SimpleQueue()
+# Queue with maxsize enforces the cap without a racy qsize() check.
+_pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=_POOL_SIZE)
 _pool_db_path: str | None = None
 
 
@@ -61,9 +62,10 @@ def get_connection() -> Generator[sqlite3.Connection, None, None]:
     try:
         yield conn
     finally:
-        if _pool.qsize() < _POOL_SIZE:
-            _pool.put(conn)
-        else:
+        # put_nowait raises Full when pool is at maxsize — close excess connections.
+        try:
+            _pool.put_nowait(conn)
+        except queue.Full:
             conn.close()
 
 
@@ -249,45 +251,42 @@ def _migrate_v0(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_V0)
 
 
-def _migrate_v1(conn: sqlite3.Connection) -> None:
-    import contextlib
-
-    for stmt in [s.strip() for s in _SCHEMA_V1.strip().split(";") if s.strip()]:
+def _migrate_alter(conn: sqlite3.Connection, schema: str) -> None:
+    """Apply ALTER TABLE statements, ignoring already-existing columns."""
+    for stmt in [s.strip() for s in schema.strip().split(";") if s.strip()]:
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(stmt)
     conn.commit()
+
+
+def _migrate_v1(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, _SCHEMA_V1)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
-    import contextlib
-
-    for stmt in [s.strip() for s in _SCHEMA_V2.strip().split(";") if s.strip()]:
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute(stmt)
-    conn.commit()
+    _migrate_alter(conn, _SCHEMA_V2)
 
 
 def _migrate_v3(conn: sqlite3.Connection) -> None:
-    import contextlib
-
-    for stmt in [s.strip() for s in _SCHEMA_V3.strip().split(";") if s.strip()]:
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute(stmt)
-    conn.commit()
+    _migrate_alter(conn, _SCHEMA_V3)
 
 
 def _migrate_v4(conn: sqlite3.Connection) -> None:
-    import contextlib
+    _migrate_alter(conn, _SCHEMA_V4)
 
-    for stmt in [s.strip() for s in _SCHEMA_V4.strip().split(";") if s.strip()]:
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute(stmt)
-    conn.commit()
+
+_SCHEMA_V6 = """
+ALTER TABLE projects ADD COLUMN solar_noon_window_minutes INTEGER DEFAULT 30;
+"""
 
 
 def _migrate_v5(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_V5)
     conn.commit()
+
+
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, _SCHEMA_V6)
 
 
 MIGRATIONS: dict[int, object] = {
@@ -297,6 +296,7 @@ MIGRATIONS: dict[int, object] = {
     3: _migrate_v3,
     4: _migrate_v4,
     5: _migrate_v5,
+    6: _migrate_v6,
 }
 
 
@@ -321,7 +321,7 @@ def init_database() -> None:
                 conn.commit()
 
         new_version = max(MIGRATIONS) + 1
-        conn.execute(f"PRAGMA user_version = {new_version}")
+        conn.execute(f"PRAGMA user_version = {int(new_version)}")  # int() guards against non-integer (#28)
         conn.commit()
 
         # Zombie render recovery: any render stuck in 'rendering' from a

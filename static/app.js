@@ -103,12 +103,17 @@ document.addEventListener('alpine:init', () => {
       document.documentElement.classList.toggle('dark', this.darkMode);
     },
 
-    toggleDark() {
+    async toggleDark() {
       this.darkMode = !this.darkMode;
       document.documentElement.classList.toggle('dark', this.darkMode);
       localStorage.setItem('darkMode', String(this.darkMode));
-      // Persist immediately — fire-and-forget
-      this.api('/api/settings', 'PUT', { dark_mode: this.darkMode });
+      // Await save — revert on failure so UI stays consistent (#29)
+      const result = await this.api('/api/settings', 'PUT', { dark_mode: this.darkMode });
+      if (!result) {
+        this.darkMode = !this.darkMode;
+        document.documentElement.classList.toggle('dark', this.darkMode);
+        localStorage.setItem('darkMode', String(this.darkMode));
+      }
     },
 
     async loadAll() {
@@ -207,7 +212,7 @@ document.addEventListener('alpine:init', () => {
         } else {
           // Camera no longer on NVR but project references it
           map[proj.camera_id] = {
-            id: proj.camera_id, name: proj.camera_id, is_online: false, projects: [proj]
+            id: proj.camera_id, name: proj.camera_id, is_online: false, is_connected: false, projects: [proj]
           };
         }
       }
@@ -215,6 +220,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     cameraHasError(cam) {
+      // Use is_online (API field name) consistently — is_connected was wrong (#13)
       return cam.projects.some(p => p.status === 'paused_error' || p.status === 'error')
         || !cam.is_online;
     },
@@ -445,7 +451,7 @@ document.addEventListener('alpine:init', () => {
       overlay.innerHTML = `
         <div class="flex items-center justify-between mb-3">
           <span class="text-sm text-slate-300">Frame Comparison — drag divider to compare</span>
-          <button onclick="document.getElementById('frame-compare-overlay').remove()"
+          <button id="fcomp-close-btn"
                   class="text-slate-400 hover:text-white text-sm bg-slate-800 px-4 py-2 rounded-lg">Close [Esc]</button>
         </div>
         <div id="fcomp-container" class="relative flex-1 overflow-hidden rounded-xl bg-black select-none">
@@ -468,7 +474,6 @@ document.addEventListener('alpine:init', () => {
           <div class="absolute bottom-3 right-3 text-xs text-white bg-black/60 px-2 py-1 rounded">${tsB}</div>
         </div>`;
 
-      overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
       document.body.appendChild(overlay);
 
       // Drag logic
@@ -486,25 +491,43 @@ document.addEventListener('alpine:init', () => {
       };
 
       let dragging = false;
-      divider.addEventListener('mousedown', e => { dragging = true; e.preventDefault(); });
-      document.addEventListener('mousemove', e => {
+
+      // Named handlers so we can remove them on close — prevents listener accumulation (#24)
+      const onMouseMove = e => {
         if (!dragging) return;
         const rect = container.getBoundingClientRect();
         setPos(((e.clientX - rect.left) / rect.width) * 100);
-      });
-      document.addEventListener('mouseup', () => { dragging = false; });
-
-      // Touch support
-      divider.addEventListener('touchstart', e => { dragging = true; e.preventDefault(); }, { passive: false });
-      document.addEventListener('touchmove', e => {
+      };
+      const onMouseUp = () => { dragging = false; };
+      const onTouchMove = e => {
         if (!dragging) return;
         const rect = container.getBoundingClientRect();
         setPos(((e.touches[0].clientX - rect.left) / rect.width) * 100);
-      }, { passive: true });
-      document.addEventListener('touchend', () => { dragging = false; });
+      };
+      const onTouchEnd = () => { dragging = false; };
 
-      const esc = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); } };
-      document.addEventListener('keydown', esc);
+      const cleanup = () => {
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+        document.removeEventListener('touchmove', onTouchMove);
+        document.removeEventListener('touchend', onTouchEnd);
+        document.removeEventListener('keydown', onEsc);
+        overlay.remove();
+      };
+
+      divider.addEventListener('mousedown', e => { dragging = true; e.preventDefault(); });
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+
+      // Touch support
+      divider.addEventListener('touchstart', e => { dragging = true; e.preventDefault(); }, { passive: false });
+      document.addEventListener('touchmove', onTouchMove, { passive: true });
+      document.addEventListener('touchend', onTouchEnd);
+
+      const onEsc = e => { if (e.key === 'Escape') cleanup(); };
+      document.addEventListener('keydown', onEsc);
+      overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
+      overlay.querySelector('button').onclick = cleanup;
 
       this.compareFrameIndices = [];
     },
@@ -551,7 +574,17 @@ document.addEventListener('alpine:init', () => {
       const id = this.activeProject.id;
       this.gifJobStatus = 'pending';
       await this.api(`/api/projects/${id}/gif`, 'POST');
+      let gifPollCount = 0;
+      const GIF_MAX_POLLS = 150;  // 5 minutes at 2s intervals (#26)
       this.gifPollTimer = setInterval(async () => {
+        gifPollCount++;
+        if (gifPollCount > GIF_MAX_POLLS) {
+          clearInterval(this.gifPollTimer);
+          this.gifPollTimer = null;
+          this.gifJobStatus = 'error';
+          this.toast('GIF export timed out', 'error');
+          return;
+        }
         const data = await this.api(`/api/projects/${id}/gif/status`);
         if (data) {
           this.gifJobStatus = data.status;
@@ -774,6 +807,7 @@ document.addEventListener('alpine:init', () => {
         auto_render_daily: false, auto_render_weekly: false, auto_render_monthly: false,
         retention_days: 0, max_frames: null, width: null, height: null,
         use_motion_filter: false, motion_threshold: 5,
+        solar_noon_window_minutes: 30,
       };
       this.selectedTemplate = null;
       this.previewUrl = null;
@@ -811,21 +845,29 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    _submitting: false,
+
     async submitForm() {
-      if (this.formMode === 'create') {
-        const data = await this.api('/api/projects', 'POST', this.form);
-        if (data) {
-          await this.loadProjects();
-          this.toast('Project created');
-          this.view = 'dashboard';
+      if (this._submitting) return;  // prevent double-submit (#27)
+      this._submitting = true;
+      try {
+        if (this.formMode === 'create') {
+          const data = await this.api('/api/projects', 'POST', this.form);
+          if (data) {
+            await this.loadProjects();
+            this.toast('Project created');
+            this.view = 'dashboard';
+          }
+        } else {
+          const data = await this.api(`/api/projects/${this.form.id}`, 'PUT', this.form);
+          if (data) {
+            await this.loadProjects();
+            this.toast('Project updated');
+            this.view = 'dashboard';
+          }
         }
-      } else {
-        const data = await this.api(`/api/projects/${this.form.id}`, 'PUT', this.form);
-        if (data) {
-          await this.loadProjects();
-          this.toast('Project updated');
-          this.view = 'dashboard';
-        }
+      } finally {
+        this._submitting = false;
       }
     },
 
@@ -930,21 +972,31 @@ document.addEventListener('alpine:init', () => {
     },
 
     // ── WebSocket ─────────────────────────────────────────────────────────
+    _wsConnecting: false,
+
     connectWebSocket() {
+      // Guard against multiple simultaneous connect attempts (#25)
+      if (this._wsConnecting || (this.ws && this.ws.readyState === WebSocket.CONNECTING)) return;
+      this._wsConnecting = true;
+
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const url = `${proto}://${location.host}/api/ws`;
       this.ws = new WebSocket(url);
 
       this.ws.onopen = () => {
+        this._wsConnecting = false;
         this.wsRetries = 0;
         console.log('[WS] connected');
       };
 
       this.ws.onmessage = (e) => {
-        try { this.handleWsEvent(JSON.parse(e.data)); } catch {}
+        try { this.handleWsEvent(JSON.parse(e.data)); } catch (err) {
+          console.error('[WS] message handler error:', err, e.data);  // (#14)
+        }
       };
 
       this.ws.onclose = () => {
+        this._wsConnecting = false;
         if (this.wsRetries < this.wsMaxRetries) {
           const delay = Math.min(1000 * Math.pow(2, this.wsRetries), 30000);
           this.wsRetries++;
@@ -989,6 +1041,19 @@ document.addEventListener('alpine:init', () => {
           const pName = this.projects.find(p => p.id === projId)?.name || 'project';
           const label = msg.status === 'done' ? `Render done: ${pName}` : `Render failed: ${pName}`;
           this.toast(label, msg.status === 'done' ? 'success' : 'error', projId);
+          break;
+        }
+        case 'extraction_progress': {
+          const p = this.projects.find(p => p.id === msg.project_id);
+          if (p) {
+            p.frame_count = msg.frames;
+            p._extraction_pct = msg.progress_pct;
+            if (msg.progress_pct >= 100) {
+              p.status = 'completed';
+              p._extraction_pct = null;
+              this.toast(`Extraction complete: ${p.name}`, 'success', p.id);
+            }
+          }
           break;
         }
         case 'disk_update': {

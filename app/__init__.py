@@ -76,7 +76,10 @@ async def lifespan(application: FastAPI):  # type: ignore[type-arg]
 
     await stop_scheduler()
 
-    await stop_render_worker(render_task)
+    try:
+        await stop_render_worker(render_task)
+    except Exception as exc:
+        log.warning("Render worker shutdown error (ignored): %s", exc)  # (#30)
 
     from app.websocket import manager as ws_manager
 

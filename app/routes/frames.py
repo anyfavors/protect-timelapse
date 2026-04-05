@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import os
+import shutil
 import zipfile
 from typing import Any
 
@@ -104,13 +105,15 @@ def list_frames(
 def serve_thumbnail(project_id: int, frame_id: int, request: Request) -> Response:
     frame = _get_frame_or_404(project_id, frame_id)
     path = frame.get("thumbnail_path") or frame["file_path"]
-    if not os.path.exists(path):
+    # Avoid TOCTOU: skip existence check, handle FileNotFoundError on open (#20)
+    try:
+        etag = f'"{int(os.path.getmtime(path) * 1000)}"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304)
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Thumbnail file not found on disk")
-    etag = f'"{int(os.path.getmtime(path) * 1000)}"'
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304)
-    with open(path, "rb") as f:
-        data = f.read()
     return Response(
         content=data,
         media_type="image/jpeg",
@@ -125,10 +128,12 @@ def serve_thumbnail(project_id: int, frame_id: int, request: Request) -> Respons
 def serve_full(project_id: int, frame_id: int) -> Response:
     frame = _get_frame_or_404(project_id, frame_id)
     path = frame["file_path"]
-    if not os.path.exists(path):
+    # Avoid TOCTOU: skip existence check, handle FileNotFoundError on open (#20)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Frame file not found on disk")
-    with open(path, "rb") as f:
-        data = f.read()
     return Response(content=data, media_type="image/jpeg")
 
 
@@ -259,24 +264,25 @@ def export_frames(project_id: int) -> StreamingResponse:
     from collections.abc import Iterator
 
     def _generate() -> Iterator[bytes]:
-        # Stream-write ZIP entries one at a time so we never buffer the whole
-        # archive in memory. ZIP_STORED skips compression (JPEGs are already
-        # compressed — re-compressing wastes CPU for no gain).
+        # Stream-write ZIP entries using ZipFile.open() to avoid buffering entire
+        # files in RAM — fixes OOM crash on projects with thousands of frames (#4).
+        # ZIP_STORED skips compression (JPEGs already compressed).
         buf = io.BytesIO()
-        zf = zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True)
-        for row in rows:
-            path = row["file_path"]
-            if not os.path.exists(path):
-                continue
-            arcname = os.path.basename(path)
-            zf.write(path, arcname)
-            # Yield whatever has accumulated and reset the buffer
-            chunk = buf.getvalue()
-            if chunk:
-                yield chunk
-                buf.seek(0)
-                buf.truncate(0)
-        zf.close()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for row in rows:
+                path = row["file_path"]
+                arcname = os.path.basename(path)
+                try:
+                    with zf.open(arcname, "w") as zentry, open(path, "rb") as src:
+                        shutil.copyfileobj(src, zentry, length=65536)
+                except (FileNotFoundError, OSError):
+                    continue
+                # Yield whatever Central Directory + local headers have accumulated
+                chunk = buf.getvalue()
+                if chunk:
+                    yield chunk
+                    buf.seek(0)
+                    buf.truncate(0)
         tail = buf.getvalue()
         if tail:
             yield tail

@@ -303,8 +303,8 @@
             </div>
             <!-- Status badge -->
             <span class="absolute top-2 right-2 text-xs px-2 py-0.5 rounded-full"
-                  :class="cam.is_connected ? 'bg-emerald-600/80 text-emerald-100' : 'bg-slate-600/80 text-slate-300'"
-                  x-text="cam.is_connected ? 'Online' : 'Offline'"></span>
+                  :class="cam.is_online ? 'bg-emerald-600/80 text-emerald-100' : 'bg-slate-600/80 text-slate-300'"
+                  x-text="cam.is_online ? 'Online' : 'Offline'"></span>
           </div>
           <div class="p-3">
             <p class="text-sm font-medium text-slate-200 truncate" x-text="cam.name"></p>
@@ -414,12 +414,25 @@
                 </div>
                 <div class="flex items-center gap-2">
                   <span class="capitalize" x-text="proj.status.replace('_', ' ')"></span>
-                  <template x-if="proj.last_captured_at">
+                  <template x-if="proj.last_captured_at && proj.status === 'active'">
                     <span class="text-xs px-1.5 py-0.5 rounded-full"
                           :class="timeSinceBadgeClass(proj)"
                           x-text="timeSince(proj.last_captured_at)"></span>
                   </template>
                 </div>
+                <!-- Extraction progress bar -->
+                <template x-if="proj.status === 'extracting'">
+                  <div class="mt-1">
+                    <div class="flex justify-between text-xs text-slate-500 mb-0.5">
+                      <span>Extracting…</span>
+                      <span x-text="(proj._extraction_pct || 0) + '%'"></span>
+                    </div>
+                    <div class="h-1 bg-slate-700 rounded-full overflow-hidden">
+                      <div class="h-full bg-blue-500 rounded-full transition-all duration-500"
+                           :style="`width: ${proj._extraction_pct || 0}%`"></div>
+                    </div>
+                  </div>
+                </template>
               </div>
               <!-- Quick actions -->
               <div class="flex gap-2 mt-3" @click.stop>
@@ -963,13 +976,18 @@
           </div>
         </div>
 
-        <!-- Interval -->
-        <div>
-          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Interval (seconds)</label>
-          <div class="flex gap-2 mb-2">
-            <button @click="setIntervalPreset(5)"   class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition">5s Weather</button>
-            <button @click="setIntervalPreset(60)"  class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition">1m Construction</button>
-            <button @click="setIntervalPreset(600)" class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition">10m Long-term</button>
+        <!-- Interval (hidden for solar_noon — internally fixed at 60 s) -->
+        <div x-show="form.capture_mode !== 'solar_noon'">
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Capture Interval</label>
+          <div class="flex flex-wrap gap-1.5 mb-2">
+            <button @click="setIntervalPreset(2)"    :class="form.interval_seconds==2    ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Fast-moving clouds, traffic">2 s</button>
+            <button @click="setIntervalPreset(5)"    :class="form.interval_seconds==5    ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Storms, fast weather">5 s</button>
+            <button @click="setIntervalPreset(15)"   :class="form.interval_seconds==15   ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Busy streets, market">15 s</button>
+            <button @click="setIntervalPreset(30)"   :class="form.interval_seconds==30   ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Normal weather, activity">30 s</button>
+            <button @click="setIntervalPreset(60)"   :class="form.interval_seconds==60   ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Construction site, garden">1 min</button>
+            <button @click="setIntervalPreset(300)"  :class="form.interval_seconds==300  ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Slow construction, seasons">5 min</button>
+            <button @click="setIntervalPreset(900)"  :class="form.interval_seconds==900  ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Plant growth, renovation">15 min</button>
+            <button @click="setIntervalPreset(3600)" :class="form.interval_seconds==3600 ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Long-term: months or years">1 hr</button>
           </div>
           <input x-model.number="form.interval_seconds" type="number" min="1"
                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
@@ -981,16 +999,34 @@
           <div class="space-y-2">
             <label class="flex items-center gap-2 cursor-pointer">
               <input type="radio" x-model="form.capture_mode" value="continuous" class="accent-blue-500" />
-              <span class="text-sm text-slate-300">Continuous</span>
+              <span class="text-sm text-slate-300">Continuous <span class="text-slate-500 text-xs">— capture every interval</span></span>
             </label>
             <label class="flex items-center gap-2 cursor-pointer">
               <input type="radio" x-model="form.capture_mode" value="daylight_only" class="accent-blue-500" />
-              <span class="text-sm text-slate-300">Daylight Only (Astral)</span>
+              <span class="text-sm text-slate-300">Daylight only <span class="text-slate-500 text-xs">— skip frames outside sunrise/sunset</span></span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="radio" x-model="form.capture_mode" value="solar_noon" class="accent-blue-500" />
+              <span class="text-sm text-slate-300">Solar noon <span class="text-slate-500 text-xs">— one frame per day near peak sun, consistent light year-round</span></span>
             </label>
             <label class="flex items-center gap-2 cursor-pointer">
               <input type="radio" x-model="form.capture_mode" value="schedule" class="accent-blue-500" />
-              <span class="text-sm text-slate-300">Schedule</span>
+              <span class="text-sm text-slate-300">Schedule <span class="text-slate-500 text-xs">— specific hours and weekdays</span></span>
             </label>
+          </div>
+        </div>
+
+        <!-- Solar noon settings (live only) -->
+        <div x-show="form.project_type !== 'historical' && form.capture_mode === 'solar_noon'" class="bg-slate-800/60 rounded-lg p-3 space-y-2">
+          <p class="text-xs text-slate-400">Captures one frame per day at the moment of solar noon — the sun is at its highest point, giving the most consistent light across seasons. Requires latitude/longitude in Settings.</p>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Capture window — ± minutes around solar noon</label>
+            <div class="flex items-center gap-3">
+              <input x-model.number="form.solar_noon_window_minutes" type="range" min="5" max="120" step="5"
+                     class="flex-1 accent-blue-500" />
+              <span class="text-sm text-slate-200 w-16 text-right" x-text="'±' + (form.solar_noon_window_minutes || 30) + ' min'"></span>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">The first capture within this window each day is saved; subsequent checks are skipped until tomorrow.</p>
           </div>
         </div>
 

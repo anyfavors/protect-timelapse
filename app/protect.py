@@ -32,7 +32,9 @@ class ProtectClientManager:
         overrides = get_db_overrides()
         host = overrides.get("protect_host") or settings.protect_host
         port = int(overrides.get("protect_port") or settings.protect_port)
-        verify_ssl = bool(overrides.get("protect_verify_ssl", settings.protect_verify_ssl))
+        # Explicit int() before bool() — prevents bool("0") == True when DB stores string (#11)
+        raw_ssl = overrides.get("protect_verify_ssl")
+        verify_ssl = bool(int(raw_ssl)) if raw_ssl is not None else settings.protect_verify_ssl
 
         async with self._lock:
             if self._client is not None:

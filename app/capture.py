@@ -6,20 +6,23 @@ The snapshot_worker() runs the full visibility pipeline before saving a frame.
 """
 
 import asyncio
+import contextlib
 import io
 import logging
 import os
 import shutil
-from datetime import UTC, datetime
+import tempfile
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from PIL import Image, ImageStat
+from PIL import Image, ImageFilter, ImageStat
 
 from app.config import get_settings
-from app.database import get_connection
-from app.thumbnails import generate_thumbnail_from_pillow
+from app.database import get_connection, get_db_overrides
+from app.protect import protect_manager
+from app.thumbnails import generate_thumbnail, generate_thumbnail_from_pillow
 from app.websocket import broadcast
 
 log = logging.getLogger("app.capture")
@@ -46,11 +49,11 @@ async def start_scheduler() -> None:
     """Boot APScheduler and register jobs for all currently active projects."""
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, interval_seconds FROM projects WHERE status = 'active' AND project_type = 'live'"
+            "SELECT id, interval_seconds, capture_mode FROM projects WHERE status = 'active' AND project_type = 'live'"
         ).fetchall()
 
     for row in rows:
-        _register_job(row["id"], row["interval_seconds"])
+        _register_job(row["id"], row["interval_seconds"], row["capture_mode"])
 
     scheduler.start()
     log.info("Capture scheduler started with %d active project(s)", len(rows))
@@ -62,8 +65,10 @@ async def stop_scheduler() -> None:
         log.info("Capture scheduler stopped")
 
 
-async def add_project_job(project_id: int, interval_seconds: int) -> None:
-    _register_job(project_id, interval_seconds)
+async def add_project_job(
+    project_id: int, interval_seconds: int, capture_mode: str = "continuous"
+) -> None:
+    _register_job(project_id, interval_seconds, capture_mode)
 
 
 async def remove_project_job(project_id: int) -> None:
@@ -72,12 +77,15 @@ async def remove_project_job(project_id: int) -> None:
         scheduler.remove_job(job_id)
 
 
-async def reschedule_project_job(project_id: int, interval_seconds: int) -> None:
+async def reschedule_project_job(
+    project_id: int, interval_seconds: int, capture_mode: str = "continuous"
+) -> None:
     job_id = f"project_{project_id}"
+    effective = 60 if capture_mode == "solar_noon" else interval_seconds
     if scheduler.get_job(job_id):
-        scheduler.reschedule_job(job_id, trigger=IntervalTrigger(seconds=interval_seconds))
+        scheduler.reschedule_job(job_id, trigger=IntervalTrigger(seconds=effective))
     else:
-        _register_job(project_id, interval_seconds)
+        _register_job(project_id, interval_seconds, capture_mode)
 
 
 async def pause_project_job(project_id: int) -> None:
@@ -86,25 +94,35 @@ async def pause_project_job(project_id: int) -> None:
         scheduler.pause_job(job_id)
 
 
-async def resume_project_job(project_id: int, interval_seconds: int) -> None:
+async def resume_project_job(
+    project_id: int, interval_seconds: int, capture_mode: str = "continuous"
+) -> None:
     job_id = f"project_{project_id}"
     if scheduler.get_job(job_id):
         scheduler.resume_job(job_id)
     else:
-        _register_job(project_id, interval_seconds)
+        _register_job(project_id, interval_seconds, capture_mode)
 
 
-def _register_job(project_id: int, interval_seconds: int) -> None:
+def _register_job(project_id: int, interval_seconds: int, capture_mode: str = "continuous") -> None:
+    # Solar noon projects poll every 60 s; the worker itself gates on noon proximity.
+    effective_interval = 60 if capture_mode == "solar_noon" else interval_seconds
     job_id = f"project_{project_id}"
     scheduler.add_job(
         snapshot_worker,
-        trigger=IntervalTrigger(seconds=interval_seconds),
+        trigger=IntervalTrigger(seconds=effective_interval),
         id=job_id,
         args=[project_id],
         replace_existing=True,
         max_instances=1,
         coalesce=True,
     )
+
+
+def _set_project_status(project_id: int, status: str) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET status = ? WHERE id = ?", (status, project_id))
+        conn.commit()
 
 
 # -------------------------------------------------------------------------
@@ -156,21 +174,34 @@ async def snapshot_worker(project_id: int) -> None:
         return
 
     # --- 3. Astronomical filter ---------------------------------------------
-    if project["capture_mode"] == "daylight_only" and not _is_daylight(settings):
+    if project["capture_mode"] == "daylight_only" and not _is_daylight():
         log.debug("Project %d: outside daylight window, skipping", project_id)
         return
 
-    # --- 4. Schedule window filter ------------------------------------------
-    from app.database import get_db_overrides
+    # --- 3b. Solar noon filter ----------------------------------------------
+    # Solar noon mode: scheduler runs every minute; only capture within
+    # ±window of solar noon AND only once per calendar day.
+    if project["capture_mode"] == "solar_noon":
+        if not _is_solar_noon_window(project):
+            return
+        # Check if already captured today (UTC date)
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        with get_connection() as conn:
+            already = conn.execute(
+                "SELECT 1 FROM frames WHERE project_id = ? AND captured_at >= ? LIMIT 1",
+                (project_id, today),
+            ).fetchone()
+        if already:
+            log.debug("Project %d: solar noon frame already captured today", project_id)
+            return
 
+    # --- 4. Schedule window filter ------------------------------------------
     tz_name: str = get_db_overrides().get("tz") or settings.tz  # type: ignore[assignment]
     if project["capture_mode"] == "schedule" and not _is_in_schedule(project, tz_name):
         log.debug("Project %d: outside schedule window, skipping", project_id)
         return
 
     # --- 5. NVR snapshot ----------------------------------------------------
-    from app.protect import protect_manager
-
     try:
         client = await protect_manager.get_client()
         cam = client.bootstrap.cameras.get(project["camera_id"])
@@ -228,8 +259,10 @@ async def snapshot_worker(project_id: int) -> None:
                 "SELECT file_path FROM frames WHERE project_id = ? ORDER BY captured_at DESC LIMIT 1",
                 (project_id,),
             ).fetchone()
-        if last_row and os.path.exists(last_row["file_path"]):
+        if last_row:
             try:
+                # No existence pre-check: handle FileNotFoundError directly to avoid TOCTOU
+                # (maintenance worker may delete the file between check and open) (#6)
                 last_img = Image.open(last_row["file_path"]).convert("L").resize((64, 64))
                 curr_gray = pil_img.convert("L").resize((64, 64))
                 diff = (
@@ -252,9 +285,6 @@ async def snapshot_worker(project_id: int) -> None:
             except Exception as exc:
                 log.debug("Project %d: motion filter error, allowing frame: %s", project_id, exc)
 
-    # Sharpness score (Laplacian variance — proxy for focus quality)
-    from PIL import ImageFilter
-
     if pil_img is None:
         pil_img = Image.open(io.BytesIO(snapshot_bytes))
     gray_for_sharp = pil_img.convert("L")
@@ -272,8 +302,13 @@ async def snapshot_worker(project_id: int) -> None:
     frame_path = os.path.join(frame_dir, f"{timestamp}.jpg")
     thumb_path = os.path.join(thumb_dir, f"{timestamp}.jpg")
 
-    with open(frame_path, "wb") as f:
-        f.write(snapshot_bytes)
+    # Abort early if frame file can't be written — don't insert orphaned DB record (#7)
+    try:
+        with open(frame_path, "wb") as f:
+            f.write(snapshot_bytes)
+    except OSError as exc:
+        log.error("Project %d: failed to write frame file %s: %s", project_id, frame_path, exc)
+        return
 
     # Reuse the already-decoded PIL image if available, otherwise decode now
     if pil_img is None:
@@ -384,24 +419,12 @@ async def snapshot_worker(project_id: int) -> None:
 # -------------------------------------------------------------------------
 
 
-def _is_daylight(settings) -> bool:  # type: ignore[no-untyped-def]
+def _is_daylight() -> bool:
     from astral import LocationInfo
     from astral.sun import sun
 
-    from app.database import get_db_overrides
-
-    overrides = get_db_overrides()
-    tz: str = overrides.get("tz") or settings.tz  # type: ignore[assignment]
-    lat: float = overrides.get("latitude") or settings.latitude  # type: ignore[assignment]
-    lon: float = overrides.get("longitude") or settings.longitude  # type: ignore[assignment]
-
-    city = LocationInfo(
-        name="custom",
-        region="custom",
-        timezone=tz,
-        latitude=lat,
-        longitude=lon,
-    )
+    tz, lat, lon = _get_location()
+    city = LocationInfo(name="custom", region="custom", timezone=tz, latitude=lat, longitude=lon)
     now = datetime.now(UTC)
     try:
         s = sun(city.observer, date=now.date(), tzinfo=tz)
@@ -409,6 +432,43 @@ def _is_daylight(settings) -> bool:  # type: ignore[no-untyped-def]
     except Exception:
         # If astral fails (e.g. polar night), allow capture
         return True
+
+
+def _get_location() -> tuple[str, float, float]:
+    """Return (tz, lat, lon) merged from DB overrides and env settings."""
+    settings = get_settings()
+    overrides = get_db_overrides()
+    tz: str = overrides.get("tz") or settings.tz  # type: ignore[assignment]
+    lat: float = overrides.get("latitude") or settings.latitude  # type: ignore[assignment]
+    lon: float = overrides.get("longitude") or settings.longitude  # type: ignore[assignment]
+    return tz, lat, lon
+
+
+def _is_solar_noon_window(project: dict) -> bool:
+    """Return True if now is within ±window minutes of today's solar noon.
+
+    Solar noon mode is designed to capture exactly one frame per day at the
+    moment of peak sun, giving consistent light conditions across all frames
+    regardless of season. The scheduler runs every minute; this gate fires
+    only during the configured window so exactly one capture occurs per day.
+    """
+    from astral import LocationInfo
+    from astral.sun import sun
+
+    tz_name, lat, lon = _get_location()
+    window = int(project.get("solar_noon_window_minutes") or 30)
+
+    try:
+        city = LocationInfo(
+            name="custom", region="custom", timezone=tz_name, latitude=lat, longitude=lon
+        )
+        now = datetime.now(UTC)
+        s = sun(city.observer, date=now.date(), tzinfo=tz_name)
+        noon = s["noon"]
+        diff_minutes = abs((now - noon).total_seconds()) / 60
+        return diff_minutes <= window
+    except Exception:
+        return False
 
 
 def _is_in_schedule(project: dict, tz_name: str) -> bool:
@@ -426,8 +486,19 @@ def _is_in_schedule(project: dict, tz_name: str) -> bool:
 
     start_str = project.get("schedule_start_time") or "00:00"
     end_str = project.get("schedule_end_time") or "23:59"
-    start_h, start_m = map(int, start_str.split(":"))
-    end_h, end_m = map(int, end_str.split(":"))
+    # Validate time format to prevent ValueError crash on malformed values (#16)
+    try:
+        start_parts = start_str.split(":")
+        end_parts = end_str.split(":")
+        start_h, start_m = int(start_parts[0]), int(start_parts[1])
+        end_h, end_m = int(end_parts[0]), int(end_parts[1])
+        if not (0 <= start_h <= 23 and 0 <= start_m <= 59):
+            raise ValueError(f"Invalid start time: {start_str!r}")
+        if not (0 <= end_h <= 23 and 0 <= end_m <= 59):
+            raise ValueError(f"Invalid end time: {end_str!r}")
+    except (ValueError, IndexError) as exc:
+        log.warning("Project %d: invalid schedule time (%s), allowing capture", project.get("id"), exc)
+        return True  # fail open — allow capture rather than crash
 
     current_minutes = local_now.hour * 60 + local_now.minute
     start_minutes = start_h * 60 + start_m
@@ -498,24 +569,39 @@ async def run_historical_extraction(project_id: int) -> None:
     Background task: download 1-hour NVR video chunks, extract frames via
     ffmpeg, rename to UTC timestamps, generate thumbnails, then mark done.
     """
-    import tempfile
+    try:
+        await _run_historical_extraction_inner(project_id)
+    except Exception as exc:
+        log.exception("Historical extraction project %d crashed: %s", project_id, exc)
+        _set_project_status(project_id, "error")
 
+
+async def _run_historical_extraction_inner(project_id: int) -> None:
     settings = get_settings()
 
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     if row is None:
+        log.error("Historical extraction: project %d not found", project_id)
         return
 
     project = dict(row)
 
-    # Mark extracting at start
-    with get_connection() as conn:
-        conn.execute("UPDATE projects SET status = 'extracting' WHERE id = ?", (project_id,))
-        conn.commit()
+    if not project.get("start_date") or not project.get("end_date"):
+        log.error("Historical extraction: project %d missing start_date or end_date", project_id)
+        _set_project_status(project_id, "error")
+        return
+
+    _set_project_status(project_id, "extracting")
 
     start_dt = datetime.fromisoformat(project["start_date"]).replace(tzinfo=UTC)
     end_dt = datetime.fromisoformat(project["end_date"]).replace(tzinfo=UTC)
+
+    if end_dt <= start_dt:
+        log.error("Historical extraction: project %d end_date is not after start_date", project_id)
+        _set_project_status(project_id, "error")
+        return
+
     interval = project["interval_seconds"]
 
     frame_dir = os.path.join(settings.frames_path, str(project_id))
@@ -523,33 +609,31 @@ async def run_historical_extraction(project_id: int) -> None:
     os.makedirs(frame_dir, exist_ok=True)
     os.makedirs(thumb_dir, exist_ok=True)
 
-    from app.protect import protect_manager
-
     try:
         client = await protect_manager.get_client()
         cam = client.bootstrap.cameras.get(project["camera_id"])
         if cam is None:
             log.error("Historical extraction: camera %s not found", project["camera_id"])
-            with get_connection() as conn:
-                conn.execute("UPDATE projects SET status = 'error' WHERE id = ?", (project_id,))
-                conn.commit()
+            _set_project_status(project_id, "error")
             return
     except RuntimeError as exc:
         log.error("Historical extraction: NVR unavailable — %s", exc)
-        with get_connection() as conn:
-            conn.execute("UPDATE projects SET status = 'error' WHERE id = ?", (project_id,))
-            conn.commit()
+        _set_project_status(project_id, "error")
         return
-
-    # Chunk into 1-hour segments
-    from datetime import timedelta
 
     chunk_start = start_dt
     chunk_index = 0
     total_frames = 0
+    total_duration_h = max(1, (end_dt - start_dt).total_seconds() / 3600)
 
     while chunk_start < end_dt:
         chunk_end = min(chunk_start + timedelta(hours=1), end_dt)
+        elapsed_h = (chunk_start - start_dt).total_seconds() / 3600
+        progress_pct = int(elapsed_h / total_duration_h * 100)
+        await broadcast(
+            "extraction_progress",
+            {"project_id": project_id, "progress_pct": progress_pct, "frames": total_frames},
+        )
 
         with tempfile.NamedTemporaryFile(
             suffix=".mp4", prefix=f"hist_{project_id}_{chunk_index}_", delete=False
@@ -601,15 +685,18 @@ async def run_historical_extraction(project_id: int) -> None:
                 frame_utc = chunk_start + timedelta(seconds=frame_index * interval)
                 ts = frame_utc.strftime("%Y%m%d%H%M%S")
                 dst = os.path.join(frame_dir, f"{ts}.jpg")
-                os.rename(src, dst)
+                try:
+                    os.rename(src, dst)
+                except OSError as exc:
+                    log.warning(
+                        "Historical extraction: rename failed %s → %s: %s", src, dst, exc
+                    )
+                    continue  # skip frame rather than crashing the chunk (#9)
 
-                # Thumbnail (offloaded to thread pool to avoid blocking event loop)
                 with open(dst, "rb") as fh:
                     img_bytes = fh.read()
-                from app.thumbnails import generate_thumbnail
-
-                _loop = asyncio.get_event_loop()
-                thumb_bytes = await _loop.run_in_executor(None, generate_thumbnail, img_bytes)
+                loop = asyncio.get_event_loop()
+                thumb_bytes = await loop.run_in_executor(None, generate_thumbnail, img_bytes)
                 thumb_path = os.path.join(thumb_dir, f"{ts}.jpg")
                 with open(thumb_path, "wb") as fh:
                     fh.write(thumb_bytes)
@@ -628,29 +715,25 @@ async def run_historical_extraction(project_id: int) -> None:
                     conn.commit()
                 total_frames += 1
 
-            import shutil as _shutil
-
-            with __import__("contextlib").suppress(Exception):
-                _shutil.rmtree(extract_dir)
+            with contextlib.suppress(Exception):
+                shutil.rmtree(extract_dir)
 
         except TimeoutError:
             log.error("Historical extraction: ffmpeg timed out on chunk %d", chunk_index)
         except Exception as exc:
             log.error("Historical extraction error on chunk %d: %s", chunk_index, exc)
         finally:
-            import contextlib
-
             with contextlib.suppress(FileNotFoundError):
                 os.remove(tmp_path)
 
         chunk_start = chunk_end
         chunk_index += 1
 
-    # Mark project completed
-    with get_connection() as conn:
-        conn.execute("UPDATE projects SET status = 'completed' WHERE id = ?", (project_id,))
-        conn.commit()
-
+    _set_project_status(project_id, "completed")
+    await broadcast(
+        "extraction_progress",
+        {"project_id": project_id, "progress_pct": 100, "frames": total_frames},
+    )
     log.info("Historical extraction complete: project %d, %d frames", project_id, total_frames)
 
 

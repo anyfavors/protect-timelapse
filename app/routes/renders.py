@@ -99,7 +99,8 @@ def create_render(payload: RenderCreate) -> dict:
         )
         conn.commit()
 
-    assert cur.lastrowid is not None
+    if cur.lastrowid is None:
+        raise HTTPException(status_code=500, detail="Failed to create render: no row ID returned")
     result = _get_render_or_404(cur.lastrowid)
     result.update(
         {

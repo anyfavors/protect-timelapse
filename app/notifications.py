@@ -4,9 +4,11 @@ Always writes to the notifications table first, then fires an optional webhook.
 The webhook POST is fire-and-forget with a 10-second timeout.
 """
 
+import ipaddress
 import logging
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -75,6 +77,10 @@ async def notify(
     if details:
         payload["details"] = details
 
+    if not _is_safe_webhook_url(webhook_url):
+        log.warning("Webhook URL rejected (SSRF guard) for event %s: %r", event, webhook_url)
+        return
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(webhook_url, json=payload)
@@ -91,3 +97,27 @@ def _get_webhook_url() -> str | None:
         return row["webhook_url"] if row and row["webhook_url"] else None
     except Exception:
         return None
+
+
+def _is_safe_webhook_url(url: str) -> bool:
+    """Validate webhook URL to prevent SSRF attacks (#5)."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname or ""
+        if not host:
+            return False
+        # Reject obvious local hostnames
+        if host.lower() in ("localhost", "127.0.0.1", "::1"):
+            return False
+        # Reject IP addresses in private/loopback/link-local ranges
+        try:
+            addr = ipaddress.ip_address(host)
+            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                return False
+        except ValueError:
+            pass  # hostname, not IP — allow it
+        return True
+    except Exception:
+        return False

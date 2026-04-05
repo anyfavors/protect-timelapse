@@ -42,7 +42,9 @@ class ProjectCreate(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     # Capture mode
-    capture_mode: str = Field(default="continuous", pattern="^(continuous|daylight_only|schedule)$")
+    capture_mode: str = Field(
+        default="continuous", pattern="^(continuous|daylight_only|schedule|solar_noon)$"
+    )
     use_luminance_check: bool = False
     luminance_threshold: int = Field(default=15, ge=0, le=255)
     # Schedule mode
@@ -57,6 +59,8 @@ class ProjectCreate(BaseModel):
     # Motion filter
     use_motion_filter: bool = False
     motion_threshold: int = Field(default=5, ge=1, le=100)
+    # Solar noon mode
+    solar_noon_window_minutes: int = Field(default=30, ge=5, le=120)
     # Template linkage
     template_id: int | None = None
 
@@ -64,7 +68,9 @@ class ProjectCreate(BaseModel):
 class ProjectUpdate(BaseModel):
     name: str | None = None
     interval_seconds: int | None = Field(default=None, ge=1)
-    capture_mode: str | None = Field(default=None, pattern="^(continuous|daylight_only|schedule)$")
+    capture_mode: str | None = Field(
+        default=None, pattern="^(continuous|daylight_only|schedule|solar_noon)$"
+    )
     use_luminance_check: bool | None = None
     luminance_threshold: int | None = Field(default=None, ge=0, le=255)
     schedule_start_time: str | None = None
@@ -142,8 +148,9 @@ async def create_project(payload: ProjectCreate) -> dict:
                 auto_render_daily, auto_render_weekly, auto_render_monthly,
                 retention_days, template_id,
                 use_motion_filter, motion_threshold,
+                solar_noon_window_minutes,
                 status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload.name,
@@ -168,10 +175,12 @@ async def create_project(payload: ProjectCreate) -> dict:
                 payload.template_id,
                 int(payload.use_motion_filter),
                 payload.motion_threshold,
+                payload.solar_noon_window_minutes,
                 "active" if payload.project_type == "live" else "extracting",
             ),
         )
-        assert cur.lastrowid is not None
+        if cur.lastrowid is None:
+            raise HTTPException(status_code=500, detail="Failed to create project: no row ID returned")
         project_id: int = cur.lastrowid
         conn.commit()
 
@@ -184,7 +193,7 @@ async def create_project(payload: ProjectCreate) -> dict:
 
     # Register APScheduler job for live projects
     if payload.project_type == "live":
-        await add_project_job(project_id, payload.interval_seconds)
+        await add_project_job(project_id, payload.interval_seconds, payload.capture_mode)
 
     # Kick off historical extraction as a background task
     if payload.project_type == "historical":
@@ -203,6 +212,19 @@ async def update_project(project_id: int, payload: ProjectUpdate) -> dict:
     _get_project_or_404(project_id)  # raises 404 if missing
 
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        return _get_project_or_404(project_id)
+
+    # Explicit allowlist — prevents SQL injection even if Pydantic is bypassed (#1)
+    _ALLOWED_UPDATE_FIELDS = {
+        "name", "interval_seconds", "capture_mode", "use_luminance_check",
+        "luminance_threshold", "schedule_start_time", "schedule_end_time",
+        "schedule_days", "auto_render_daily", "auto_render_weekly",
+        "auto_render_monthly", "retention_days", "max_frames",
+        "use_motion_filter", "motion_threshold", "status",
+        "solar_noon_window_minutes",
+    }
+    updates = {k: v for k, v in updates.items() if k in _ALLOWED_UPDATE_FIELDS}
     if not updates:
         return _get_project_or_404(project_id)
 
@@ -256,8 +278,9 @@ async def clone_project(project_id: int) -> dict:
                 schedule_start_time, schedule_end_time, schedule_days,
                 auto_render_daily, auto_render_weekly, auto_render_monthly,
                 retention_days, template_id,
+                use_motion_filter, motion_threshold, solar_noon_window_minutes,
                 status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 source["name"] + " (copy)",
@@ -278,10 +301,14 @@ async def clone_project(project_id: int) -> dict:
                 source["auto_render_monthly"],
                 source["retention_days"],
                 source["template_id"],
+                source["use_motion_filter"],
+                source["motion_threshold"],
+                source["solar_noon_window_minutes"],
                 "active" if source["project_type"] == "live" else "extracting",
             ),
         )
-        assert cur.lastrowid is not None
+        if cur.lastrowid is None:
+            raise HTTPException(status_code=500, detail="Failed to clone project: no row ID returned")
         new_id: int = cur.lastrowid
         conn.commit()
 

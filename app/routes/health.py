@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 
 from fastapi import APIRouter
 
@@ -8,6 +9,11 @@ from app.database import get_connection
 from app.protect import protect_manager
 
 router = APIRouter(tags=["health"])
+
+# Cache disk breakdown for 60s to avoid O(n*m) dir walk on every request (#19)
+_disk_cache: dict | None = None
+_disk_cache_ts: float = 0.0
+_DISK_CACHE_TTL = 60.0
 
 
 def _dir_size_gb(path: str) -> float:
@@ -45,6 +51,11 @@ async def health() -> dict:
 @router.get("/api/disk")
 def disk_breakdown() -> dict:
     """Per-project disk usage breakdown across frames, renders, and thumbs."""
+    global _disk_cache, _disk_cache_ts
+    now = time.monotonic()
+    if _disk_cache is not None and (now - _disk_cache_ts) < _DISK_CACHE_TTL:
+        return _disk_cache
+
     cfg = get_settings()
     try:
         usage = shutil.disk_usage("/data")
@@ -75,9 +86,12 @@ def disk_breakdown() -> dict:
         )
 
     breakdown.sort(key=lambda x: x["total_gb"], reverse=True)
-    return {
+    result = {
         "total_gb": total_gb,
         "used_gb": used_gb,
         "free_gb": free_gb,
         "projects": breakdown,
     }
+    _disk_cache = result
+    _disk_cache_ts = now
+    return result
