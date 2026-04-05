@@ -26,6 +26,12 @@ log = logging.getLogger("app.capture")
 
 scheduler = AsyncIOScheduler()
 
+# Default Laplacian variance threshold below which a frame is flagged as blurry.
+_BLUR_THRESHOLD = 20.0
+
+# Per-camera semaphore: at most 2 concurrent snapshots per camera to avoid NVR overload.
+_camera_semaphores: dict[str, asyncio.Semaphore] = {}
+
 # Disk check interval: every N captures we run a full disk check.
 # APScheduler calls snapshot_worker per project; disk check is cheap so we
 # run it every time rather than tracking a separate timer.
@@ -40,7 +46,7 @@ async def start_scheduler() -> None:
     """Boot APScheduler and register jobs for all currently active projects."""
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, interval_seconds FROM projects WHERE status = 'active'"
+            "SELECT id, interval_seconds FROM projects WHERE status = 'active' AND project_type = 'live'"
         ).fetchall()
 
     for row in rows:
@@ -144,6 +150,11 @@ async def snapshot_worker(project_id: int) -> None:
 
     project = dict(row)
 
+    # Safety net: historical projects must never get snapshot jobs
+    if project["project_type"] != "live":
+        await remove_project_job(project_id)
+        return
+
     # --- 3. Astronomical filter ---------------------------------------------
     if project["capture_mode"] == "daylight_only" and not _is_daylight(settings):
         log.debug("Project %d: outside daylight window, skipping", project_id)
@@ -174,7 +185,11 @@ async def snapshot_worker(project_id: int) -> None:
         if project["height"]:
             kwargs["height"] = project["height"]
 
-        raw = await cam.get_snapshot(**kwargs)
+        camera_id = project["camera_id"]
+        if camera_id not in _camera_semaphores:
+            _camera_semaphores[camera_id] = asyncio.Semaphore(2)
+        async with _camera_semaphores[camera_id]:
+            raw = await cam.get_snapshot(**kwargs)
         if raw is None:
             raise RuntimeError("NVR returned empty snapshot")
         snapshot_bytes: bytes = raw
@@ -204,6 +219,49 @@ async def snapshot_worker(project_id: int) -> None:
                 project["luminance_threshold"],
             )
 
+    # --- 6b. Motion filter (skip if scene hasn't changed enough) -----------
+    if project.get("use_motion_filter"):
+        if pil_img is None:
+            pil_img = Image.open(io.BytesIO(snapshot_bytes))
+        with get_connection() as conn:
+            last_row = conn.execute(
+                "SELECT file_path FROM frames WHERE project_id = ? ORDER BY captured_at DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        if last_row and os.path.exists(last_row["file_path"]):
+            try:
+                last_img = Image.open(last_row["file_path"]).convert("L").resize((64, 64))
+                curr_gray = pil_img.convert("L").resize((64, 64))
+                diff = (
+                    sum(
+                        abs(a - b)
+                        for a, b in zip(last_img.getdata(), curr_gray.getdata(), strict=False)
+                    )
+                    / (64 * 64 * 255)
+                    * 100
+                )
+                threshold = project.get("motion_threshold") or 5
+                if diff < threshold:
+                    log.debug(
+                        "Project %d: motion filter skip (diff=%.1f%% < threshold=%d%%)",
+                        project_id,
+                        diff,
+                        threshold,
+                    )
+                    return
+            except Exception as exc:
+                log.debug("Project %d: motion filter error, allowing frame: %s", project_id, exc)
+
+    # Sharpness score (Laplacian variance — proxy for focus quality)
+    from PIL import ImageFilter
+
+    if pil_img is None:
+        pil_img = Image.open(io.BytesIO(snapshot_bytes))
+    gray_for_sharp = pil_img.convert("L")
+    edges = gray_for_sharp.filter(ImageFilter.FIND_EDGES)
+    sharpness_score = float(ImageStat.Stat(edges).var[0])
+    is_blurry = 1 if sharpness_score < _BLUR_THRESHOLD else 0
+
     # --- 7. Save JPEG + thumbnail ------------------------------------------
     timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     frame_dir = os.path.join(settings.frames_path, str(project_id))
@@ -220,7 +278,8 @@ async def snapshot_worker(project_id: int) -> None:
     # Reuse the already-decoded PIL image if available, otherwise decode now
     if pil_img is None:
         pil_img = Image.open(io.BytesIO(snapshot_bytes))
-    thumb_bytes = generate_thumbnail_from_pillow(pil_img)
+    loop = asyncio.get_event_loop()
+    thumb_bytes = await loop.run_in_executor(None, generate_thumbnail_from_pillow, pil_img)
     with open(thumb_path, "wb") as f:
         f.write(thumb_bytes)
 
@@ -231,14 +290,37 @@ async def snapshot_worker(project_id: int) -> None:
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size, is_dark)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size,
+                                is_dark, sharpness_score, is_blurry)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, now_utc, frame_path, thumb_path, file_size, is_dark),
+            (
+                project_id,
+                now_utc,
+                frame_path,
+                thumb_path,
+                file_size,
+                is_dark,
+                sharpness_score,
+                is_blurry,
+            ),
         )
         conn.execute(
             "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
             (project_id,),
+        )
+        # Upsert into pre-aggregated frame_stats
+        frame_date = now_utc[:10]  # YYYY-MM-DD
+        frame_hour = int(now_utc[11:13])
+        conn.execute(
+            """
+            INSERT INTO frame_stats (project_id, date, hour, captured, dark)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(project_id, date, hour) DO UPDATE SET
+                captured = captured + 1,
+                dark = dark + excluded.dark
+            """,
+            (project_id, frame_date, frame_hour, is_dark),
         )
         new_count_row = conn.execute(
             "SELECT frame_count FROM projects WHERE id = ?", (project_id,)
@@ -426,6 +508,12 @@ async def run_historical_extraction(project_id: int) -> None:
         return
 
     project = dict(row)
+
+    # Mark extracting at start
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET status = 'extracting' WHERE id = ?", (project_id,))
+        conn.commit()
+
     start_dt = datetime.fromisoformat(project["start_date"]).replace(tzinfo=UTC)
     end_dt = datetime.fromisoformat(project["end_date"]).replace(tzinfo=UTC)
     interval = project["interval_seconds"]
@@ -442,9 +530,15 @@ async def run_historical_extraction(project_id: int) -> None:
         cam = client.bootstrap.cameras.get(project["camera_id"])
         if cam is None:
             log.error("Historical extraction: camera %s not found", project["camera_id"])
+            with get_connection() as conn:
+                conn.execute("UPDATE projects SET status = 'error' WHERE id = ?", (project_id,))
+                conn.commit()
             return
     except RuntimeError as exc:
         log.error("Historical extraction: NVR unavailable — %s", exc)
+        with get_connection() as conn:
+            conn.execute("UPDATE projects SET status = 'error' WHERE id = ?", (project_id,))
+            conn.commit()
         return
 
     # Chunk into 1-hour segments
@@ -509,12 +603,13 @@ async def run_historical_extraction(project_id: int) -> None:
                 dst = os.path.join(frame_dir, f"{ts}.jpg")
                 os.rename(src, dst)
 
-                # Thumbnail
+                # Thumbnail (offloaded to thread pool to avoid blocking event loop)
                 with open(dst, "rb") as fh:
                     img_bytes = fh.read()
                 from app.thumbnails import generate_thumbnail
 
-                thumb_bytes = generate_thumbnail(img_bytes)
+                _loop = asyncio.get_event_loop()
+                thumb_bytes = await _loop.run_in_executor(None, generate_thumbnail, img_bytes)
                 thumb_path = os.path.join(thumb_dir, f"{ts}.jpg")
                 with open(thumb_path, "wb") as fh:
                     fh.write(thumb_bytes)

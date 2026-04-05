@@ -6,7 +6,13 @@
 document.addEventListener('alpine:init', () => {
   Alpine.data('timelapseApp', () => ({
     // ── State ─────────────────────────────────────────────────────────────
-    view: 'dashboard',        // dashboard | project_detail | create_project | settings
+    darkMode: localStorage.getItem('darkMode') !== 'false',
+
+    view: 'dashboard',        // dashboard | project_detail | create_project | settings | cameras | renders_queue
+    allRenders: [],
+    scrubberHoverFrame: null,
+    scrubberHoverX: 0,
+    _scrubberHoverTimer: null,
     projects: [],
     cameras: [],
     activeProject: null,
@@ -14,6 +20,7 @@ document.addEventListener('alpine:init', () => {
     activeProjectRenders: [],
     activeProjectBookmarks: [],
     activeProjectDarkFrames: [],
+    activeProjectBlurryFrames: [],
     activeProjectDailyStats: [],
     activeProjectTimeline: [],
     templates: [],
@@ -27,6 +34,21 @@ document.addEventListener('alpine:init', () => {
     toasts: [],
     showNotifDropdown: false,
     showShortcutHelp: false,
+    showDiskModal: false,
+    diskBreakdown: {},
+    selectedProjectIds: [],
+    selectMode: false,
+    historicalPresetLabel: '',
+    historicalPresets: [
+      { label: 'Last 24 h',   hours: 24 },
+      { label: 'Last 7 days', hours: 24 * 7 },
+      { label: 'Last 30 days', hours: 24 * 30 },
+      { label: 'This week',   week: 'current' },
+      { label: 'Last week',   week: 'prev' },
+      { label: 'This month',  month: 'current' },
+      { label: 'Last month',  month: 'prev' },
+      { label: 'Custom',      custom: true },
+    ],
 
     // Detail view tabs
     detailTab: 'overview',    // overview | renders | bookmarks | dark_frames
@@ -43,6 +65,19 @@ document.addEventListener('alpine:init', () => {
     previewUrl: null,
     previewTimer: null,
     selectedTemplate: null,
+
+    // GIF export
+    gifJobStatus: null,   // null | 'pending' | 'rendering' | 'done' | 'error'
+    gifPollTimer: null,
+
+    // Render settings
+    renderFramerate: 30,
+    renderResolution: '1920x1080',
+    renderQuality: 'standard',
+    renderFlicker: 'standard',
+    renderFrameBlend: false,
+    renderStabilize: false,
+    renderColorGrade: 'none',
 
     // Render comparison & video player
     compareRenders: [],
@@ -63,8 +98,6 @@ document.addEventListener('alpine:init', () => {
       this.connectWebSocket();
     },
 
-    darkMode: true,
-
     loadTheme(darkMode) {
       this.darkMode = darkMode !== false && darkMode !== 0;
       document.documentElement.classList.toggle('dark', this.darkMode);
@@ -73,6 +106,7 @@ document.addEventListener('alpine:init', () => {
     toggleDark() {
       this.darkMode = !this.darkMode;
       document.documentElement.classList.toggle('dark', this.darkMode);
+      localStorage.setItem('darkMode', String(this.darkMode));
       // Persist immediately — fire-and-forget
       this.api('/api/settings', 'PUT', { dark_mode: this.darkMode });
     },
@@ -98,6 +132,43 @@ document.addEventListener('alpine:init', () => {
       if (data) this.cameras = data;
     },
 
+    async openCameraGrid() {
+      this.view = 'cameras';
+      await this.loadCameras();
+      this._startCameraGridAutoRefresh();
+    },
+
+    _cameraGridTimer: null,
+
+    _startCameraGridAutoRefresh() {
+      this._stopCameraGridAutoRefresh();
+      this._cameraGridTimer = setInterval(() => {
+        if (this.view !== 'cameras') { this._stopCameraGridAutoRefresh(); return; }
+        // bump preview image timestamps by forcing reactive update
+        this._cameraPreviewTs = Date.now();
+      }, 5000);
+    },
+
+    _stopCameraGridAutoRefresh() {
+      if (this._cameraGridTimer) { clearInterval(this._cameraGridTimer); this._cameraGridTimer = null; }
+    },
+
+    _cameraPreviewTs: Date.now(),
+
+    cameraPreviewUrl(cameraId) {
+      return `/api/cameras/${cameraId}/preview?t=${this._cameraPreviewTs}`;
+    },
+
+    async refreshCameraGrid() {
+      this._cameraPreviewTs = Date.now();
+      await this.loadCameras();
+    },
+
+    createProjectFromCamera(cameraId) {
+      this.openCreateForm();
+      this.$nextTick(() => { this.form.camera_id = cameraId; });
+    },
+
     async loadTemplates() {
       const data = await this.api('/api/templates');
       if (data) this.templates = data;
@@ -116,6 +187,12 @@ document.addEventListener('alpine:init', () => {
       if (data) {
         this.diskSpace = { free_gb: data.disk_free_gb, total_gb: data.disk_total_gb };
       }
+    },
+
+    async openDiskModal() {
+      this.showDiskModal = true;
+      const data = await this.api('/api/disk');
+      if (data) this.diskBreakdown = data;
     },
 
     // ── Camera grouping ───────────────────────────────────────────────────
@@ -171,6 +248,50 @@ document.addEventListener('alpine:init', () => {
       this.toast('Project deleted');
     },
 
+    async cloneProject(id) {
+      const data = await this.api(`/api/projects/${id}/clone`, 'POST');
+      if (data) {
+        await this.loadProjects();
+        this.toast(`Project cloned as "${data.name}"`);
+      }
+    },
+
+    // ── Bulk project actions ──────────────────────────────────────────────
+    toggleSelectMode() {
+      this.selectMode = !this.selectMode;
+      if (!this.selectMode) this.selectedProjectIds = [];
+    },
+
+    toggleSelectProject(id) {
+      if (this.selectedProjectIds.includes(id)) {
+        this.selectedProjectIds = this.selectedProjectIds.filter(x => x !== id);
+      } else {
+        this.selectedProjectIds.push(id);
+      }
+    },
+
+    async bulkPause() {
+      await Promise.all(this.selectedProjectIds.map(id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'paused' })));
+      await this.loadProjects();
+      this.toast(`Paused ${this.selectedProjectIds.length} project(s)`);
+      this.selectedProjectIds = [];
+    },
+
+    async bulkResume() {
+      await Promise.all(this.selectedProjectIds.map(id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'active' })));
+      await this.loadProjects();
+      this.toast(`Resumed ${this.selectedProjectIds.length} project(s)`);
+      this.selectedProjectIds = [];
+    },
+
+    async bulkDelete() {
+      if (!confirm(`Delete ${this.selectedProjectIds.length} project(s)? This cannot be undone.`)) return;
+      await Promise.all(this.selectedProjectIds.map(id => this.api(`/api/projects/${id}`, 'DELETE')));
+      await this.loadProjects();
+      this.toast(`Deleted ${this.selectedProjectIds.length} project(s)`);
+      this.selectedProjectIds = [];
+    },
+
     // ── Project detail ────────────────────────────────────────────────────
     async openProject(project) {
       this.activeProject = project;
@@ -179,6 +300,8 @@ document.addEventListener('alpine:init', () => {
       this.scrubberIndex = 0;
       this.rangeStart = null;
       this.rangeEnd = null;
+      this.gifJobStatus = null;
+      if (this.gifPollTimer) { clearInterval(this.gifPollTimer); this.gifPollTimer = null; }
       await this.loadProjectDetail();
     },
 
@@ -208,9 +331,13 @@ document.addEventListener('alpine:init', () => {
       if (tab === 'bookmarks') {
         const data = await this.api(`/api/projects/${id}/frames/bookmarks`);
         if (data) this.activeProjectBookmarks = data;
-      } else if (tab === 'dark_frames') {
-        const data = await this.api(`/api/projects/${id}/frames/dark`);
-        if (data) this.activeProjectDarkFrames = data;
+      } else if (tab === 'quality') {
+        const [dark, blurry] = await Promise.all([
+          this.api(`/api/projects/${id}/frames/dark`),
+          this.api(`/api/projects/${id}/frames/blurry`),
+        ]);
+        if (dark) this.activeProjectDarkFrames = dark;
+        if (blurry) this.activeProjectBlurryFrames = blurry;
       } else if (tab === 'renders') {
         const data = await this.api(`/api/projects/${id}/renders`);
         if (data) this.activeProjectRenders = data;
@@ -232,6 +359,15 @@ document.addEventListener('alpine:init', () => {
       this.updateScrubberFrame();
     },
 
+    onScrubberHover(e) {
+      if (!this.activeProjectFrames.length) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const idx = Math.round(ratio * (this.activeProjectFrames.length - 1));
+      this.scrubberHoverFrame = this.activeProjectFrames[idx] || null;
+      this.scrubberHoverX = e.clientX - rect.left;
+    },
+
     onScrubberShiftClick(e) {
       if (!e.shiftKey) return;
       const idx = parseInt(e.target.value);
@@ -242,6 +378,22 @@ document.addEventListener('alpine:init', () => {
       } else {
         this.rangeEnd = frame.captured_at;
       }
+    },
+
+    async deleteFrame(frameId) {
+      if (!confirm('Delete this frame permanently? This cannot be undone.')) return;
+      const id = this.activeProject.id;
+      await this.api(`/api/projects/${id}/frames/${frameId}`, 'DELETE');
+      this.activeProjectFrames = this.activeProjectFrames.filter(f => f.id !== frameId);
+      this.activeProjectBookmarks = this.activeProjectBookmarks.filter(f => f.id !== frameId);
+      this.activeProjectDarkFrames = this.activeProjectDarkFrames.filter(f => f.id !== frameId);
+      this.activeProjectBlurryFrames = this.activeProjectBlurryFrames.filter(f => f.id !== frameId);
+      if (this.activeProject) this.activeProject.frame_count = Math.max(0, (this.activeProject.frame_count || 1) - 1);
+      if (this.scrubberIndex >= this.activeProjectFrames.length) {
+        this.scrubberIndex = Math.max(0, this.activeProjectFrames.length - 1);
+      }
+      this.updateScrubberFrame();
+      this.toast('Frame deleted');
     },
 
     async bookmarkCurrentFrame(note) {
@@ -367,10 +519,20 @@ document.addEventListener('alpine:init', () => {
     },
 
     // ── Renders ───────────────────────────────────────────────────────────
-    async triggerRender(projectId, framerate = 30, resolution = '1920x1080', label = null) {
-      const payload = { project_id: projectId, framerate, resolution, render_type: 'manual' };
+    async triggerRender(projectId, framerate = 30, resolution = '1920x1080', label = null, renderType = null) {
+      const payload = {
+        project_id: projectId,
+        framerate,
+        resolution,
+        render_type: renderType || 'manual',
+        quality: this.renderQuality,
+        flicker_reduction: this.renderFlicker,
+        frame_blend: this.renderFrameBlend,
+        stabilize: this.renderStabilize,
+        color_grade: this.renderColorGrade,
+      };
       if (label) payload.label = label;
-      if (this.rangeStart && this.rangeEnd) {
+      if (!renderType && this.rangeStart && this.rangeEnd) {
         payload.render_type = 'range';
         payload.range_start = this.rangeStart;
         payload.range_end = this.rangeEnd;
@@ -385,11 +547,40 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    async exportGif() {
+      const id = this.activeProject.id;
+      this.gifJobStatus = 'pending';
+      await this.api(`/api/projects/${id}/gif`, 'POST');
+      this.gifPollTimer = setInterval(async () => {
+        const data = await this.api(`/api/projects/${id}/gif/status`);
+        if (data) {
+          this.gifJobStatus = data.status;
+          if (data.status === 'done' || data.status === 'error') {
+            clearInterval(this.gifPollTimer);
+            this.gifPollTimer = null;
+            if (data.status === 'done') this.toast('GIF ready — click to download');
+            else this.toast('GIF export failed: ' + (data.error || ''), 'error');
+          }
+        }
+      }, 2000);
+    },
+
     async deleteRender(renderId) {
       if (!confirm('Delete this render file?')) return;
       await this.api(`/api/renders/${renderId}`, 'DELETE');
-      await this.loadDetailTab('renders');
+      this.allRenders = this.allRenders.filter(r => r.id !== renderId);
+      if (this.view === 'project_detail') await this.loadDetailTab('renders');
       this.toast('Render deleted');
+    },
+
+    async openRendersQueue() {
+      this.view = 'renders_queue';
+      await this.loadRendersQueue();
+    },
+
+    async loadRendersQueue() {
+      const data = await this.api('/api/renders');
+      if (data) this.allRenders = data;
     },
 
     renderStatusClass(status) {
@@ -404,12 +595,21 @@ document.addEventListener('alpine:init', () => {
     // ── Video player ──────────────────────────────────────────────────────
     openVideoPlayer(renderId) {
       const url = `/api/renders/${renderId}/download`;
-      // Open in a minimal overlay using a native <video> element injected into the DOM
       const overlay = document.createElement('div');
       overlay.id = 'video-overlay';
       overlay.className = 'fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90';
       overlay.innerHTML = `
         <div class="relative w-full max-w-5xl px-4">
+          <!-- Prominent × close button pinned top-right -->
+          <button id="video-close-btn"
+                  onclick="document.getElementById('video-overlay').remove()"
+                  class="fixed top-4 right-4 z-60 w-10 h-10 flex items-center justify-center rounded-full bg-slate-800 hover:bg-red-700 text-white text-xl font-bold shadow-lg transition"
+                  title="Close (Esc)">×</button>
+          <!-- Esc hint overlaid on video — fades out after 3s -->
+          <div id="video-esc-hint"
+               class="absolute top-2 left-1/2 -translate-x-1/2 text-xs text-white/70 bg-black/50 px-3 py-1 rounded-full pointer-events-none transition-opacity duration-1000">
+            Press Esc to close
+          </div>
           <video id="overlay-video" src="${url}" controls preload="metadata" loop muted playsinline
                  class="w-full rounded-xl max-h-[80vh] bg-black"></video>
           <div class="flex items-center justify-between mt-3 gap-4">
@@ -430,6 +630,11 @@ document.addEventListener('alpine:init', () => {
       const esc = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); } };
       document.addEventListener('keydown', esc);
       document.getElementById('overlay-video').play();
+      // Fade out the Esc hint after 3s
+      setTimeout(() => {
+        const hint = document.getElementById('video-esc-hint');
+        if (hint) hint.style.opacity = '0';
+      }, 3000);
     },
 
     // ── Render comparison ─────────────────────────────────────────────────
@@ -465,7 +670,7 @@ document.addEventListener('alpine:init', () => {
           <button onclick="document.getElementById('compare-overlay').remove()"
                   class="text-slate-400 hover:text-white text-sm bg-slate-800 px-4 py-2 rounded-lg transition">Close [Esc]</button>
         </div>
-        <div class="flex flex-1 gap-2 min-h-0">
+        <div class="flex flex-col sm:flex-row flex-1 gap-2 min-h-0">
           <div class="flex-1 flex flex-col min-w-0">
             <p class="text-xs text-slate-400 mb-1 truncate">${a.label || 'Render #' + a.id} — ${a.framerate}fps</p>
             <video id="cmp-a" src="${urlA}" preload="metadata" loop muted playsinline
@@ -510,6 +715,54 @@ document.addEventListener('alpine:init', () => {
         : 'No frames yet';
     },
 
+    // ── Historical date range helpers ─────────────────────────────────────
+    _toLocalISO(date) {
+      // Returns a datetime-local string (YYYY-MM-DDTHH:MM) in local time
+      const pad = n => String(n).padStart(2, '0');
+      return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    },
+
+    applyHistoricalPreset(preset) {
+      this.historicalPresetLabel = preset.label;
+      if (preset.custom) return; // let user fill manually
+      const now = new Date();
+      let start, end;
+      if (preset.hours) {
+        end = now;
+        start = new Date(now.getTime() - preset.hours * 3600000);
+      } else if (preset.week === 'current') {
+        const day = now.getDay() || 7; // Mon=1
+        start = new Date(now); start.setDate(now.getDate() - day + 1); start.setHours(0,0,0,0);
+        end = now;
+      } else if (preset.week === 'prev') {
+        const day = now.getDay() || 7;
+        end = new Date(now); end.setDate(now.getDate() - day); end.setHours(23,59,0,0);
+        start = new Date(end); start.setDate(end.getDate() - 6); start.setHours(0,0,0,0);
+      } else if (preset.month === 'current') {
+        start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0);
+        end = now;
+      } else if (preset.month === 'prev') {
+        end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59);
+        start = new Date(end.getFullYear(), end.getMonth(), 1, 0, 0);
+      }
+      this.form.start_date = this._toLocalISO(start);
+      this.form.end_date = this._toLocalISO(end);
+    },
+
+    formatHistoricalRange(startStr, endStr) {
+      if (!startStr || !endStr) return '';
+      const s = new Date(startStr), e = new Date(endStr);
+      const diffMs = e - s;
+      if (diffMs <= 0) return 'Invalid range';
+      const hours = Math.round(diffMs / 3600000);
+      const days = Math.floor(hours / 24);
+      const remHours = hours % 24;
+      const parts = [];
+      if (days > 0) parts.push(`${days}d`);
+      if (remHours > 0) parts.push(`${remHours}h`);
+      return `${s.toLocaleString()} → ${e.toLocaleString()} (${parts.join(' ') || '<1h'})`;
+    },
+
     // ── Create / Edit project form ────────────────────────────────────────
     openCreateForm() {
       this.formMode = 'create';
@@ -520,9 +773,11 @@ document.addEventListener('alpine:init', () => {
         schedule_days: '1,2,3,4,5',
         auto_render_daily: false, auto_render_weekly: false, auto_render_monthly: false,
         retention_days: 0, max_frames: null, width: null, height: null,
+        use_motion_filter: false, motion_threshold: 5,
       };
       this.selectedTemplate = null;
       this.previewUrl = null;
+      this.historicalPresetLabel = '';
       this.view = 'create_project';
     },
 
@@ -580,7 +835,7 @@ document.addEventListener('alpine:init', () => {
 
     startPreviewPolling() {
       this.stopPreviewPolling();
-      if (!this.form.camera_id) return;
+      if (!this.form.camera_id || this.form.project_type === 'historical') return;
       const poll = () => {
         this.previewUrl = `/api/cameras/${this.form.camera_id}/preview?t=${Date.now()}`;
       };
@@ -596,6 +851,8 @@ document.addEventListener('alpine:init', () => {
 
     // ── Settings ──────────────────────────────────────────────────────────
     settingsData: {},
+    nvrTestResult: null,
+    nvrTesting: false,
 
     async openSettings() {
       this.view = 'settings';
@@ -615,6 +872,38 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    async testNvrConnection() {
+      this.nvrTesting = true;
+      this.nvrTestResult = null;
+      const data = await this.api('/api/settings/nvr-test');
+      this.nvrTestResult = data;
+      this.nvrTesting = false;
+    },
+
+    async uploadWatermark(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append('file', file);
+      const resp = await fetch('/api/settings/watermark', { method: 'POST', body: form });
+      if (resp.ok) {
+        const data = await resp.json();
+        this.settingsData = { ...this.settingsData, watermark_path: data.watermark_path };
+        this.toast('Watermark uploaded');
+      } else {
+        this.toast('Upload failed', 'error');
+      }
+    },
+
+    async clearWatermark() {
+      if (!confirm('Remove watermark?')) return;
+      const resp = await fetch('/api/settings/watermark', { method: 'DELETE' });
+      if (resp.ok || resp.status === 204) {
+        this.settingsData = { ...this.settingsData, watermark_path: null };
+        this.toast('Watermark removed');
+      }
+    },
+
     async deleteTemplate(id) {
       if (!confirm('Delete this template?')) return;
       await this.api(`/api/templates/${id}`, 'DELETE');
@@ -625,6 +914,19 @@ document.addEventListener('alpine:init', () => {
     async markAllRead() {
       await this.api('/api/notifications/read', 'PUT', { all: true });
       await this.loadNotifications();
+    },
+
+    async deleteNotification(id) {
+      await this.api(`/api/notifications/${id}`, 'DELETE');
+      this.notifications = this.notifications.filter(n => n.id !== id);
+      this.unreadCount = this.notifications.filter(n => !n.is_read).length;
+    },
+
+    async clearAllNotifications(readOnly = false) {
+      const url = readOnly ? '/api/notifications?read_only=true' : '/api/notifications';
+      await this.api(url, 'DELETE');
+      await this.loadNotifications();
+      this.toast(readOnly ? 'Read notifications cleared' : 'All notifications cleared');
     },
 
     // ── WebSocket ─────────────────────────────────────────────────────────
@@ -664,6 +966,16 @@ document.addEventListener('alpine:init', () => {
           }
           break;
         }
+        case 'capture_batch': {
+          for (const upd of (msg.updates || [])) {
+            const p = this.projects.find(p => p.id === upd.project_id);
+            if (p) { p.frame_count = upd.frame_count; }
+            if (this.activeProject?.id === upd.project_id) {
+              this.activeProject.frame_count = upd.frame_count;
+            }
+          }
+          break;
+        }
         case 'render_progress': {
           const r = this.activeProjectRenders.find(r => r.id === msg.render_id);
           if (r) { r.progress_pct = msg.progress_pct; }
@@ -673,6 +985,10 @@ document.addEventListener('alpine:init', () => {
           const r = this.activeProjectRenders.find(r => r.id === msg.render_id);
           if (r) { r.status = msg.status; r.progress_pct = 100; }
           this.loadDetailTab('renders');
+          const projId = r?.project_id ?? msg.project_id;
+          const pName = this.projects.find(p => p.id === projId)?.name || 'project';
+          const label = msg.status === 'done' ? `Render done: ${pName}` : `Render failed: ${pName}`;
+          this.toast(label, msg.status === 'done' ? 'success' : 'error', projId);
           break;
         }
         case 'disk_update': {
@@ -704,10 +1020,22 @@ document.addEventListener('alpine:init', () => {
     },
 
     // ── Toast ─────────────────────────────────────────────────────────────
-    toast(message, type = 'success') {
+    toast(message, type = 'success', projectId = null) {
       const id = Date.now();
-      this.toasts.push({ id, message, type });
+      this.toasts.push({ id, message, type, projectId });
       setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 4000);
+    },
+
+    dismissToast(id) {
+      this.toasts = this.toasts.filter(t => t.id !== id);
+    },
+
+    clickToast(t) {
+      this.dismissToast(t.id);
+      if (t.projectId) {
+        const proj = this.projects.find(p => p.id === t.projectId);
+        if (proj) this.openProject(proj);
+      }
     },
 
     // ── Keyboard shortcuts ────────────────────────────────────────────────
@@ -729,7 +1057,7 @@ document.addEventListener('alpine:init', () => {
           case 'r': case 'R':
             if (this.view === 'project_detail' && this.activeProject) {
               e.preventDefault();
-              this.triggerRender(this.activeProject.id);
+              this.triggerRender(this.activeProject.id, this.renderFramerate, this.renderResolution);
             }
             break;
           case 'b': case 'B':
@@ -790,6 +1118,24 @@ document.addEventListener('alpine:init', () => {
       return new Date(iso).toLocaleString();
     },
 
+    timeSince(iso) {
+      if (!iso) return null;
+      const secs = (Date.now() - new Date(iso).getTime()) / 1000;
+      if (secs < 60) return Math.round(secs) + 's ago';
+      if (secs < 3600) return Math.round(secs / 60) + 'm ago';
+      if (secs < 86400) return Math.round(secs / 3600) + 'h ago';
+      return Math.round(secs / 86400) + 'd ago';
+    },
+
+    timeSinceBadgeClass(proj) {
+      if (!proj.last_captured_at || proj.status !== 'active') return 'bg-slate-700 text-slate-400';
+      const secs = (Date.now() - new Date(proj.last_captured_at).getTime()) / 1000;
+      const threshold = proj.interval_seconds || 60;
+      if (secs < threshold * 2) return 'bg-emerald-700/60 text-emerald-300';
+      if (secs < threshold * 10) return 'bg-amber-700/60 text-amber-300';
+      return 'bg-red-700/60 text-red-300';
+    },
+
     formatBytes(bytes) {
       if (!bytes) return '—';
       if (bytes > 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + ' GB';
@@ -804,6 +1150,7 @@ document.addEventListener('alpine:init', () => {
         paused_error: 'bg-red-500',
         error:        'bg-red-500',
         completed:    'bg-blue-400',
+        extracting:   'bg-purple-400 animate-pulse',
       }[status] || 'bg-slate-500';
     },
   }));

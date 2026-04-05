@@ -1,10 +1,14 @@
 """Global settings routes (single row, id=1)."""
 
+import contextlib
+import os
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from app.config import get_settings as _get_app_settings
 from app.database import get_connection
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -83,11 +87,62 @@ async def update_settings(payload: SettingsUpdate) -> dict:
     # Reconnect NVR if any NVR override fields were touched
     nvr_touched = any(k in _NVR_FIELDS for k in data if data[k] is not None)
     if nvr_touched or any(k in _NVR_FIELDS and data[k] is None for k in _NVR_FIELDS):
-        import contextlib
-
         from app.protect import protect_manager
 
         with contextlib.suppress(Exception):
             await protect_manager.reconnect()
 
     return _get_settings_row()
+
+
+@router.post("/settings/watermark", status_code=200)
+async def upload_watermark(file: UploadFile) -> dict:
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=422, detail="Only image files are accepted")
+    config = _get_app_settings()
+    watermark_path = os.path.join(os.path.dirname(config.database_path), "watermark.png")
+    os.makedirs(os.path.dirname(watermark_path), exist_ok=True)
+    content = await file.read()
+    with open(watermark_path, "wb") as f:
+        f.write(content)
+    with get_connection() as conn:
+        conn.execute("UPDATE settings SET watermark_path = ? WHERE id = 1", (watermark_path,))
+        conn.commit()
+    return {"watermark_path": watermark_path}
+
+
+@router.get("/settings/watermark-preview")
+def get_watermark_preview() -> FileResponse:
+    row = _get_settings_row()
+    path = row.get("watermark_path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="No watermark set")
+    return FileResponse(path, media_type="image/png")
+
+
+@router.delete("/settings/watermark", status_code=204)
+def delete_watermark() -> None:
+    row = _get_settings_row()
+    path = row.get("watermark_path")
+    if path:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+    with get_connection() as conn:
+        conn.execute("UPDATE settings SET watermark_path = NULL WHERE id = 1")
+        conn.commit()
+
+
+@router.get("/settings/nvr-test")
+async def test_nvr_connection() -> dict:
+    import time
+
+    from app.protect import protect_manager
+
+    t0 = time.monotonic()
+    try:
+        client = await protect_manager.get_client()
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        camera_count = len(client.bootstrap.cameras)
+        return {"ok": True, "latency_ms": latency_ms, "camera_count": camera_count, "error": None}
+    except Exception as exc:
+        return {"ok": False, "latency_ms": None, "camera_count": 0, "error": str(exc)[:300]}

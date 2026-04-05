@@ -3,6 +3,8 @@ Single SQLite connection factory. This is the ONLY file that calls sqlite3.conne
 All route handlers and workers must import get_connection() from here.
 """
 
+import contextlib
+import queue
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -17,20 +19,52 @@ _PRAGMAS = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA cache_size = -65536;
+PRAGMA temp_store = MEMORY;
 """
+
+_POOL_SIZE = 4
+_pool: queue.SimpleQueue[sqlite3.Connection] = queue.SimpleQueue()
+_pool_db_path: str | None = None
+
+
+def _make_connection(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_PRAGMAS)
+    return conn
+
+
+def _get_pool_connection() -> sqlite3.Connection:
+    """Return a pooled connection, creating one if the pool is empty."""
+    global _pool_db_path
+    settings = get_settings()
+    db_path = settings.database_path
+
+    # If the DB path changed (e.g. test isolation), drain and rebuild.
+    if _pool_db_path != db_path:
+        _pool_db_path = db_path
+        while not _pool.empty():
+            with contextlib.suppress(Exception):
+                _pool.get_nowait().close()
+
+    try:
+        return _pool.get_nowait()
+    except queue.Empty:
+        return _make_connection(db_path)
 
 
 @contextmanager
 def get_connection() -> Generator[sqlite3.Connection, None, None]:
-    """Open a SQLite connection, apply WAL pragmas, yield, then close."""
-    settings = get_settings()
-    conn = sqlite3.connect(settings.database_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    """Check out a pooled SQLite connection; return it when done."""
+    conn = _get_pool_connection()
     try:
-        conn.executescript(_PRAGMAS)
         yield conn
     finally:
-        conn.close()
+        if _pool.qsize() < _POOL_SIZE:
+            _pool.put(conn)
+        else:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +211,45 @@ ALTER TABLE settings ADD COLUMN tz TEXT;
 ALTER TABLE settings ADD COLUMN dark_mode INTEGER DEFAULT 1;
 """
 
+_SCHEMA_V2 = """
+ALTER TABLE renders ADD COLUMN quality TEXT DEFAULT 'standard';
+ALTER TABLE renders ADD COLUMN flicker_reduction TEXT DEFAULT 'standard';
+ALTER TABLE renders ADD COLUMN frame_blend INTEGER DEFAULT 0;
+ALTER TABLE renders ADD COLUMN stabilize INTEGER DEFAULT 0;
+ALTER TABLE renders ADD COLUMN color_grade TEXT DEFAULT 'none';
+"""
+
+_SCHEMA_V3 = """
+ALTER TABLE frames ADD COLUMN sharpness_score REAL;
+ALTER TABLE frames ADD COLUMN is_blurry INTEGER DEFAULT 0;
+"""
+
+_SCHEMA_V4 = """
+ALTER TABLE projects ADD COLUMN use_motion_filter INTEGER DEFAULT 0;
+ALTER TABLE projects ADD COLUMN motion_threshold INTEGER DEFAULT 5;
+ALTER TABLE settings ADD COLUMN watermark_path TEXT;
+"""
+
+_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS frame_stats (
+    project_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    hour INTEGER NOT NULL,
+    captured INTEGER NOT NULL DEFAULT 0,
+    dark INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project_id, date, hour),
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_frame_stats_project
+    ON frame_stats(project_id, date);
+"""
+
 
 def _migrate_v0(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_V0)
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
-    # ALTER TABLE does not support multi-statement executescript in all SQLite
-    # versions — run each statement individually, ignoring "duplicate column" errors.
     import contextlib
 
     for stmt in [s.strip() for s in _SCHEMA_V1.strip().split(";") if s.strip()]:
@@ -193,9 +258,45 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    import contextlib
+
+    for stmt in [s.strip() for s in _SCHEMA_V2.strip().split(";") if s.strip()]:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(stmt)
+    conn.commit()
+
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    import contextlib
+
+    for stmt in [s.strip() for s in _SCHEMA_V3.strip().split(";") if s.strip()]:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(stmt)
+    conn.commit()
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    import contextlib
+
+    for stmt in [s.strip() for s in _SCHEMA_V4.strip().split(";") if s.strip()]:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(stmt)
+    conn.commit()
+
+
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_V5)
+    conn.commit()
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
+    2: _migrate_v2,
+    3: _migrate_v3,
+    4: _migrate_v4,
+    5: _migrate_v5,
 }
 
 

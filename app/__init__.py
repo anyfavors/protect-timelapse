@@ -8,6 +8,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
@@ -87,6 +88,7 @@ async def lifespan(application: FastAPI):  # type: ignore[type-arg]
 
 def create_app() -> FastAPI:
     application = FastAPI(title="Protect Timelapse", lifespan=lifespan)
+    application.add_middleware(GZipMiddleware, minimum_size=500)
 
     application.include_router(health.router)
     application.include_router(cameras.router)

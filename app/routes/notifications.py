@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.database import get_connection
@@ -49,4 +49,26 @@ def mark_read(payload: MarkReadPayload) -> None:
                 f"UPDATE notifications SET is_read = 1 WHERE id IN ({placeholders})",
                 payload.ids,
             )
+        conn.commit()
+
+
+@router.delete("/notifications/{notification_id}", status_code=204)
+def delete_notification(notification_id: int) -> None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Notification {notification_id} not found")
+        conn.execute("DELETE FROM notifications WHERE id = ?", (notification_id,))
+        conn.commit()
+
+
+@router.delete("/notifications", status_code=204)
+def clear_notifications(read_only: bool = Query(default=False)) -> None:
+    with get_connection() as conn:
+        if read_only:
+            conn.execute("DELETE FROM notifications WHERE is_read = 1")
+        else:
+            conn.execute("DELETE FROM notifications")
         conn.commit()

@@ -11,19 +11,40 @@
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 
-<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="timelapseApp()" x-init="init()">
+<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="timelapseApp()">
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- TOP NAV                                                                 -->
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <nav class="bg-slate-900 border-b border-slate-800 px-4 py-3 flex items-center justify-between sticky top-0 z-50">
-  <button @click="view = 'dashboard'" class="text-blue-400 font-bold text-lg tracking-tight hover:text-blue-300 transition">
-    ▶ Protect Timelapse
-  </button>
+  <div class="flex items-center gap-4">
+    <button @click="view = 'dashboard'" class="text-blue-400 font-bold text-lg tracking-tight hover:text-blue-300 transition">
+      ▶ Protect Timelapse
+    </button>
+    <button @click="openCameraGrid()"
+            class="hidden sm:inline-flex items-center gap-1.5 text-sm px-3 py-1 rounded-lg transition"
+            :class="view === 'cameras' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M15 10l4.553-2.069A1 1 0 0121 8.882v6.236a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+      </svg>
+      Cameras
+    </button>
+    <button @click="openRendersQueue()"
+            class="hidden sm:inline-flex items-center gap-1.5 text-sm px-3 py-1 rounded-lg transition"
+            :class="view === 'renders_queue' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M7 4v16M17 4v16M3 8h4m10 0h4M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/>
+      </svg>
+      Renders
+    </button>
+  </div>
 
   <div class="flex items-center gap-4">
-    <!-- Disk gauge -->
-    <div class="hidden sm:flex items-center gap-2 text-xs text-slate-400">
+    <!-- Disk gauge (click to open breakdown modal) -->
+    <button class="hidden sm:flex items-center gap-2 text-xs text-slate-400 hover:text-slate-200 transition"
+            @click="openDiskModal()">
       <span :class="diskCritical ? 'text-red-400' : ''">
         <span x-text="diskSpace.free_gb !== null ? diskSpace.free_gb.toFixed(1) + ' GB free' : 'Disk —'"></span>
       </span>
@@ -32,7 +53,7 @@
              :class="diskCritical ? 'bg-red-500' : 'bg-blue-500'"
              :style="`width:${diskPercent}%`"></div>
       </div>
-    </div>
+    </button>
 
     <!-- Notification bell -->
     <div class="relative">
@@ -53,7 +74,11 @@
            class="absolute right-0 mt-2 w-80 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-50 max-h-80 overflow-y-auto">
         <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
           <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Notifications</span>
-          <button @click="markAllRead()" class="text-xs text-blue-400 hover:text-blue-300">Mark all read</button>
+          <div class="flex gap-2">
+            <button @click="markAllRead()" class="text-xs text-blue-400 hover:text-blue-300">Mark all read</button>
+            <button @click="clearAllNotifications(true)" class="text-xs text-slate-400 hover:text-slate-200">Clear read</button>
+            <button @click="clearAllNotifications(false)" class="text-xs text-red-400 hover:text-red-300">Clear all</button>
+          </div>
         </div>
         <template x-if="notifications.length === 0">
           <p class="text-slate-500 text-sm text-center py-4">No notifications</p>
@@ -62,12 +87,14 @@
           <div class="px-3 py-2 border-b border-slate-700/50 hover:bg-slate-700/40 transition"
                :class="n.is_read ? 'opacity-60' : ''">
             <div class="flex items-start gap-2">
-              <span class="mt-0.5 w-2 h-2 rounded-full flex-shrink-0"
+              <span class="mt-0.5 w-2 h-2 rounded-full flex-shrink-0 mt-1.5"
                     :class="{ 'bg-red-400': n.level==='error', 'bg-yellow-400': n.level==='warning', 'bg-blue-400': n.level==='info' }"></span>
-              <div>
+              <div class="flex-1 min-w-0">
                 <p class="text-sm text-slate-200" x-text="n.message"></p>
                 <p class="text-xs text-slate-500" x-text="formatDate(n.created_at)"></p>
               </div>
+              <button @click.stop="deleteNotification(n.id)"
+                      class="text-slate-600 hover:text-red-400 transition flex-shrink-0 text-xs px-1" title="Delete">✕</button>
             </div>
           </div>
         </template>
@@ -100,37 +127,218 @@
   </div>
 </nav>
 
+<!-- Mobile bottom nav bar (sm: hidden) -->
+<nav class="sm:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 flex z-40">
+  <button @click="view = 'dashboard'" class="flex-1 flex flex-col items-center py-2 text-xs gap-0.5"
+          :class="view === 'dashboard' ? 'text-blue-400' : 'text-slate-500'">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+    </svg>
+    Home
+  </button>
+  <button @click="openCameraGrid()" class="flex-1 flex flex-col items-center py-2 text-xs gap-0.5"
+          :class="view === 'cameras' ? 'text-blue-400' : 'text-slate-500'">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M15 10l4.553-2.069A1 1 0 0121 8.882v6.236a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+    </svg>
+    Cameras
+  </button>
+  <button @click="openRendersQueue()" class="flex-1 flex flex-col items-center py-2 text-xs gap-0.5"
+          :class="view === 'renders_queue' ? 'text-blue-400' : 'text-slate-500'">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M7 4v16M17 4v16M3 8h4m10 0h4M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/>
+    </svg>
+    Renders
+  </button>
+  <button @click="openSettings()" class="flex-1 flex flex-col items-center py-2 text-xs gap-0.5"
+          :class="view === 'settings' ? 'text-blue-400' : 'text-slate-500'">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+    </svg>
+    Settings
+  </button>
+</nav>
+
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- TOAST AREA                                                              -->
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <div class="fixed bottom-4 right-4 flex flex-col gap-2 z-50">
   <template x-for="t in toasts" :key="t.id">
-    <div class="px-4 py-2 rounded-lg text-sm shadow-lg border"
-         :class="t.type==='error' ? 'bg-red-900 border-red-700 text-red-100' : 'bg-emerald-900 border-emerald-700 text-emerald-100'"
-         x-text="t.message"
+    <div class="flex items-center gap-2 px-4 py-2 rounded-lg text-sm shadow-lg border max-w-sm"
+         :class="[
+           t.type==='error' ? 'bg-red-900 border-red-700 text-red-100' : 'bg-emerald-900 border-emerald-700 text-emerald-100',
+           t.projectId ? 'cursor-pointer hover:brightness-110' : ''
+         ]"
+         @click="clickToast(t)"
          x-transition:enter="transition ease-out duration-200"
          x-transition:enter-start="opacity-0 translate-y-2"
          x-transition:enter-end="opacity-100 translate-y-0"
          x-transition:leave="transition ease-in duration-150"
          x-transition:leave-start="opacity-100"
-         x-transition:leave-end="opacity-0"></div>
+         x-transition:leave-end="opacity-0">
+      <span class="flex-1" x-text="t.message"></span>
+      <button @click.stop="dismissToast(t.id)" class="opacity-60 hover:opacity-100 text-xs">✕</button>
+    </div>
   </template>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- MAIN CONTENT                                                             -->
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
-<main class="max-w-7xl mx-auto px-4 py-6">
+<main class="max-w-7xl mx-auto px-4 py-6 pb-20 sm:pb-6">
+
+  <!-- ── GLOBAL RENDERS QUEUE ─────────────────────────────────────────────── -->
+  <div x-show="view === 'renders_queue'">
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-bold text-slate-100">Render Queue</h1>
+      <button @click="loadRendersQueue()"
+              class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition">
+        Refresh
+      </button>
+    </div>
+
+    <template x-if="allRenders.length === 0">
+      <div class="text-center py-20 text-slate-500">No renders yet.</div>
+    </template>
+
+    <div class="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-slate-700 text-xs text-slate-400 uppercase tracking-wide">
+            <th class="text-left px-4 py-3">Project</th>
+            <th class="text-left px-4 py-3 hidden sm:table-cell">Type</th>
+            <th class="text-left px-4 py-3">Status</th>
+            <th class="text-left px-4 py-3 hidden md:table-cell">Progress</th>
+            <th class="text-left px-4 py-3 hidden lg:table-cell">Size</th>
+            <th class="text-left px-4 py-3 hidden lg:table-cell">Created</th>
+            <th class="text-right px-4 py-3">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="r in allRenders" :key="r.id">
+            <tr class="border-b border-slate-700/50 hover:bg-slate-700/30 transition">
+              <td class="px-4 py-3 text-slate-200" x-text="r.project_name || ('#' + r.project_id)"></td>
+              <td class="px-4 py-3 text-slate-400 capitalize hidden sm:table-cell" x-text="r.render_type"></td>
+              <td class="px-4 py-3">
+                <span class="px-2 py-0.5 rounded-full text-xs font-medium"
+                      :class="{
+                        'bg-yellow-700/50 text-yellow-300': r.status === 'pending',
+                        'bg-blue-700/50 text-blue-300': r.status === 'rendering',
+                        'bg-emerald-700/50 text-emerald-300': r.status === 'done',
+                        'bg-red-700/50 text-red-300': r.status === 'error',
+                      }"
+                      x-text="r.status"></span>
+              </td>
+              <td class="px-4 py-3 hidden md:table-cell">
+                <div class="w-24 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                  <div class="h-full bg-blue-500 rounded-full transition-all"
+                       :style="`width:${r.progress_pct || 0}%`"></div>
+                </div>
+              </td>
+              <td class="px-4 py-3 text-slate-400 hidden lg:table-cell"
+                  x-text="r.file_size_bytes ? (r.file_size_bytes / 1048576).toFixed(1) + ' MB' : '—'"></td>
+              <td class="px-4 py-3 text-slate-400 hidden lg:table-cell"
+                  x-text="formatDate(r.created_at)"></td>
+              <td class="px-4 py-3 text-right">
+                <div class="flex justify-end gap-2">
+                  <template x-if="r.status === 'done'">
+                    <a :href="`/api/renders/${r.id}/download`"
+                       class="text-xs bg-blue-700 hover:bg-blue-600 text-blue-100 px-2 py-1 rounded transition">
+                      Download
+                    </a>
+                  </template>
+                  <button @click="deleteRender(r.id)"
+                          class="text-xs bg-slate-700 hover:bg-red-800 text-slate-400 hover:text-red-200 px-2 py-1 rounded transition">
+                    ✕
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── CAMERA GRID ──────────────────────────────────────────────────────── -->
+  <div x-show="view === 'cameras'">
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-bold text-slate-100">Live Cameras</h1>
+      <button @click="refreshCameraGrid()"
+              class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+        </svg>
+        Refresh
+      </button>
+    </div>
+
+    <template x-if="cameras.length === 0">
+      <div class="text-center py-20 text-slate-500">
+        <svg class="w-12 h-12 mx-auto mb-3 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M15 10l4.553-2.069A1 1 0 0121 8.882v6.236a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+        </svg>
+        <p>No cameras found. Check NVR connection in Settings.</p>
+      </div>
+    </template>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+      <template x-for="cam in cameras" :key="cam.id">
+        <div class="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden hover:border-blue-500/50 transition cursor-pointer group"
+             @click="createProjectFromCamera(cam.id)">
+          <!-- Snapshot preview -->
+          <div class="relative aspect-video bg-slate-900 overflow-hidden">
+            <img :src="cameraPreviewUrl(cam.id)"
+                 :alt="cam.name"
+                 class="w-full h-full object-cover"
+                 @error="$el.style.display='none'" />
+            <!-- overlay hint -->
+            <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center">
+              <span class="text-white text-sm font-medium">+ New Project</span>
+            </div>
+            <!-- Status badge -->
+            <span class="absolute top-2 right-2 text-xs px-2 py-0.5 rounded-full"
+                  :class="cam.is_connected ? 'bg-emerald-600/80 text-emerald-100' : 'bg-slate-600/80 text-slate-300'"
+                  x-text="cam.is_connected ? 'Online' : 'Offline'"></span>
+          </div>
+          <div class="p-3">
+            <p class="text-sm font-medium text-slate-200 truncate" x-text="cam.name"></p>
+            <p class="text-xs text-slate-500 mt-0.5" x-text="cam.id.substring(0,16) + '…'"></p>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
 
   <!-- ── DASHBOARD ───────────────────────────────────────────────────────── -->
   <div x-show="view === 'dashboard'">
-    <div class="flex items-center justify-between mb-6">
+    <div class="flex items-center justify-between mb-3">
       <h1 class="text-2xl font-bold text-slate-100">Dashboard</h1>
-      <button @click="openCreateForm()"
-              class="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
-        <span>+ New Project</span>
-        <span class="hidden sm:inline text-blue-300 text-xs">[N]</span>
-      </button>
+      <div class="flex items-center gap-2">
+        <button @click="toggleSelectMode()"
+                :class="selectMode ? 'bg-blue-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'"
+                class="text-sm px-3 py-1.5 rounded-lg transition">
+          <span x-text="selectMode ? 'Done' : 'Select'"></span>
+        </button>
+        <button @click="openCreateForm()"
+                class="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
+          <span>+ New Project</span>
+          <span class="hidden sm:inline text-blue-300 text-xs">[N]</span>
+        </button>
+      </div>
+    </div>
+    <!-- Bulk action bar -->
+    <div x-show="selectMode && selectedProjectIds.length > 0"
+         class="flex items-center gap-2 mb-4 bg-blue-900/40 border border-blue-700 rounded-xl px-4 py-2">
+      <span class="text-sm text-blue-300 flex-1" x-text="`${selectedProjectIds.length} selected`"></span>
+      <button @click="bulkPause()" class="text-xs bg-slate-700 hover:bg-yellow-800 text-slate-300 hover:text-yellow-100 px-3 py-1.5 rounded-lg transition">Pause all</button>
+      <button @click="bulkResume()" class="text-xs bg-slate-700 hover:bg-emerald-800 text-slate-300 hover:text-emerald-100 px-3 py-1.5 rounded-lg transition">Resume all</button>
+      <button @click="bulkDelete()" class="text-xs bg-red-900/60 hover:bg-red-800 text-red-300 hover:text-red-100 px-3 py-1.5 rounded-lg transition">Delete selected</button>
     </div>
 
     <!-- Onboarding empty state -->
@@ -162,19 +370,56 @@
 
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
           <template x-for="proj in cam.projects" :key="proj.id">
-            <div class="bg-slate-800 border border-slate-700 rounded-xl p-4 hover:border-slate-600 transition cursor-pointer"
-                 @click="openProject(proj)">
+            <div class="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden hover:border-slate-600 transition cursor-pointer relative"
+                 :class="selectedProjectIds.includes(proj.id) ? 'ring-2 ring-blue-500' : ''"
+                 @click="selectMode ? toggleSelectProject(proj.id) : openProject(proj)">
+              <!-- Thumbnail background (dimmed) -->
+              <template x-if="proj.last_frame_id">
+                <img :src="`/api/projects/${proj.id}/frames/${proj.last_frame_id}/thumbnail`"
+                     class="absolute inset-0 w-full h-full object-cover opacity-10 pointer-events-none" />
+              </template>
+              <!-- Select mode checkbox -->
+              <template x-if="selectMode">
+                <div class="absolute top-2 left-2 z-10">
+                  <div class="w-5 h-5 rounded border-2 flex items-center justify-center transition"
+                       :class="selectedProjectIds.includes(proj.id) ? 'bg-blue-600 border-blue-600' : 'border-slate-500 bg-slate-900/60'">
+                    <svg x-show="selectedProjectIds.includes(proj.id)" class="w-3 h-3 text-white" fill="currentColor" viewBox="0 0 20 20">
+                      <path d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"/>
+                    </svg>
+                  </div>
+                </div>
+              </template>
+              <div class="relative p-4">
               <div class="flex items-start justify-between mb-2">
                 <span class="font-medium text-slate-100 truncate" x-text="proj.name"></span>
-                <span class="w-2.5 h-2.5 rounded-full flex-shrink-0 mt-1 ml-2"
-                      :class="statusDot(proj.status)"></span>
+                <div class="flex items-center gap-1.5 flex-shrink-0 ml-2">
+                  <!-- Progress ring for max_frames projects -->
+                  <template x-if="proj.max_frames">
+                    <svg class="w-5 h-5 -rotate-90" viewBox="0 0 20 20">
+                      <circle cx="10" cy="10" r="8" fill="none" stroke="rgb(71 85 105)" stroke-width="2"/>
+                      <circle cx="10" cy="10" r="8" fill="none" stroke="rgb(96 165 250)" stroke-width="2"
+                              stroke-linecap="round"
+                              :stroke-dasharray="`${2 * Math.PI * 8}`"
+                              :stroke-dashoffset="`${2 * Math.PI * 8 * (1 - Math.min(1, proj.frame_count / proj.max_frames))}`"/>
+                    </svg>
+                  </template>
+                  <span class="w-2.5 h-2.5 rounded-full"
+                        :class="statusDot(proj.status)"></span>
+                </div>
               </div>
               <div class="text-xs text-slate-400 space-y-1">
                 <div>
                   <span x-text="proj.frame_count.toLocaleString()"></span> frames ·
                   <span x-text="proj.interval_seconds + 's interval'"></span>
                 </div>
-                <div class="capitalize" x-text="proj.status.replace('_', ' ')"></div>
+                <div class="flex items-center gap-2">
+                  <span class="capitalize" x-text="proj.status.replace('_', ' ')"></span>
+                  <template x-if="proj.last_captured_at">
+                    <span class="text-xs px-1.5 py-0.5 rounded-full"
+                          :class="timeSinceBadgeClass(proj)"
+                          x-text="timeSince(proj.last_captured_at)"></span>
+                  </template>
+                </div>
               </div>
               <!-- Quick actions -->
               <div class="flex gap-2 mt-3" @click.stop>
@@ -190,11 +435,16 @@
                     Resume
                   </button>
                 </template>
+                <button @click="cloneProject(proj.id)"
+                        class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-400 hover:text-slate-200 px-2 py-1 rounded transition" title="Clone project">
+                  ⧉
+                </button>
                 <button @click="deleteProject(proj.id)"
                         class="text-xs bg-slate-700 hover:bg-red-800 text-slate-400 hover:text-red-200 px-2 py-1 rounded transition">
                   ✕
                 </button>
               </div>
+              </div><!-- /relative p-4 -->
             </div>
           </template>
         </div>
@@ -236,12 +486,12 @@
       </div>
     </div>
 
-    <!-- Tabs -->
-    <div class="flex gap-1 mb-6 border-b border-slate-800">
-      <template x-for="tab in ['overview','renders','bookmarks','dark_frames']" :key="tab">
+    <!-- Tabs (horizontally scrollable on mobile) -->
+    <div class="flex gap-1 mb-6 border-b border-slate-800 overflow-x-auto scrollbar-none -mx-4 px-4 sm:mx-0 sm:px-0">
+      <template x-for="tab in ['overview','renders','bookmarks','quality']" :key="tab">
         <button @click="loadDetailTab(tab)"
                 :class="detailTab === tab ? 'border-b-2 border-blue-500 text-blue-400' : 'text-slate-500 hover:text-slate-300'"
-                class="px-4 py-2 text-sm capitalize transition"
+                class="px-4 py-2 text-sm capitalize transition flex-shrink-0"
                 x-text="tab.replace('_',' ')"></button>
       </template>
     </div>
@@ -268,12 +518,31 @@
         <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wide">Frame Scrubber</h3>
         <template x-if="activeProjectFrames.length > 0">
           <div>
+            <!-- Scrubber wrapper for hover preview -->
+            <div class="relative"
+                 @mousemove="onScrubberHover($event)"
+                 @mouseleave="scrubberHoverFrame = null">
             <input type="range" min="0" :max="activeProjectFrames.length - 1"
                    :value="scrubberIndex"
                    @input="onScrubberInput($event)"
                    @click="onScrubberShiftClick($event)"
                    class="w-full accent-blue-500 mb-2" />
-            <div class="text-xs text-slate-400 mb-2" x-text="scrubberTimestamp ? formatDate(scrubberTimestamp) : ''"></div>
+            <!-- Hover preview floating thumbnail -->
+            <template x-if="scrubberHoverFrame">
+              <div class="absolute bottom-8 pointer-events-none z-30 -translate-x-1/2"
+                   :style="`left: ${scrubberHoverX}px`">
+                <img :src="`/api/projects/${activeProject.id}/frames/${scrubberHoverFrame.id}/thumbnail`"
+                     class="w-32 h-20 object-cover rounded-lg border border-slate-600 shadow-xl bg-slate-900" />
+                <p class="text-xs text-slate-300 text-center mt-1 bg-slate-900/80 rounded px-1" x-text="formatDate(scrubberHoverFrame.captured_at)"></p>
+              </div>
+            </template>
+            </div><!-- /scrubber wrapper -->
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs text-slate-400" x-text="scrubberTimestamp ? formatDate(scrubberTimestamp) : ''"></span>
+              <button x-show="activeProjectFrames[scrubberIndex]"
+                      @click="deleteFrame(activeProjectFrames[scrubberIndex]?.id)"
+                      class="text-xs text-slate-600 hover:text-red-400 transition px-2 py-0.5 rounded" title="Delete this frame">🗑</button>
+            </div>
             <template x-if="scrubberFrameUrl">
               <img :src="scrubberFrameUrl" alt="Frame preview"
                    class="rounded-lg max-h-64 object-contain bg-slate-900 w-full" />
@@ -326,24 +595,131 @@
       </template>
 
       <!-- Render trigger -->
-      <div class="bg-slate-800 rounded-xl p-4">
-        <h3 class="text-sm font-semibold text-slate-400 mb-3 uppercase tracking-wide">Render</h3>
-        <div class="flex flex-wrap gap-2">
-          <button @click="triggerRender(activeProject.id, 30); updateRenderEstimate(30)"
-                  class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm transition">
-            Render 30fps <span class="text-xs text-blue-300 ml-1">[R]</span>
-          </button>
-          <button @click="triggerRender(activeProject.id, 24); updateRenderEstimate(24)"
-                  class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-lg text-sm transition">
-            Render 24fps
-          </button>
-          <button @click="triggerRender(activeProject.id, 60); updateRenderEstimate(60)"
-                  class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-lg text-sm transition">
-            Render 60fps
-          </button>
+      <div class="bg-slate-800 rounded-xl p-4 space-y-3">
+        <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide">Render</h3>
+
+        <!-- Framerate presets -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1.5">Framerate</label>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="fp in [{fps:12,label:'12fps',note:'slow'},{fps:15,label:'15fps',note:''},{fps:24,label:'24fps',note:'film'},{fps:25,label:'25fps',note:'PAL'},{fps:30,label:'30fps',note:'default'},{fps:48,label:'48fps',note:''},{fps:60,label:'60fps',note:''}]" :key="fp.fps">
+              <button @click="renderFramerate = fp.fps; updateRenderEstimate(fp.fps)"
+                      :class="renderFramerate === fp.fps ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+                      class="px-3 py-1.5 rounded-lg text-xs transition">
+                <span x-text="fp.label"></span><span x-show="fp.note" class="text-slate-400 ml-1 text-xs" x-text="'(' + fp.note + ')'"></span>
+              </button>
+            </template>
+          </div>
         </div>
+
+        <!-- Resolution presets -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1.5">Resolution</label>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="rp in [{res:'3840x2160',label:'4K'},{res:'2560x1440',label:'2K'},{res:'1920x1080',label:'1080p'},{res:'1280x720',label:'720p'}]" :key="rp.res">
+              <button @click="renderResolution = rp.res"
+                      :class="renderResolution === rp.res ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+                      class="px-3 py-1.5 rounded-lg text-xs transition">
+                <span x-text="rp.label"></span>
+                <span class="text-slate-400 ml-1 text-xs" x-text="'(' + rp.res + ')'"></span>
+              </button>
+            </template>
+            <input x-model="renderResolution"
+                   placeholder="custom e.g. 1600x900"
+                   class="bg-slate-700 border border-slate-600 text-slate-200 text-xs rounded-lg px-2 py-1.5 w-36 focus:outline-none focus:ring-1 focus:ring-blue-500" />
+          </div>
+        </div>
+
+        <!-- Quality presets -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1.5">Quality</label>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="q in [{v:'draft',label:'Draft',note:'fast preview'},{v:'standard',label:'Standard',note:'H.264 CRF 23'},{v:'high',label:'High',note:'CRF 18'},{v:'archive',label:'Archive',note:'H.265'}]" :key="q.v">
+              <button @click="renderQuality = q.v"
+                      :class="renderQuality === q.v ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+                      class="px-3 py-1.5 rounded-lg text-xs transition">
+                <span x-text="q.label"></span>
+                <span class="text-slate-400 ml-1 text-xs" x-text="'(' + q.note + ')'"></span>
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <!-- Deflicker -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1.5">Deflicker</label>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="f in [{v:'off',label:'Off'},{v:'standard',label:'Standard',note:'10 frames'},{v:'strong',label:'Strong',note:'50 frames'},{v:'holy_grail',label:'Holy Grail',note:'outdoor'}]" :key="f.v">
+              <button @click="renderFlicker = f.v"
+                      :class="renderFlicker === f.v ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+                      class="px-3 py-1.5 rounded-lg text-xs transition">
+                <span x-text="f.label"></span>
+                <span x-show="f.note" class="text-slate-400 ml-1 text-xs" x-text="'(' + f.note + ')'"></span>
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <!-- Color grade -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1.5">Color Grade</label>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="g in [{v:'none',label:'None'},{v:'neutral',label:'Neutral',note:'S-curve'},{v:'warm',label:'Warm',note:'golden'},{v:'cool',label:'Cool',note:'overcast'},{v:'cinematic',label:'Cinematic',note:'teal-orange'}]" :key="g.v">
+              <button @click="renderColorGrade = g.v"
+                      :class="renderColorGrade === g.v ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+                      class="px-3 py-1.5 rounded-lg text-xs transition">
+                <span x-text="g.label"></span>
+                <span x-show="g.note" class="text-slate-400 ml-1 text-xs" x-text="'(' + g.note + ')'"></span>
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <!-- Toggles: frame blend + stabilize -->
+        <div class="flex flex-wrap gap-4">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="renderFrameBlend" class="accent-blue-500" />
+            <span class="text-xs text-slate-300">Motion blend <span class="text-slate-500">(cinematic)</span></span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="renderStabilize" class="accent-blue-500" />
+            <span class="text-xs text-slate-300">Stabilize <span class="text-slate-500">(slow)</span></span>
+          </label>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="flex flex-wrap gap-2 pt-1">
+          <button @click="triggerRender(activeProject.id, renderFramerate, renderResolution); updateRenderEstimate(renderFramerate)"
+                  class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm transition">
+            Render <span x-text="renderFramerate + 'fps · ' + renderResolution"></span>
+            <span class="text-xs text-blue-300 ml-1">[R]</span>
+          </button>
+          <button @click="triggerRender(activeProject.id, renderFramerate, '854x480', 'Preview', 'preview')"
+                  class="bg-slate-600 hover:bg-slate-500 text-slate-200 px-4 py-2 rounded-lg text-sm transition"
+                  title="Fast 480p proxy render — check settings before full render">
+            ⚡ Preview
+          </button>
+          <!-- GIF export -->
+          <template x-if="!gifJobStatus || gifJobStatus === 'error'">
+            <button @click="exportGif()"
+                    class="bg-slate-600 hover:bg-slate-500 text-slate-200 px-4 py-2 rounded-lg text-sm transition"
+                    title="Export 480px animated GIF (max 60 frames)">
+              🎞 GIF
+            </button>
+          </template>
+          <template x-if="gifJobStatus === 'pending' || gifJobStatus === 'rendering'">
+            <span class="text-xs text-slate-400 animate-pulse px-2 py-2">Generating GIF…</span>
+          </template>
+          <template x-if="gifJobStatus === 'done'">
+            <a :href="`/api/projects/${activeProject.id}/gif/download`" target="_blank"
+               class="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm transition">
+              ⬇ Download GIF
+            </a>
+          </template>
+        </div>
+
         <template x-if="lastRenderEstimate">
-          <p class="text-xs text-slate-400 mt-2" x-text="lastRenderEstimate"></p>
+          <p class="text-xs text-slate-400" x-text="lastRenderEstimate"></p>
         </template>
       </div>
     </div>
@@ -428,37 +804,66 @@
       </template>
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <template x-for="frame in activeProjectBookmarks" :key="frame.id">
-          <div class="bg-slate-800 rounded-lg overflow-hidden cursor-pointer hover:ring-1 hover:ring-blue-500 transition"
-               @click="detailTab='overview'; scrubberIndex = activeProjectFrames.findIndex(f => f.id === frame.id); updateScrubberFrame()">
+          <div class="bg-slate-800 rounded-lg overflow-hidden hover:ring-1 hover:ring-blue-500 transition">
             <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
-                 class="w-full h-24 object-cover bg-slate-900" alt="" />
-            <div class="p-2">
-              <p class="text-xs text-slate-300 truncate" x-text="frame.bookmark_note"></p>
-              <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
+                 class="w-full h-24 object-cover bg-slate-900 cursor-pointer" alt=""
+                 @click="detailTab='overview'; scrubberIndex = activeProjectFrames.findIndex(f => f.id === frame.id); updateScrubberFrame()" />
+            <div class="p-2 flex items-start justify-between gap-1">
+              <div class="min-w-0">
+                <p class="text-xs text-slate-300 truncate" x-text="frame.bookmark_note"></p>
+                <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
+              </div>
+              <button @click.stop="deleteFrame(frame.id)" class="text-slate-600 hover:text-red-400 flex-shrink-0 text-xs" title="Delete frame">🗑</button>
             </div>
           </div>
         </template>
       </div>
     </div>
 
-    <!-- Tab: Dark Frames -->
-    <div x-show="detailTab === 'dark_frames'">
-      <p class="text-xs text-slate-400 mb-4">
-        Frames flagged as too dark (luminance below threshold). Use these to calibrate your threshold setting.
-      </p>
-      <template x-if="activeProjectDarkFrames.length === 0">
-        <p class="text-slate-500 text-sm">No dark frames. Either luminance check is off, or all frames passed.</p>
-      </template>
-      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-        <template x-for="frame in activeProjectDarkFrames" :key="frame.id">
-          <div class="bg-slate-800 rounded-lg overflow-hidden">
-            <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
-                 class="w-full h-24 object-cover bg-slate-900" alt="" />
-            <div class="p-2">
-              <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
-            </div>
-          </div>
+    <!-- Tab: Quality (dark + blurry frames) -->
+    <div x-show="detailTab === 'quality'">
+      <!-- Dark frames -->
+      <div class="mb-6">
+        <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide mb-2">Dark Frames</h3>
+        <p class="text-xs text-slate-500 mb-3">Frames below the luminance threshold — excluded from renders.</p>
+        <template x-if="activeProjectDarkFrames.length === 0">
+          <p class="text-slate-500 text-sm">No dark frames.</p>
         </template>
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+          <template x-for="frame in activeProjectDarkFrames" :key="frame.id">
+            <div class="bg-slate-800 rounded-lg overflow-hidden">
+              <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                   class="w-full h-24 object-cover bg-slate-900" alt="" />
+              <div class="p-2 flex items-center justify-between">
+                <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
+                <button @click="deleteFrame(frame.id)" class="text-slate-600 hover:text-red-400 text-xs" title="Delete frame">🗑</button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+      <!-- Blurry frames -->
+      <div>
+        <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide mb-2">Blurry Frames</h3>
+        <p class="text-xs text-slate-500 mb-3">Frames with low sharpness score (Laplacian variance &lt; 20) — excluded from renders.</p>
+        <template x-if="activeProjectBlurryFrames.length === 0">
+          <p class="text-slate-500 text-sm">No blurry frames detected.</p>
+        </template>
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+          <template x-for="frame in activeProjectBlurryFrames" :key="frame.id">
+            <div class="bg-slate-800 rounded-lg overflow-hidden">
+              <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                   class="w-full h-24 object-cover bg-slate-900" alt="" />
+              <div class="p-2 flex items-start justify-between gap-1">
+                <div>
+                  <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
+                  <p class="text-xs text-amber-400" x-text="'sharpness: ' + (frame.sharpness_score || 0).toFixed(1)"></p>
+                </div>
+                <button @click="deleteFrame(frame.id)" class="text-slate-600 hover:text-red-400 flex-shrink-0 text-xs" title="Delete frame">🗑</button>
+              </div>
+            </div>
+          </template>
+        </div>
       </div>
     </div>
   </div>
@@ -517,17 +922,44 @@
           </div>
         </div>
 
-        <!-- Historical date range -->
+        <!-- Historical date range picker -->
         <div x-show="form.project_type === 'historical'" class="space-y-3">
           <div>
-            <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Start Date/Time</label>
-            <input x-model="form.start_date" type="datetime-local"
-                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
-          </div>
-          <div>
-            <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">End Date/Time</label>
-            <input x-model="form.end_date" type="datetime-local"
-                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+            <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Date Range</label>
+            <!-- Quick presets -->
+            <div class="flex flex-wrap gap-1.5 mb-3">
+              <template x-for="preset in historicalPresets" :key="preset.label">
+                <button type="button"
+                        @click="applyHistoricalPreset(preset)"
+                        class="text-xs px-2.5 py-1 rounded-lg border transition"
+                        :class="historicalPresetLabel === preset.label
+                          ? 'bg-blue-600 border-blue-500 text-white'
+                          : 'border-slate-600 bg-slate-700/50 text-slate-300 hover:bg-slate-700'"
+                        x-text="preset.label">
+                </button>
+              </template>
+            </div>
+            <!-- Range summary -->
+            <template x-if="form.start_date && form.end_date">
+              <p class="text-xs text-blue-300 mb-2"
+                 x-text="formatHistoricalRange(form.start_date, form.end_date)">
+              </p>
+            </template>
+            <!-- Custom inputs (shown when "Custom" selected or no preset) -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div>
+                <label class="block text-xs text-slate-400 mb-1">Start</label>
+                <input x-model="form.start_date" type="datetime-local"
+                       @change="historicalPresetLabel = 'Custom'"
+                       class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-100" />
+              </div>
+              <div>
+                <label class="block text-xs text-slate-400 mb-1">End</label>
+                <input x-model="form.end_date" type="datetime-local"
+                       @change="historicalPresetLabel = 'Custom'"
+                       class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-100" />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -543,8 +975,8 @@
                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
         </div>
 
-        <!-- Capture mode -->
-        <div>
+        <!-- Capture mode (live only) -->
+        <div x-show="form.project_type !== 'historical'">
           <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Capture Mode</label>
           <div class="space-y-2">
             <label class="flex items-center gap-2 cursor-pointer">
@@ -562,8 +994,8 @@
           </div>
         </div>
 
-        <!-- Schedule settings -->
-        <div x-show="form.capture_mode === 'schedule'" class="bg-slate-800/60 rounded-lg p-3 space-y-3">
+        <!-- Schedule settings (live only) -->
+        <div x-show="form.project_type !== 'historical' && form.capture_mode === 'schedule'" class="bg-slate-800/60 rounded-lg p-3 space-y-3">
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-xs text-slate-400 mb-1">Start time</label>
@@ -583,8 +1015,8 @@
           </div>
         </div>
 
-        <!-- Luminance check -->
-        <div>
+        <!-- Luminance check (live only) -->
+        <div x-show="form.project_type !== 'historical'">
           <label class="flex items-center gap-2 cursor-pointer mb-2">
             <input type="checkbox" x-model="form.use_luminance_check" class="accent-blue-500" />
             <span class="text-sm text-slate-300">Enable Luminance Check</span>
@@ -596,15 +1028,28 @@
           </div>
         </div>
 
-        <!-- Max frames -->
-        <div>
+        <!-- Motion filter (live only) -->
+        <div x-show="form.project_type !== 'historical'">
+          <label class="flex items-center gap-2 cursor-pointer mb-2">
+            <input type="checkbox" x-model="form.use_motion_filter" class="accent-blue-500" />
+            <span class="text-sm text-slate-300">Motion Filter <span class="text-slate-500 text-xs">(skip still frames)</span></span>
+          </label>
+          <div x-show="form.use_motion_filter">
+            <label class="block text-xs text-slate-400 mb-1">Motion threshold (% pixel difference, 1–100)</label>
+            <input x-model.number="form.motion_threshold" type="number" min="1" max="100"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+          </div>
+        </div>
+
+        <!-- Max frames (live only) -->
+        <div x-show="form.project_type !== 'historical'">
           <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Max Frames (0 = unlimited)</label>
           <input x-model.number="form.max_frames" type="number" min="0"
                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
         </div>
 
-        <!-- Auto-render toggles -->
-        <div class="space-y-2">
+        <!-- Auto-render toggles (live only) -->
+        <div x-show="form.project_type !== 'historical'" class="space-y-2">
           <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide">Auto-Render</label>
           <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" x-model="form.auto_render_daily" class="accent-blue-500" />
@@ -640,8 +1085,8 @@
         </div>
       </div>
 
-      <!-- Live FoV preview -->
-      <div x-show="form.camera_id && view === 'create_project'">
+      <!-- Live FoV preview (live projects only) -->
+      <div x-show="form.camera_id && view === 'create_project' && form.project_type !== 'historical'">
         <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Live Preview</label>
         <template x-if="previewUrl">
           <img :src="previewUrl" alt="Camera preview"
@@ -686,6 +1131,23 @@
           <span class="text-sm text-slate-300">Verify SSL certificate</span>
         </label>
         <p class="text-xs text-amber-400">Saving NVR settings will trigger an automatic reconnect.</p>
+        <!-- NVR connection tester -->
+        <div>
+          <button @click="testNvrConnection()"
+                  :disabled="nvrTesting"
+                  class="bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200 px-4 py-1.5 rounded-lg text-sm transition">
+            <span x-text="nvrTesting ? 'Testing…' : 'Test Connection'"></span>
+          </button>
+          <div x-show="nvrTestResult !== null" class="mt-2 text-sm rounded-lg px-3 py-2"
+               :class="nvrTestResult && nvrTestResult.ok ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-700' : 'bg-red-900/40 text-red-300 border border-red-700'">
+            <template x-if="nvrTestResult && nvrTestResult.ok">
+              <span>✓ Connected · <span x-text="nvrTestResult.camera_count"></span> camera(s) · <span x-text="nvrTestResult.latency_ms"></span> ms</span>
+            </template>
+            <template x-if="nvrTestResult && !nvrTestResult.ok">
+              <span>✗ <span x-text="nvrTestResult.error"></span></span>
+            </template>
+          </div>
+        </div>
       </div>
 
       <!-- Capture & Render -->
@@ -756,6 +1218,37 @@
         </div>
       </div>
 
+      <!-- Watermark -->
+      <div class="bg-slate-800 border border-slate-700 rounded-xl p-5 space-y-4">
+        <div>
+          <h2 class="font-semibold text-slate-200">Watermark / Logo</h2>
+          <p class="text-xs text-slate-500 mt-0.5">PNG image overlaid at the bottom-right of every render.</p>
+        </div>
+        <!-- Current watermark preview -->
+        <template x-if="settingsData.watermark_path">
+          <div class="space-y-2">
+            <p class="text-xs text-slate-400">Current watermark:</p>
+            <img :src="'/api/settings/watermark-preview?t=' + Date.now()" alt="Watermark preview"
+                 class="max-h-16 rounded border border-slate-600 bg-slate-700/50 p-1" />
+            <button @click="clearWatermark()"
+                    class="text-xs text-red-400 hover:text-red-300 transition">Remove watermark</button>
+          </div>
+        </template>
+        <template x-if="!settingsData.watermark_path">
+          <p class="text-xs text-slate-500 italic">No watermark set.</p>
+        </template>
+        <!-- Upload -->
+        <div>
+          <label class="cursor-pointer inline-flex items-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-1.5 rounded-lg text-sm transition">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+            </svg>
+            Upload image
+            <input type="file" accept="image/*" class="hidden" @change="uploadWatermark($event)" />
+          </label>
+        </div>
+      </div>
+
     </div>
 
     <!-- Save button -->
@@ -790,7 +1283,13 @@
 
     <!-- Notification history -->
     <div class="mt-6 max-w-4xl">
-      <h2 class="font-semibold text-slate-200 mb-3">Notification History</h2>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-slate-200">Notification History</h2>
+        <div class="flex gap-2">
+          <button @click="clearAllNotifications(true)" class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition">Clear read</button>
+          <button @click="clearAllNotifications(false)" class="text-xs text-red-400 hover:text-red-300 bg-slate-700 hover:bg-red-900 px-3 py-1 rounded-lg transition">Clear all</button>
+        </div>
+      </div>
       <div class="bg-slate-800 border border-slate-700 rounded-xl divide-y divide-slate-700 max-h-80 overflow-y-auto">
         <template x-if="notifications.length === 0">
           <p class="text-slate-500 text-sm text-center py-6">No notifications.</p>
@@ -799,10 +1298,12 @@
           <div class="px-4 py-3 flex items-start gap-3" :class="n.is_read ? 'opacity-50' : ''">
             <span class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0"
                   :class="{ 'bg-red-400': n.level==='error', 'bg-yellow-400': n.level==='warning', 'bg-blue-400': n.level==='info' }"></span>
-            <div>
+            <div class="flex-1 min-w-0">
               <p class="text-sm text-slate-200" x-text="n.message"></p>
               <p class="text-xs text-slate-500" x-text="formatDate(n.created_at)"></p>
             </div>
+            <button @click="deleteNotification(n.id)"
+                    class="text-slate-600 hover:text-red-400 transition flex-shrink-0 text-sm px-1" title="Delete">✕</button>
           </div>
         </template>
       </div>
@@ -810,6 +1311,59 @@
   </div>
 
 </main>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- DISK BREAKDOWN MODAL                                                     -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div x-show="showDiskModal"
+     @click="showDiskModal = false"
+     class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+  <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-lg mx-4 max-h-[80vh] overflow-y-auto" @click.stop>
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-bold text-slate-100 text-lg">Disk Usage</h2>
+      <button @click="showDiskModal = false" class="text-slate-400 hover:text-slate-100 text-lg">✕</button>
+    </div>
+
+    <!-- Overall bar -->
+    <div class="mb-4">
+      <div class="flex justify-between text-xs text-slate-400 mb-1">
+        <span x-text="`${diskBreakdown.used_gb?.toFixed(1) ?? '—'} GB used`"></span>
+        <span x-text="`${diskBreakdown.free_gb?.toFixed(1) ?? '—'} GB free / ${diskBreakdown.total_gb?.toFixed(1) ?? '—'} GB total`"></span>
+      </div>
+      <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
+        <div class="h-full rounded-full transition-all"
+             :class="diskCritical ? 'bg-red-500' : 'bg-blue-500'"
+             :style="`width:${diskPercent}%`"></div>
+      </div>
+    </div>
+
+    <!-- Per-project breakdown -->
+    <div class="space-y-2">
+      <template x-if="!diskBreakdown.projects || diskBreakdown.projects.length === 0">
+        <p class="text-slate-500 text-sm text-center py-4">No projects with stored data.</p>
+      </template>
+      <template x-for="p in (diskBreakdown.projects || [])" :key="p.id">
+        <div class="bg-slate-700/40 rounded-lg px-3 py-2">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-sm text-slate-200 truncate" x-text="p.name"></span>
+            <span class="text-xs text-slate-400 flex-shrink-0 ml-2" x-text="`${p.total_gb.toFixed(2)} GB`"></span>
+          </div>
+          <!-- Stacked bar -->
+          <div class="h-1.5 rounded-full overflow-hidden bg-slate-600 flex">
+            <div class="bg-emerald-500 h-full" :style="`width:${diskBreakdown.total_gb > 0 ? p.frames_gb / diskBreakdown.total_gb * 100 : 0}%`" :title="`Frames: ${p.frames_gb.toFixed(2)} GB`"></div>
+            <div class="bg-blue-500 h-full" :style="`width:${diskBreakdown.total_gb > 0 ? p.renders_gb / diskBreakdown.total_gb * 100 : 0}%`" :title="`Renders: ${p.renders_gb.toFixed(2)} GB`"></div>
+            <div class="bg-slate-400 h-full" :style="`width:${diskBreakdown.total_gb > 0 ? p.thumbs_gb / diskBreakdown.total_gb * 100 : 0}%`" :title="`Thumbs: ${p.thumbs_gb.toFixed(2)} GB`"></div>
+          </div>
+          <div class="flex gap-3 mt-1 text-xs text-slate-500">
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span> Frames</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-blue-500 inline-block"></span> Renders</span>
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-slate-400 inline-block"></span> Thumbs</span>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- KEYBOARD SHORTCUT HELP OVERLAY                                          -->

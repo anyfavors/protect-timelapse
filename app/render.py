@@ -102,8 +102,49 @@ async def _process_next_render() -> None:
             for path in frame_paths:
                 f.write(f"file '{path}'\n")
 
+        # Stabilization pre-pass (vidstabdetect)
+        transforms_file: str | None = None
+        if render.get("stabilize"):
+            transforms_file = f"/tmp/transforms_{render_id}.trf"
+            stab_cmd = [
+                "ffmpeg",
+                "-y",
+                "-threads",
+                str(getattr(settings, "ffmpeg_threads", 4)),
+                "-r",
+                str(render["framerate"]),
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_file,
+                "-vf",
+                f"vidstabdetect=shakiness=5:accuracy=15:result={transforms_file}",
+                "-f",
+                "null",
+                "-",
+            ]
+            stab_proc = await asyncio.create_subprocess_exec(
+                *stab_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stab_err = await asyncio.wait_for(
+                stab_proc.communicate(), timeout=getattr(settings, "ffmpeg_timeout_seconds", 3600)
+            )
+            if stab_proc.returncode != 0:
+                log.warning(
+                    "Render id=%d: vidstabdetect failed (%s) — continuing without stabilization",
+                    render_id,
+                    stab_err.decode(errors="replace")[:200],
+                )
+                transforms_file = None
+
         # Build ffmpeg command
-        cmd = _build_ffmpeg_cmd(render, concat_file, output_path, total_frames, settings)
+        cmd = _build_ffmpeg_cmd(
+            render, concat_file, output_path, total_frames, settings, transforms_file
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -189,6 +230,9 @@ async def _process_next_render() -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.remove(concat_file)
+        if "transforms_file" in locals() and transforms_file:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(transforms_file)
 
 
 def _get_frame_paths(render: dict) -> list[str]:
@@ -215,7 +259,7 @@ def _get_frame_paths(render: dict) -> list[str]:
             rows = conn.execute(
                 """
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND is_dark = 0
+                WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)
                 AND captured_at BETWEEN ? AND ?
                 ORDER BY captured_at ASC
                 """,
@@ -226,7 +270,7 @@ def _get_frame_paths(render: dict) -> list[str]:
             rows = conn.execute(
                 """
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND is_dark = 0
+                WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)
                 ORDER BY captured_at ASC
                 """,
                 (project_id,),
@@ -235,12 +279,23 @@ def _get_frame_paths(render: dict) -> list[str]:
     return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
 
 
+_QUALITY_MAP = {
+    "draft": ("libx264", "veryfast", "28"),
+    "standard": ("libx264", "medium", "23"),
+    "high": ("libx264", "slow", "18"),
+    "archive": ("libx265", "medium", "22"),
+}
+
+_LUT_DIR = os.path.join(os.path.dirname(__file__), "luts")
+
+
 def _build_ffmpeg_cmd(
     render: dict,
     concat_file: str,
     output_path: str,
     total_frames: int,
     settings: object,
+    transforms_file: str | None = None,
 ) -> list[str]:
     framerate = render["framerate"]
     render_type = render["render_type"]
@@ -264,21 +319,73 @@ def _build_ffmpeg_cmd(
             output_path,
         ]
 
-    # Check if frame skipping is needed (target max 1800 frames @ 30fps = 60s)
-    target_frames = 1800
+    # Preview render: low-res proxy, max 300 evenly-sampled frames, ultrafast
+    is_preview = render_type == "preview"
+    if is_preview:
+        target_frames = 300
+        framerate = min(framerate, 30)
+    else:
+        # Check if frame skipping is needed (target max 1800 frames @ 30fps = 60s)
+        target_frames = 1800
+
     skip_factor = (
         max(1, math.ceil(total_frames / target_frames)) if total_frames > target_frames else 1
     )
 
-    # Build filter graph
-    filters: list[str] = ["deflicker=mode=pm:size=10"]
+    # ── Filter chain ─────────────────────────────────────────────────────────
+    filters: list[str] = []
 
+    # Frame skip (select filter)
     if skip_factor > 1:
-        filters = [
+        filters += [
             f"select='not(mod(n\\,{skip_factor}))'",
             "setpts=N/FRAME_RATE/TB",
-            "deflicker=mode=pm:size=10",
         ]
+
+    # Frame blend — cinematic motion smoothness
+    if render.get("frame_blend"):
+        filters.append("tmix=frames=3:weights='1 2 1'")
+
+    # Deflicker
+    flicker = render.get("flicker_reduction") or "standard"
+    if flicker == "standard":
+        filters.append("deflicker=mode=pm:size=10")
+    elif flicker == "strong":
+        filters.append("deflicker=mode=pm:size=50")
+    elif flicker == "holy_grail":
+        # Holy Grail: large-window deflicker; the pre-pass luminance correction
+        # requires CPU preprocessing and is handled separately before ffmpeg.
+        # Fall back to a large deflicker window here for the ffmpeg stage.
+        filters.append("deflicker=mode=pm:size=50")
+    # "off" → no deflicker filter added
+
+    # Resolution / scale
+    resolution = render.get("resolution") or "1920x1080"
+    if is_preview:
+        resolution = "854x480"  # 480p proxy
+
+    out_w, out_h = (int(x) for x in resolution.split("x"))
+
+    # Detect source resolution from first frame for lanczos guard
+    src_w, src_h = _get_source_resolution(render["project_id"])
+    if src_w and src_h and (out_w < src_w or out_h < src_h):
+        filters.append(f"scale={out_w}:{out_h}:flags=lanczos")
+    elif is_preview:
+        # Always scale for preview even if no source info
+        filters.append(f"scale={out_w}:{out_h}:flags=lanczos")
+
+    # Color grade LUT
+    grade = render.get("color_grade") or "none"
+    if grade != "none":
+        lut_path = os.path.join(_LUT_DIR, f"{grade}.cube")
+        if os.path.exists(lut_path):
+            filters.append(f"lut3d={lut_path}")
+
+    # Stabilization transform pass (requires pre-pass transforms file)
+    if transforms_file and os.path.exists(transforms_file):
+        filters.append(
+            f"vidstabtransform=input={transforms_file}:zoom=1:smoothing=30,unsharp=5:5:0.8:3:3:0.4"
+        )
 
     # Timestamp burn-in
     try:
@@ -289,14 +396,39 @@ def _build_ffmpeg_cmd(
         burn_in = 0
 
     if burn_in:
-        # Get epoch of first frame for drawtext pts localtime calculation
         epoch = _get_first_frame_epoch(render["project_id"])
         filters.append(
             f"drawtext=text='%{{pts\\:localtime\\:{epoch}\\:%Y-%m-%d %H\\\\:%M}}':"
             "x=w-tw-20:y=h-th-20:fontcolor=white:fontsize=32:box=1:boxcolor=black@0.6"
         )
 
-    vf = ",".join(filters)
+    # Watermark overlay (movie filter + overlay)
+    watermark_path: str | None = None
+    try:
+        with get_connection() as conn:
+            wm_row = conn.execute("SELECT watermark_path FROM settings WHERE id = 1").fetchone()
+        if wm_row and wm_row["watermark_path"] and os.path.exists(wm_row["watermark_path"]):
+            watermark_path = wm_row["watermark_path"]
+    except Exception:
+        pass
+
+    # Build final vf / filter_complex
+    filter_complex: str | None = None
+    if watermark_path:
+        chain = ",".join(filters) if filters else "null"
+        filter_complex = (
+            f"[0:v]{chain}[main];movie={watermark_path}[wm];[main][wm]overlay=W-w-10:H-h-10[out]"
+        )
+        vf = None
+    else:
+        vf = ",".join(filters) if filters else "null"
+
+    # ── Encode settings ───────────────────────────────────────────────────────
+    if is_preview:
+        codec, preset, crf = "libx264", "ultrafast", "32"
+    else:
+        quality = render.get("quality") or "standard"
+        codec, preset, crf = _QUALITY_MAP.get(quality, _QUALITY_MAP["standard"])
 
     cmd = [
         "ffmpeg",
@@ -311,19 +443,41 @@ def _build_ffmpeg_cmd(
         "0",
         "-i",
         concat_file,
-        "-vf",
-        vf,
+    ]
+    if filter_complex:
+        cmd += ["-filter_complex", filter_complex, "-map", "[out]"]
+    else:
+        cmd += ["-vf", vf or "null"]
+    cmd += [
         "-c:v",
-        "libx264",
+        codec,
         "-preset",
-        "fast",
+        preset,
         "-crf",
-        "23",
+        crf,
         "-pix_fmt",
         "yuv420p",
         output_path,
     ]
     return cmd
+
+
+def _get_source_resolution(project_id: int) -> tuple[int, int]:
+    """Return (width, height) of the first non-dark frame, or (0, 0) if unavailable."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT file_path FROM frames WHERE project_id = ? AND is_dark = 0 ORDER BY captured_at ASC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    if row and os.path.exists(row["file_path"]):
+        try:
+            from PIL import Image
+
+            with Image.open(row["file_path"]) as img:
+                return img.width, img.height
+        except Exception:
+            pass
+    return 0, 0
 
 
 def _get_first_frame_epoch(project_id: int) -> int:

@@ -19,13 +19,18 @@ log = logging.getLogger("app.routes.renders")
 class RenderCreate(BaseModel):
     project_id: int
     framerate: int = Field(default=30, ge=1, le=120)
-    resolution: str = "1920x1080"
+    resolution: str = Field(default="1920x1080", pattern=r"^\d{1,5}x\d{1,5}$")
     render_type: str = Field(
-        default="manual", pattern="^(manual|range|auto_daily|auto_weekly|auto_monthly)$"
+        default="manual", pattern="^(manual|range|auto_daily|auto_weekly|auto_monthly|preview)$"
     )
     label: str | None = None
     range_start: str | None = None
     range_end: str | None = None
+    quality: str = Field(default="standard", pattern="^(draft|standard|high|archive)$")
+    flicker_reduction: str = Field(default="standard", pattern="^(off|standard|strong|holy_grail)$")
+    frame_blend: bool = False
+    stabilize: bool = False
+    color_grade: str = Field(default="none", pattern="^(none|neutral|warm|cool|cinematic)$")
 
 
 def _row_to_dict(row: Any) -> dict:
@@ -71,8 +76,9 @@ def create_render(payload: RenderCreate) -> dict:
             INSERT INTO renders (
                 project_id, framerate, resolution, render_type, label,
                 range_start, range_end,
-                estimated_duration_seconds, estimated_file_size_bytes
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+                estimated_duration_seconds, estimated_file_size_bytes,
+                quality, flicker_reduction, frame_blend, stabilize, color_grade
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload.project_id,
@@ -84,6 +90,11 @@ def create_render(payload: RenderCreate) -> dict:
                 payload.range_end,
                 estimate["estimated_duration_seconds"],
                 estimate["estimated_file_size_bytes"],
+                payload.quality,
+                payload.flicker_reduction,
+                int(payload.frame_blend),
+                int(payload.stabilize),
+                payload.color_grade,
             ),
         )
         conn.commit()
@@ -107,6 +118,22 @@ def render_status(render_id: int) -> dict:
         "progress_pct": render["progress_pct"],
         "error_msg": render["error_msg"],
     }
+
+
+@router.get("/renders")
+def list_all_renders() -> list[dict]:
+    """Global render queue — all projects, newest first, with project name joined."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.*, p.name AS project_name
+            FROM renders r
+            LEFT JOIN projects p ON p.id = r.project_id
+            ORDER BY r.created_at DESC
+            LIMIT 200
+            """,
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 @router.get("/projects/{project_id}/renders")

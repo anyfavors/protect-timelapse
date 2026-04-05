@@ -32,7 +32,7 @@ log = logging.getLogger("app.routes.projects")
 
 class ProjectCreate(BaseModel):
     name: str
-    camera_id: str
+    camera_id: str = Field(min_length=1)
     project_type: str = Field(pattern="^(live|historical)$")
     interval_seconds: int = Field(ge=1)
     width: int | None = None
@@ -54,6 +54,9 @@ class ProjectCreate(BaseModel):
     auto_render_weekly: bool = False
     auto_render_monthly: bool = False
     retention_days: int = 0
+    # Motion filter
+    use_motion_filter: bool = False
+    motion_threshold: int = Field(default=5, ge=1, le=100)
     # Template linkage
     template_id: int | None = None
 
@@ -72,9 +75,11 @@ class ProjectUpdate(BaseModel):
     auto_render_monthly: bool | None = None
     retention_days: int | None = None
     max_frames: int | None = None
+    use_motion_filter: bool | None = None
+    motion_threshold: int | None = Field(default=None, ge=1, le=100)
     status: str | None = Field(
         default=None,
-        pattern="^(active|paused|paused_error|completed|error)$",
+        pattern="^(active|paused|paused_error|completed|error|extracting)$",
     )
 
 
@@ -103,7 +108,21 @@ def _get_project_or_404(project_id: int) -> dict:
 @router.get("/projects")
 def list_projects() -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT p.*,
+                   f.id             AS last_frame_id,
+                   f.captured_at    AS last_captured_at
+            FROM projects p
+            LEFT JOIN frames f ON f.id = (
+                SELECT id FROM frames
+                WHERE project_id = p.id
+                ORDER BY captured_at DESC
+                LIMIT 1
+            )
+            ORDER BY p.created_at DESC
+            """,
+        ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -122,8 +141,9 @@ async def create_project(payload: ProjectCreate) -> dict:
                 schedule_start_time, schedule_end_time, schedule_days,
                 auto_render_daily, auto_render_weekly, auto_render_monthly,
                 retention_days, template_id,
+                use_motion_filter, motion_threshold,
                 status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload.name,
@@ -146,7 +166,9 @@ async def create_project(payload: ProjectCreate) -> dict:
                 int(payload.auto_render_monthly),
                 payload.retention_days,
                 payload.template_id,
-                "active" if payload.project_type == "live" else "active",
+                int(payload.use_motion_filter),
+                payload.motion_threshold,
+                "active" if payload.project_type == "live" else "extracting",
             ),
         )
         assert cur.lastrowid is not None
@@ -190,6 +212,7 @@ async def update_project(project_id: int, payload: ProjectUpdate) -> dict:
         "auto_render_daily",
         "auto_render_weekly",
         "auto_render_monthly",
+        "use_motion_filter",
     ):
         if bool_field in updates:
             updates[bool_field] = int(updates[bool_field])
@@ -214,6 +237,61 @@ async def update_project(project_id: int, payload: ProjectUpdate) -> dict:
             await resume_project_job(project_id, project["interval_seconds"])
 
     return _get_project_or_404(project_id)
+
+
+@router.post("/projects/{project_id}/clone", status_code=201)
+async def clone_project(project_id: int) -> dict:
+    import os
+
+    source = _get_project_or_404(project_id)
+    settings = get_settings()
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO projects (
+                name, camera_id, project_type, interval_seconds,
+                width, height, max_frames,
+                capture_mode, use_luminance_check, luminance_threshold,
+                schedule_start_time, schedule_end_time, schedule_days,
+                auto_render_daily, auto_render_weekly, auto_render_monthly,
+                retention_days, template_id,
+                status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                source["name"] + " (copy)",
+                source["camera_id"],
+                source["project_type"],
+                source["interval_seconds"],
+                source["width"],
+                source["height"],
+                source["max_frames"],
+                source["capture_mode"],
+                source["use_luminance_check"],
+                source["luminance_threshold"],
+                source["schedule_start_time"],
+                source["schedule_end_time"],
+                source["schedule_days"],
+                source["auto_render_daily"],
+                source["auto_render_weekly"],
+                source["auto_render_monthly"],
+                source["retention_days"],
+                source["template_id"],
+                "active" if source["project_type"] == "live" else "extracting",
+            ),
+        )
+        assert cur.lastrowid is not None
+        new_id: int = cur.lastrowid
+        conn.commit()
+
+    for base in (settings.frames_path, settings.thumbnails_path):
+        os.makedirs(f"{base}/{new_id}", exist_ok=True)
+
+    if source["project_type"] == "live":
+        await add_project_job(new_id, source["interval_seconds"])
+
+    return _get_project_or_404(new_id)
 
 
 @router.delete("/projects/{project_id}", status_code=204)
