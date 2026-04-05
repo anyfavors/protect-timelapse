@@ -5,6 +5,8 @@ Also responsible for mutating APScheduler when projects are created/updated/dele
 
 import logging
 import shutil
+import unittest.mock as _mock
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -398,7 +400,6 @@ def schedule_test(
 ) -> dict:
     """Test whether a project would capture at a given ISO timestamp (or now). (F8)"""
     from app.capture import _check_capture_mode  # type: ignore[attr-defined]
-    from datetime import datetime, timezone
 
     project = _get_project_or_404(project_id)
 
@@ -406,31 +407,29 @@ def schedule_test(
         try:
             test_time = datetime.fromisoformat(timestamp)
             if test_time.tzinfo is None:
-                test_time = test_time.replace(tzinfo=timezone.utc)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"Invalid timestamp: {timestamp!r}")
+                test_time = test_time.replace(tzinfo=UTC)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid timestamp: {timestamp!r}") from exc
     else:
-        test_time = datetime.now(timezone.utc)
+        test_time = datetime.now(UTC)
 
     # _check_capture_mode uses datetime.now() internally — patch it temporarily
-    import unittest.mock as _mock
     with _mock.patch("app.capture.datetime") as mock_dt:
         mock_dt.now.return_value = test_time
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        error_msg: str | None = None
         try:
-            would_capture = _check_capture_mode(project)
+            would_capture: bool | None = _check_capture_mode(project)
         except Exception as exc:
             would_capture = None
-            error = str(exc)
-        else:
-            error = None
+            error_msg = str(exc)
 
     return {
         "project_id": project_id,
         "timestamp": test_time.isoformat(),
         "capture_mode": project.get("capture_mode"),
         "would_capture": would_capture,
-        "error": error,
+        "error": error_msg,
     }
 
 

@@ -7,6 +7,7 @@ and auto-render scheduling.
 import contextlib
 import logging
 import os
+import shutil as _shutil
 from datetime import UTC, datetime, timedelta
 
 from apscheduler.triggers.cron import CronTrigger
@@ -180,7 +181,6 @@ async def _schedule_auto_renders() -> None:
 
 async def _backup_database() -> None:
     """Create a daily SQLite backup alongside the main DB (B5)."""
-    import shutil as _shutil
     from app.config import get_settings
     settings = get_settings()
     src = settings.database_path

@@ -6,7 +6,7 @@ from fastapi import APIRouter
 from fastapi.responses import Response
 
 from app.config import get_settings
-from app.database import get_connection
+from app.database import _POOL_SIZE, _pool, get_connection
 from app.protect import protect_manager
 
 router = APIRouter(tags=["health"])
@@ -86,7 +86,6 @@ async def readiness() -> Response:
 @router.get("/api/admin/pool-stats")
 def pool_stats() -> dict:
     """Connection pool diagnostics (B10)."""
-    from app.database import _pool, _POOL_SIZE
     idle = _pool.qsize()
     return {
         "pool_size": _POOL_SIZE,

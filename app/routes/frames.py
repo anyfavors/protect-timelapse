@@ -141,8 +141,8 @@ def serve_thumbnail(project_id: int, frame_id: int, request: Request) -> Respons
             return Response(status_code=304)
         with open(path, "rb") as f:
             data = f.read()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Thumbnail file not found on disk")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Thumbnail file not found on disk") from exc
     return Response(
         content=data,
         media_type="image/jpeg",
@@ -161,8 +161,8 @@ def serve_full(project_id: int, frame_id: int) -> Response:
     try:
         with open(path, "rb") as f:
             data = f.read()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Frame file not found on disk")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Frame file not found on disk") from exc
     return Response(content=data, media_type="image/jpeg")
 
 
