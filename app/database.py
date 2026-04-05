@@ -330,7 +330,9 @@ def init_database() -> None:
                 conn.commit()
 
         new_version = max(MIGRATIONS) + 1
-        conn.execute(f"PRAGMA user_version = {int(new_version)}")  # int() guards against non-integer (#28)
+        conn.execute(
+            f"PRAGMA user_version = {int(new_version)}"
+        )  # int() guards against non-integer (#28)
         conn.commit()
 
         # Zombie render recovery: any render stuck in 'rendering' from a

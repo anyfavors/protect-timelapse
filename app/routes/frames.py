@@ -403,13 +403,29 @@ def export_frames_csv(project_id: int) -> StreamingResponse:
     def _generate_csv() -> Iterator[bytes]:
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["id", "captured_at", "file_size", "is_dark", "is_blurry", "sharpness_score", "bookmark_note"])
+        writer.writerow(
+            [
+                "id",
+                "captured_at",
+                "file_size",
+                "is_dark",
+                "is_blurry",
+                "sharpness_score",
+                "bookmark_note",
+            ]
+        )
         for row in rows:
-            writer.writerow([
-                row["id"], row["captured_at"], row["file_size"],
-                bool(row["is_dark"]), bool(row["is_blurry"]),
-                row["sharpness_score"], row["bookmark_note"],
-            ])
+            writer.writerow(
+                [
+                    row["id"],
+                    row["captured_at"],
+                    row["file_size"],
+                    bool(row["is_dark"]),
+                    bool(row["is_blurry"]),
+                    row["sharpness_score"],
+                    row["bookmark_note"],
+                ]
+            )
         yield buf.getvalue().encode()
 
     return StreamingResponse(
@@ -427,7 +443,9 @@ def export_frames_csv(project_id: int) -> StreamingResponse:
 @router.get("/projects/{project_id}/frames/analyze-interval")
 def analyze_interval(
     project_id: int,
-    target_duration_seconds: int = Query(default=60, ge=5, le=600, description="Target video length in seconds"),
+    target_duration_seconds: int = Query(
+        default=60, ge=5, le=600, description="Target video length in seconds"
+    ),
     target_fps: int = Query(default=30, ge=1, le=120),
 ) -> dict:
     """Suggest optimal capture interval to hit a target video duration at given fps."""
@@ -452,6 +470,7 @@ def analyze_interval(
     suggestion = None
     if first_ts and last_ts and total_frames > 1:
         from datetime import datetime
+
         try:
             span_secs = (
                 datetime.fromisoformat(last_ts) - datetime.fromisoformat(first_ts)
@@ -472,7 +491,11 @@ def analyze_interval(
         "note": (
             f"To produce a ~{target_duration_seconds}s video at {target_fps}fps you need "
             f"~{target_frames} frames. "
-            + (f"Based on your recording span, capture every ~{suggestion}s." if suggestion else "Not enough data yet.")
+            + (
+                f"Based on your recording span, capture every ~{suggestion}s."
+                if suggestion
+                else "Not enough data yet."
+            )
         ),
     }
 

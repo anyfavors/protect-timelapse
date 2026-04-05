@@ -72,6 +72,7 @@ async def _render_loop(stop: asyncio.Event) -> None:
         try:
             # Update heartbeat so liveness probe knows worker is alive (B2)
             from app.routes.health import update_render_worker_heartbeat
+
             update_render_worker_heartbeat()
             await _process_next_render()
         except Exception as exc:
@@ -194,7 +195,12 @@ async def _process_next_render() -> None:
         # Adaptive timeout: base + 2s per frame, capped at configured max (B8)
         base_timeout = getattr(settings, "ffmpeg_timeout_seconds", 7200)
         adaptive_timeout = min(base_timeout, max(300, total_frames * 2))
-        log.debug("Render id=%d: adaptive timeout=%ds for %d frames", render_id, adaptive_timeout, total_frames)
+        log.debug(
+            "Render id=%d: adaptive timeout=%ds for %d frames",
+            render_id,
+            adaptive_timeout,
+            total_frames,
+        )
 
         # Progress monitoring
         await _monitor_progress(proc, render_id, total_frames, adaptive_timeout)
@@ -439,7 +445,9 @@ def _build_ffmpeg_cmd(
         if lut_path.startswith(lut_dir_real + os.sep) and os.path.exists(lut_path):
             filters.append(f"lut3d={lut_path}")
         else:
-            log.warning("Render id=%d: rejected LUT path traversal attempt: %r", render.get("id"), grade)
+            log.warning(
+                "Render id=%d: rejected LUT path traversal attempt: %r", render.get("id"), grade
+            )
 
     # Stabilization transform pass (requires pre-pass transforms file)
     # unsharp is a separate filter — embedding it after a comma inside vidstabtransform
@@ -474,7 +482,9 @@ def _build_ffmpeg_cmd(
             if wm_real.startswith("/data/") and os.path.exists(wm_real):
                 watermark_path = wm_real
             else:
-                log.warning("Render: rejected watermark path outside /data/: %r", wm_row["watermark_path"])
+                log.warning(
+                    "Render: rejected watermark path outside /data/: %r", wm_row["watermark_path"]
+                )
     except Exception:
         pass
 

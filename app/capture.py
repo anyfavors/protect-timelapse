@@ -497,7 +497,9 @@ def _is_in_schedule(project: dict, tz_name: str) -> bool:
         if not (0 <= end_h <= 23 and 0 <= end_m <= 59):
             raise ValueError(f"Invalid end time: {end_str!r}")
     except (ValueError, IndexError) as exc:
-        log.warning("Project %d: invalid schedule time (%s), allowing capture", project.get("id"), exc)
+        log.warning(
+            "Project %d: invalid schedule time (%s), allowing capture", project.get("id"), exc
+        )
         return True  # fail open — allow capture rather than crash
 
     current_minutes = local_now.hour * 60 + local_now.minute
@@ -688,9 +690,7 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
                 try:
                     os.rename(src, dst)
                 except OSError as exc:
-                    log.warning(
-                        "Historical extraction: rename failed %s → %s: %s", src, dst, exc
-                    )
+                    log.warning("Historical extraction: rename failed %s → %s: %s", src, dst, exc)
                     continue  # skip frame rather than crashing the chunk (#9)
 
                 with open(dst, "rb") as fh:

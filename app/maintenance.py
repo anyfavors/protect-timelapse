@@ -66,9 +66,7 @@ async def _prune_old_frames() -> None:
             frame_ids = [f["id"] for f in old_frames]
             placeholders = ",".join("?" * len(frame_ids))
             with get_connection() as conn:
-                conn.execute(
-                    f"DELETE FROM frames WHERE id IN ({placeholders})", frame_ids
-                )
+                conn.execute(f"DELETE FROM frames WHERE id IN ({placeholders})", frame_ids)
                 count_row = conn.execute(
                     "SELECT COUNT(*) as cnt FROM frames WHERE project_id = ?", (project_id,)
                 ).fetchone()
@@ -182,6 +180,7 @@ async def _schedule_auto_renders() -> None:
 async def _backup_database() -> None:
     """Create a daily SQLite backup alongside the main DB (B5)."""
     from app.config import get_settings
+
     settings = get_settings()
     src = settings.database_path
     if not os.path.exists(src):

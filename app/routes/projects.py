@@ -182,7 +182,9 @@ async def create_project(payload: ProjectCreate) -> dict:
             ),
         )
         if cur.lastrowid is None:
-            raise HTTPException(status_code=500, detail="Failed to create project: no row ID returned")
+            raise HTTPException(
+                status_code=500, detail="Failed to create project: no row ID returned"
+            )
         project_id: int = cur.lastrowid
         conn.commit()
 
@@ -219,11 +221,22 @@ async def update_project(project_id: int, payload: ProjectUpdate) -> dict:
 
     # Explicit allowlist — prevents SQL injection even if Pydantic is bypassed (#1)
     _ALLOWED_UPDATE_FIELDS = {
-        "name", "interval_seconds", "capture_mode", "use_luminance_check",
-        "luminance_threshold", "schedule_start_time", "schedule_end_time",
-        "schedule_days", "auto_render_daily", "auto_render_weekly",
-        "auto_render_monthly", "retention_days", "max_frames",
-        "use_motion_filter", "motion_threshold", "status",
+        "name",
+        "interval_seconds",
+        "capture_mode",
+        "use_luminance_check",
+        "luminance_threshold",
+        "schedule_start_time",
+        "schedule_end_time",
+        "schedule_days",
+        "auto_render_daily",
+        "auto_render_weekly",
+        "auto_render_monthly",
+        "retention_days",
+        "max_frames",
+        "use_motion_filter",
+        "motion_threshold",
+        "status",
         "solar_noon_window_minutes",
     }
     updates = {k: v for k, v in updates.items() if k in _ALLOWED_UPDATE_FIELDS}
@@ -317,7 +330,9 @@ async def clone_project(
             ),
         )
         if cur.lastrowid is None:
-            raise HTTPException(status_code=500, detail="Failed to clone project: no row ID returned")
+            raise HTTPException(
+                status_code=500, detail="Failed to clone project: no row ID returned"
+            )
         new_id: int = cur.lastrowid
         conn.commit()
 
@@ -354,6 +369,7 @@ async def clone_project(
                 dst = src.replace(src_frame_dir, dst_frame_dir, 1)
                 try:
                     import shutil as _shutil
+
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     _shutil.copy2(src, dst)
                     new_file_path = dst
@@ -365,6 +381,7 @@ async def clone_project(
                 tdst = tsrc.replace(src_thumb_dir, dst_thumb_dir, 1)
                 with contextlib.suppress(OSError):
                     import shutil as _shutil
+
                     os.makedirs(os.path.dirname(tdst), exist_ok=True)
                     _shutil.copy2(tsrc, tdst)
                     new_thumb_path = tdst
@@ -377,9 +394,15 @@ async def clone_project(
                     VALUES (?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        new_id, frame["captured_at"], new_file_path, new_thumb_path,
-                        frame["file_size"], frame["is_dark"], frame["bookmark_note"],
-                        frame["sharpness_score"], frame["is_blurry"],
+                        new_id,
+                        frame["captured_at"],
+                        new_file_path,
+                        new_thumb_path,
+                        frame["file_size"],
+                        frame["is_dark"],
+                        frame["bookmark_note"],
+                        frame["sharpness_score"],
+                        frame["is_blurry"],
                     ),
                 )
                 conn.commit()
@@ -409,7 +432,9 @@ def schedule_test(
             if test_time.tzinfo is None:
                 test_time = test_time.replace(tzinfo=UTC)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"Invalid timestamp: {timestamp!r}") from exc
+            raise HTTPException(
+                status_code=422, detail=f"Invalid timestamp: {timestamp!r}"
+            ) from exc
     else:
         test_time = datetime.now(UTC)
 

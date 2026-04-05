@@ -181,7 +181,10 @@ async def cancel_render(render_id: int) -> dict:
     """Cancel a pending or in-progress render (F1)."""
     render = _get_render_or_404(render_id)
     if render["status"] not in ("pending", "rendering"):
-        raise HTTPException(status_code=409, detail=f"Render {render_id} is not cancellable (status={render['status']})")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Render {render_id} is not cancellable (status={render['status']})",
+        )
 
     # Kill ffmpeg if this render is currently running
     killed = await cancel_active_render(render_id)
