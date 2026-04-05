@@ -509,6 +509,23 @@ def _is_in_schedule(project: dict, tz_name: str) -> bool:
     return start_minutes <= current_minutes <= end_minutes
 
 
+def _check_capture_mode(project: dict) -> bool:
+    """Return True if the project's capture mode would allow a capture right now.
+
+    Used by the schedule-test endpoint (F8) to preview capture behaviour.
+    """
+    mode = project.get("capture_mode", "continuous")
+    if mode == "daylight_only":
+        return _is_daylight()
+    if mode == "solar_noon":
+        return _is_solar_noon_window(project)
+    if mode == "schedule":
+        tz_name, _, _ = _get_location()
+        return _is_in_schedule(project, tz_name)
+    # continuous or unknown — always capture
+    return True
+
+
 def _increment_failures(project_id: int) -> int:
     with get_connection() as conn:
         conn.execute(
