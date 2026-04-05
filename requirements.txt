@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+uiprotect>=7.0.0
+apscheduler>=3.10.0
+pillow>=10.2.0
+astral>=3.2
+httpx>=0.27.0
+pydantic-settings>=2.3.0
+python-multipart>=0.0.9
+aiofiles>=23.2.1

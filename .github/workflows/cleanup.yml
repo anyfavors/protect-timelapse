@@ -1,0 +1,18 @@
+name: Image cleanup
+
+on:
+  schedule:
+    - cron: "0 06 * * 1"  # Every Monday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: protect-timelapse
+          package-type: container
+          min-versions-to-keep: 3
+          # Preserve any semver-tagged releases (e.g. 1.2.3)
+          ignore-versions: '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$'

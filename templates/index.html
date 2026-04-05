@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Protect Timelapse</title>
+
+  <!-- app.js MUST come before Alpine so alpine:init fires correctly -->
+  <script src="/static/app.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+
+<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="timelapseApp()" x-init="init()">
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- TOP NAV                                                                 -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<nav class="bg-slate-900 border-b border-slate-800 px-4 py-3 flex items-center justify-between sticky top-0 z-50">
+  <button @click="view = 'dashboard'" class="text-blue-400 font-bold text-lg tracking-tight hover:text-blue-300 transition">
+    ▶ Protect Timelapse
+  </button>
+
+  <div class="flex items-center gap-4">
+    <!-- Disk gauge -->
+    <div class="hidden sm:flex items-center gap-2 text-xs text-slate-400">
+      <span :class="diskCritical ? 'text-red-400' : ''">
+        <span x-text="diskSpace.free_gb !== null ? diskSpace.free_gb.toFixed(1) + ' GB free' : 'Disk —'"></span>
+      </span>
+      <div class="w-20 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+        <div class="h-full rounded-full transition-all"
+             :class="diskCritical ? 'bg-red-500' : 'bg-blue-500'"
+             :style="`width:${diskPercent}%`"></div>
+      </div>
+    </div>
+
+    <!-- Notification bell -->
+    <div class="relative">
+      <button @click="showNotifDropdown = !showNotifDropdown; if(showNotifDropdown) loadNotifications()"
+              class="relative p-1 text-slate-400 hover:text-slate-100 transition">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+        </svg>
+        <span x-show="unreadCount > 0"
+              x-text="unreadCount"
+              class="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center leading-none"></span>
+      </button>
+
+      <!-- Dropdown -->
+      <div x-show="showNotifDropdown"
+           @click.outside="showNotifDropdown = false"
+           class="absolute right-0 mt-2 w-80 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-50 max-h-80 overflow-y-auto">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Notifications</span>
+          <button @click="markAllRead()" class="text-xs text-blue-400 hover:text-blue-300">Mark all read</button>
+        </div>
+        <template x-if="notifications.length === 0">
+          <p class="text-slate-500 text-sm text-center py-4">No notifications</p>
+        </template>
+        <template x-for="n in notifications.slice(0,20)" :key="n.id">
+          <div class="px-3 py-2 border-b border-slate-700/50 hover:bg-slate-700/40 transition"
+               :class="n.is_read ? 'opacity-60' : ''">
+            <div class="flex items-start gap-2">
+              <span class="mt-0.5 w-2 h-2 rounded-full flex-shrink-0"
+                    :class="{ 'bg-red-400': n.level==='error', 'bg-yellow-400': n.level==='warning', 'bg-blue-400': n.level==='info' }"></span>
+              <div>
+                <p class="text-sm text-slate-200" x-text="n.message"></p>
+                <p class="text-xs text-slate-500" x-text="formatDate(n.created_at)"></p>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Settings gear -->
+    <button @click="openSettings()" class="p-1 text-slate-400 hover:text-slate-100 transition">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+      </svg>
+    </button>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- TOAST AREA                                                              -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div class="fixed bottom-4 right-4 flex flex-col gap-2 z-50">
+  <template x-for="t in toasts" :key="t.id">
+    <div class="px-4 py-2 rounded-lg text-sm shadow-lg border"
+         :class="t.type==='error' ? 'bg-red-900 border-red-700 text-red-100' : 'bg-emerald-900 border-emerald-700 text-emerald-100'"
+         x-text="t.message"
+         x-transition:enter="transition ease-out duration-200"
+         x-transition:enter-start="opacity-0 translate-y-2"
+         x-transition:enter-end="opacity-100 translate-y-0"
+         x-transition:leave="transition ease-in duration-150"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0"></div>
+  </template>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- MAIN CONTENT                                                             -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<main class="max-w-7xl mx-auto px-4 py-6">
+
+  <!-- ── DASHBOARD ───────────────────────────────────────────────────────── -->
+  <div x-show="view === 'dashboard'">
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-bold text-slate-100">Dashboard</h1>
+      <button @click="openCreateForm()"
+              class="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
+        <span>+ New Project</span>
+        <span class="hidden sm:inline text-blue-300 text-xs">[N]</span>
+      </button>
+    </div>
+
+    <!-- Onboarding empty state -->
+    <template x-if="projects.length === 0">
+      <div class="text-center py-20">
+        <div class="text-5xl mb-4">📷</div>
+        <h2 class="text-xl font-semibold text-slate-300 mb-2">No projects yet</h2>
+        <p class="text-slate-500 mb-6">Create your first timelapse to get started.</p>
+        <div class="flex justify-center gap-4">
+          <button @click="openCreateForm()" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-lg font-medium transition">
+            Create Live Timelapse
+          </button>
+        </div>
+      </div>
+    </template>
+
+    <!-- Camera-grouped project cards -->
+    <template x-for="cam in cameraGroups" :key="cam.id">
+      <div class="mb-6">
+        <!-- Camera section header -->
+        <div class="flex items-center gap-3 mb-3">
+          <span class="w-2 h-2 rounded-full flex-shrink-0"
+                :class="cam.is_online ? 'bg-emerald-500' : 'bg-red-500'"></span>
+          <span class="font-semibold text-slate-200" x-text="cam.name || cam.id"></span>
+          <span class="text-xs text-slate-500" x-text="cam.type || ''"></span>
+          <span class="ml-auto text-xs bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full"
+                x-text="cam.projects.length + ' project' + (cam.projects.length !== 1 ? 's' : '')"></span>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+          <template x-for="proj in cam.projects" :key="proj.id">
+            <div class="bg-slate-800 border border-slate-700 rounded-xl p-4 hover:border-slate-600 transition cursor-pointer"
+                 @click="openProject(proj)">
+              <div class="flex items-start justify-between mb-2">
+                <span class="font-medium text-slate-100 truncate" x-text="proj.name"></span>
+                <span class="w-2.5 h-2.5 rounded-full flex-shrink-0 mt-1 ml-2"
+                      :class="statusDot(proj.status)"></span>
+              </div>
+              <div class="text-xs text-slate-400 space-y-1">
+                <div>
+                  <span x-text="proj.frame_count.toLocaleString()"></span> frames ·
+                  <span x-text="proj.interval_seconds + 's interval'"></span>
+                </div>
+                <div class="capitalize" x-text="proj.status.replace('_', ' ')"></div>
+              </div>
+              <!-- Quick actions -->
+              <div class="flex gap-2 mt-3" @click.stop>
+                <template x-if="proj.status === 'active'">
+                  <button @click="pauseProject(proj.id)"
+                          class="flex-1 text-xs bg-slate-700 hover:bg-yellow-700 text-slate-300 hover:text-yellow-100 py-1 rounded transition">
+                    Pause
+                  </button>
+                </template>
+                <template x-if="proj.status === 'paused' || proj.status === 'paused_error'">
+                  <button @click="resumeProject(proj.id)"
+                          class="flex-1 text-xs bg-slate-700 hover:bg-emerald-700 text-slate-300 hover:text-emerald-100 py-1 rounded transition">
+                    Resume
+                  </button>
+                </template>
+                <button @click="deleteProject(proj.id)"
+                        class="text-xs bg-slate-700 hover:bg-red-800 text-slate-400 hover:text-red-200 px-2 py-1 rounded transition">
+                  ✕
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- ── PROJECT DETAIL ─────────────────────────────────────────────────── -->
+  <div x-show="view === 'project_detail' && activeProject">
+    <!-- Header -->
+    <div class="flex items-center gap-3 mb-6">
+      <button @click="view = 'dashboard'" class="text-slate-400 hover:text-slate-200 transition">← Back</button>
+      <h1 class="text-2xl font-bold text-slate-100 flex-1" x-text="activeProject?.name"></h1>
+      <span class="w-2.5 h-2.5 rounded-full" :class="statusDot(activeProject?.status)"></span>
+      <span class="text-sm text-slate-400 capitalize" x-text="activeProject?.status?.replace('_',' ')"></span>
+      <button @click="openEditForm(activeProject)"
+              class="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg transition">
+        Edit
+      </button>
+    </div>
+
+    <!-- Stats row -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+      <div class="bg-slate-800 rounded-lg p-3 text-center">
+        <div class="text-2xl font-bold text-blue-400" x-text="(activeProject?.frame_count || 0).toLocaleString()"></div>
+        <div class="text-xs text-slate-400">Frames</div>
+      </div>
+      <div class="bg-slate-800 rounded-lg p-3 text-center">
+        <div class="text-2xl font-bold text-slate-200" x-text="activeProject?.interval_seconds + 's'"></div>
+        <div class="text-xs text-slate-400">Interval</div>
+      </div>
+      <div class="bg-slate-800 rounded-lg p-3 text-center">
+        <div class="text-2xl font-bold text-slate-200" x-text="activeProject?.capture_mode || '—'"></div>
+        <div class="text-xs text-slate-400">Mode</div>
+      </div>
+      <div class="bg-slate-800 rounded-lg p-3 text-center">
+        <div class="text-2xl font-bold text-slate-200" x-text="activeProjectRenders.length"></div>
+        <div class="text-xs text-slate-400">Renders</div>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex gap-1 mb-6 border-b border-slate-800">
+      <template x-for="tab in ['overview','renders','bookmarks','dark_frames']" :key="tab">
+        <button @click="loadDetailTab(tab)"
+                :class="detailTab === tab ? 'border-b-2 border-blue-500 text-blue-400' : 'text-slate-500 hover:text-slate-300'"
+                class="px-4 py-2 text-sm capitalize transition"
+                x-text="tab.replace('_',' ')"></button>
+      </template>
+    </div>
+
+    <!-- Tab: Overview -->
+    <div x-show="detailTab === 'overview'">
+      <!-- Heatmap -->
+      <div class="mb-6">
+        <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wide">Capture Heatmap</h3>
+        <div class="flex gap-0.5 flex-wrap">
+          <template x-for="day in activeProjectDailyStats" :key="day.date">
+            <div class="w-3 h-3 rounded-sm cursor-pointer"
+                 :class="heatmapIntensity(day.count)"
+                 :title="day.date + ': ' + day.count + ' frames'"></div>
+          </template>
+          <template x-if="activeProjectDailyStats.length === 0">
+            <p class="text-sm text-slate-500">No capture data yet.</p>
+          </template>
+        </div>
+      </div>
+
+      <!-- Frame scrubber -->
+      <div class="mb-6">
+        <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wide">Frame Scrubber</h3>
+        <template x-if="activeProjectFrames.length > 0">
+          <div>
+            <input type="range" min="0" :max="activeProjectFrames.length - 1"
+                   :value="scrubberIndex"
+                   @input="onScrubberInput($event)"
+                   @click="onScrubberShiftClick($event)"
+                   class="w-full accent-blue-500 mb-2" />
+            <div class="text-xs text-slate-400 mb-2" x-text="scrubberTimestamp ? formatDate(scrubberTimestamp) : ''"></div>
+            <template x-if="scrubberFrameUrl">
+              <img :src="scrubberFrameUrl" alt="Frame preview"
+                   class="rounded-lg max-h-64 object-contain bg-slate-900 w-full" />
+            </template>
+            <template x-if="rangeStart">
+              <div class="mt-2 flex items-center gap-2 text-xs text-slate-400">
+                <span>Range: <span class="text-blue-300" x-text="formatDate(rangeStart)"></span></span>
+                <template x-if="rangeEnd">
+                  <span>→ <span class="text-blue-300" x-text="formatDate(rangeEnd)"></span></span>
+                </template>
+                <button @click="rangeStart=null;rangeEnd=null" class="text-red-400 hover:text-red-300 ml-2">Clear</button>
+              </div>
+            </template>
+          </div>
+        </template>
+        <template x-if="activeProjectFrames.length === 0">
+          <p class="text-sm text-slate-500">No frames captured yet.</p>
+        </template>
+        <template x-if="activeProjectFrames.length > 0">
+          <p class="text-xs text-slate-500 mt-2">
+            Press <kbd class="bg-slate-700 px-1 rounded text-slate-300">C</kbd> at two positions to open side-by-side frame comparison.
+          </p>
+        </template>
+      </div>
+
+      <!-- Hourly timeline chart -->
+      <template x-if="activeProjectTimeline.length > 0">
+        <div class="mb-6">
+          <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase tracking-wide">Hourly Captures</h3>
+          <div class="flex items-end gap-0.5 h-16 overflow-x-auto pb-1">
+            <template x-for="slot in activeProjectTimeline" :key="slot.hour">
+              <div class="flex flex-col items-center min-w-[6px] group relative"
+                   :style="`height:100%`">
+                <div class="w-full flex-1 flex items-end">
+                  <div class="w-full rounded-sm transition-all"
+                       :class="slot.dark > 0 ? 'bg-slate-500' : 'bg-emerald-600'"
+                       :style="`height:${timelineBarHeight(slot.captured)}%`"
+                       :title="timelineLabel(slot.hour) + ': ' + slot.captured + ' frames' + (slot.dark ? ' (' + slot.dark + ' dark)' : '')">
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+          <div class="text-xs text-slate-500 mt-1">
+            <span x-text="activeProjectTimeline.length + ' hours with captures'"></span>
+            <span class="ml-3"><span class="inline-block w-2 h-2 rounded-sm bg-emerald-600 mr-1"></span>captured</span>
+            <span class="ml-2"><span class="inline-block w-2 h-2 rounded-sm bg-slate-500 mr-1"></span>has dark frames</span>
+          </div>
+        </div>
+      </template>
+
+      <!-- Render trigger -->
+      <div class="bg-slate-800 rounded-xl p-4">
+        <h3 class="text-sm font-semibold text-slate-400 mb-3 uppercase tracking-wide">Render</h3>
+        <div class="flex flex-wrap gap-2">
+          <button @click="triggerRender(activeProject.id, 30); updateRenderEstimate(30)"
+                  class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm transition">
+            Render 30fps <span class="text-xs text-blue-300 ml-1">[R]</span>
+          </button>
+          <button @click="triggerRender(activeProject.id, 24); updateRenderEstimate(24)"
+                  class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-lg text-sm transition">
+            Render 24fps
+          </button>
+          <button @click="triggerRender(activeProject.id, 60); updateRenderEstimate(60)"
+                  class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-lg text-sm transition">
+            Render 60fps
+          </button>
+        </div>
+        <template x-if="lastRenderEstimate">
+          <p class="text-xs text-slate-400 mt-2" x-text="lastRenderEstimate"></p>
+        </template>
+      </div>
+    </div>
+
+    <!-- Tab: Renders -->
+    <div x-show="detailTab === 'renders'">
+      <template x-if="activeProjectRenders.length === 0">
+        <p class="text-slate-500 text-sm">No renders yet. Trigger one from the Overview tab.</p>
+      </template>
+      <!-- Compare bar -->
+      <template x-if="compareRenders.length > 0">
+        <div class="mb-3 flex items-center gap-3 bg-slate-800 border border-blue-700 rounded-xl px-4 py-2">
+          <span class="text-xs text-slate-300">
+            Compare: <span class="text-blue-300" x-text="compareRenders.map(r => r.label || 'Render #'+r.id).join(' vs ')"></span>
+          </span>
+          <button x-show="compareRenders.length === 2" @click="openComparison()"
+                  class="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1 rounded-lg transition ml-auto">
+            Compare side-by-side
+          </button>
+          <button @click="compareRenders = []"
+                  class="text-xs text-slate-400 hover:text-slate-200 transition">Clear</button>
+        </div>
+      </template>
+      <div class="space-y-3">
+        <template x-for="r in activeProjectRenders" :key="r.id">
+          <div class="bg-slate-800 border rounded-xl p-4 transition"
+               :class="compareRenders.find(c=>c.id===r.id) ? 'border-blue-600' : 'border-slate-700'">
+            <div class="flex items-start justify-between">
+              <div>
+                <span class="font-medium text-slate-200" x-text="r.label || ('Render #' + r.id)"></span>
+                <div class="text-xs text-slate-400 mt-1">
+                  <span x-text="r.framerate + 'fps · ' + r.resolution"></span>
+                  <span x-text="' · ' + (r.file_size ? formatBytes(r.file_size) : '—')"></span>
+                </div>
+              </div>
+              <span class="text-sm font-medium" :class="renderStatusClass(r.status)" x-text="r.status"></span>
+            </div>
+            <template x-if="r.status === 'rendering'">
+              <div class="mt-2">
+                <div class="w-full bg-slate-700 rounded-full h-1.5">
+                  <div class="bg-blue-500 h-1.5 rounded-full transition-all" :style="`width:${r.progress_pct}%`"></div>
+                </div>
+                <span class="text-xs text-slate-400 mt-1" x-text="r.progress_pct + '%'"></span>
+              </div>
+            </template>
+            <div class="flex flex-wrap gap-2 mt-3">
+              <template x-if="r.status === 'done' && r.output_path">
+                <button @click="openVideoPlayer(r.id)"
+                        class="text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg transition">
+                  ▶ Play
+                </button>
+              </template>
+              <template x-if="r.status === 'done' && r.output_path">
+                <button @click="toggleCompareRender(r)"
+                        class="text-xs px-3 py-1.5 rounded-lg transition"
+                        :class="compareRenders.find(c=>c.id===r.id)
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-700 text-slate-300 hover:bg-slate-600'">
+                  Compare
+                </button>
+              </template>
+              <template x-if="r.status === 'done' && r.output_path">
+                <a :href="'/api/renders/' + r.id + '/download'" target="_blank"
+                   class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-200 px-3 py-1.5 rounded-lg transition">
+                  Download
+                </a>
+              </template>
+              <button @click="deleteRender(r.id)"
+                      class="text-xs bg-slate-700 hover:bg-red-800 text-slate-400 hover:text-red-200 px-3 py-1.5 rounded-lg transition">
+                Delete
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Tab: Bookmarks -->
+    <div x-show="detailTab === 'bookmarks'">
+      <template x-if="activeProjectBookmarks.length === 0">
+        <p class="text-slate-500 text-sm">No bookmarks yet. Use [B] on the scrubber to add one.</p>
+      </template>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+        <template x-for="frame in activeProjectBookmarks" :key="frame.id">
+          <div class="bg-slate-800 rounded-lg overflow-hidden cursor-pointer hover:ring-1 hover:ring-blue-500 transition"
+               @click="detailTab='overview'; scrubberIndex = activeProjectFrames.findIndex(f => f.id === frame.id); updateScrubberFrame()">
+            <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                 class="w-full h-24 object-cover bg-slate-900" alt="" />
+            <div class="p-2">
+              <p class="text-xs text-slate-300 truncate" x-text="frame.bookmark_note"></p>
+              <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Tab: Dark Frames -->
+    <div x-show="detailTab === 'dark_frames'">
+      <p class="text-xs text-slate-400 mb-4">
+        Frames flagged as too dark (luminance below threshold). Use these to calibrate your threshold setting.
+      </p>
+      <template x-if="activeProjectDarkFrames.length === 0">
+        <p class="text-slate-500 text-sm">No dark frames. Either luminance check is off, or all frames passed.</p>
+      </template>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+        <template x-for="frame in activeProjectDarkFrames" :key="frame.id">
+          <div class="bg-slate-800 rounded-lg overflow-hidden">
+            <img :src="`/api/projects/${activeProject.id}/frames/${frame.id}/thumbnail`"
+                 class="w-full h-24 object-cover bg-slate-900" alt="" />
+            <div class="p-2">
+              <p class="text-xs text-slate-500" x-text="formatDate(frame.captured_at)"></p>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CREATE / EDIT PROJECT ──────────────────────────────────────────── -->
+  <div x-show="view === 'create_project'">
+    <div class="flex items-center gap-3 mb-6">
+      <button @click="view = 'dashboard'; stopPreviewPolling()" class="text-slate-400 hover:text-slate-200 transition">← Back</button>
+      <h1 class="text-2xl font-bold text-slate-100" x-text="formMode === 'create' ? 'New Project' : 'Edit Project'"></h1>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-4xl">
+      <!-- Form -->
+      <div class="space-y-5">
+        <!-- Template picker -->
+        <div x-show="formMode === 'create'">
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Start from template</label>
+          <select x-model="selectedTemplate" @change="if($el.value) applyTemplate($el.value)"
+                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200">
+            <option value="">— No template —</option>
+            <template x-for="t in templates" :key="t.id">
+              <option :value="t.id" x-text="t.name"></option>
+            </template>
+          </select>
+        </div>
+
+        <!-- Name -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Project Name *</label>
+          <input x-model="form.name" type="text" placeholder="e.g. Byggeplads Nord"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500" />
+        </div>
+
+        <!-- Camera -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Camera *</label>
+          <select x-model="form.camera_id" @change="onCameraSelected()"
+                  class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200">
+            <option value="">— Select camera —</option>
+            <template x-for="cam in cameras" :key="cam.id">
+              <option :value="cam.id" x-text="cam.name + (cam.is_online ? '' : ' (offline)')"></option>
+            </template>
+          </select>
+        </div>
+
+        <!-- Project type (create only) -->
+        <div x-show="formMode === 'create'">
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Type</label>
+          <div class="flex gap-2">
+            <button @click="form.project_type = 'live'"
+                    :class="form.project_type === 'live' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200'"
+                    class="flex-1 py-2 rounded-lg text-sm transition">Live</button>
+            <button @click="form.project_type = 'historical'"
+                    :class="form.project_type === 'historical' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200'"
+                    class="flex-1 py-2 rounded-lg text-sm transition">Historical</button>
+          </div>
+        </div>
+
+        <!-- Historical date range -->
+        <div x-show="form.project_type === 'historical'" class="space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Start Date/Time</label>
+            <input x-model="form.start_date" type="datetime-local"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">End Date/Time</label>
+            <input x-model="form.end_date" type="datetime-local"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+          </div>
+        </div>
+
+        <!-- Interval -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Interval (seconds)</label>
+          <div class="flex gap-2 mb-2">
+            <button @click="setIntervalPreset(5)"   class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition">5s Weather</button>
+            <button @click="setIntervalPreset(60)"  class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition">1m Construction</button>
+            <button @click="setIntervalPreset(600)" class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded transition">10m Long-term</button>
+          </div>
+          <input x-model.number="form.interval_seconds" type="number" min="1"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+
+        <!-- Capture mode -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Capture Mode</label>
+          <div class="space-y-2">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="radio" x-model="form.capture_mode" value="continuous" class="accent-blue-500" />
+              <span class="text-sm text-slate-300">Continuous</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="radio" x-model="form.capture_mode" value="daylight_only" class="accent-blue-500" />
+              <span class="text-sm text-slate-300">Daylight Only (Astral)</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="radio" x-model="form.capture_mode" value="schedule" class="accent-blue-500" />
+              <span class="text-sm text-slate-300">Schedule</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Schedule settings -->
+        <div x-show="form.capture_mode === 'schedule'" class="bg-slate-800/60 rounded-lg p-3 space-y-3">
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Start time</label>
+              <input x-model="form.schedule_start_time" type="time"
+                     class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1.5 text-sm text-slate-100" />
+            </div>
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">End time</label>
+              <input x-model="form.schedule_end_time" type="time"
+                     class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1.5 text-sm text-slate-100" />
+            </div>
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Days (1=Mon, 7=Sun)</label>
+            <input x-model="form.schedule_days" type="text" placeholder="1,2,3,4,5"
+                   class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1.5 text-sm text-slate-100" />
+          </div>
+        </div>
+
+        <!-- Luminance check -->
+        <div>
+          <label class="flex items-center gap-2 cursor-pointer mb-2">
+            <input type="checkbox" x-model="form.use_luminance_check" class="accent-blue-500" />
+            <span class="text-sm text-slate-300">Enable Luminance Check</span>
+          </label>
+          <div x-show="form.use_luminance_check">
+            <label class="block text-xs text-slate-400 mb-1">Threshold (0–255)</label>
+            <input x-model.number="form.luminance_threshold" type="number" min="0" max="255"
+                   class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+          </div>
+        </div>
+
+        <!-- Max frames -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Max Frames (0 = unlimited)</label>
+          <input x-model.number="form.max_frames" type="number" min="0"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+
+        <!-- Auto-render toggles -->
+        <div class="space-y-2">
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide">Auto-Render</label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="form.auto_render_daily" class="accent-blue-500" />
+            <span class="text-sm text-slate-300">Daily</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="form.auto_render_weekly" class="accent-blue-500" />
+            <span class="text-sm text-slate-300">Weekly</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="form.auto_render_monthly" class="accent-blue-500" />
+            <span class="text-sm text-slate-300">Monthly</span>
+          </label>
+        </div>
+
+        <!-- Retention -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Retention Days (0 = keep forever)</label>
+          <input x-model.number="form.retention_days" type="number" min="0"
+                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+
+        <!-- Actions -->
+        <div class="flex gap-3 pt-2">
+          <button @click="submitForm()"
+                  class="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg font-medium text-sm transition">
+            <span x-text="formMode === 'create' ? 'Create Project' : 'Save Changes'"></span>
+          </button>
+          <button x-show="formMode === 'create'" @click="saveAsTemplate()"
+                  class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-lg text-sm transition">
+            Save as Template
+          </button>
+        </div>
+      </div>
+
+      <!-- Live FoV preview -->
+      <div x-show="form.camera_id && view === 'create_project'">
+        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Live Preview</label>
+        <template x-if="previewUrl">
+          <img :src="previewUrl" alt="Camera preview"
+               class="w-full rounded-xl bg-slate-900 object-contain max-h-64" />
+        </template>
+        <template x-if="!previewUrl">
+          <div class="w-full h-48 bg-slate-800 rounded-xl flex items-center justify-center text-slate-500 text-sm">
+            Select a camera to see live preview
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SETTINGS ───────────────────────────────────────────────────────── -->
+  <div x-show="view === 'settings'">
+    <div class="flex items-center gap-3 mb-6">
+      <button @click="view = 'dashboard'" class="text-slate-400 hover:text-slate-200 transition">← Back</button>
+      <h1 class="text-2xl font-bold text-slate-100">Settings</h1>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-3xl">
+      <!-- Global settings form -->
+      <div class="bg-slate-800 border border-slate-700 rounded-xl p-5 space-y-4">
+        <h2 class="font-semibold text-slate-200">Global</h2>
+
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Webhook URL</label>
+          <input x-model="settingsData.webhook_url" type="url" placeholder="https://..."
+                 class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Disk Warning Threshold (GB)</label>
+          <input x-model.number="settingsData.disk_warning_threshold_gb" type="number" min="1"
+                 class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Default Framerate</label>
+          <input x-model.number="settingsData.default_framerate" type="number" min="1" max="120"
+                 class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" x-model="settingsData.timestamp_burn_in" class="accent-blue-500" />
+          <span class="text-sm text-slate-300">Timestamp Burn-in on Renders</span>
+        </label>
+
+        <button @click="saveSettings()"
+                class="w-full bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg text-sm font-medium transition">
+          Save Settings
+        </button>
+      </div>
+
+      <!-- Templates management -->
+      <div class="bg-slate-800 border border-slate-700 rounded-xl p-5">
+        <h2 class="font-semibold text-slate-200 mb-4">Templates</h2>
+        <template x-if="templates.length === 0">
+          <p class="text-slate-500 text-sm">No templates saved.</p>
+        </template>
+        <div class="space-y-2">
+          <template x-for="t in templates" :key="t.id">
+            <div class="flex items-center justify-between bg-slate-700/40 rounded-lg px-3 py-2">
+              <div>
+                <p class="text-sm text-slate-200" x-text="t.name"></p>
+                <p class="text-xs text-slate-400" x-text="t.interval_seconds + 's · ' + t.capture_mode"></p>
+              </div>
+              <button @click="deleteTemplate(t.id)"
+                      class="text-red-400 hover:text-red-300 text-xs transition">Delete</button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Notification history -->
+    <div class="mt-6 max-w-3xl">
+      <h2 class="font-semibold text-slate-200 mb-3">Notification History</h2>
+      <div class="bg-slate-800 border border-slate-700 rounded-xl divide-y divide-slate-700 max-h-80 overflow-y-auto">
+        <template x-if="notifications.length === 0">
+          <p class="text-slate-500 text-sm text-center py-6">No notifications.</p>
+        </template>
+        <template x-for="n in notifications" :key="n.id">
+          <div class="px-4 py-3 flex items-start gap-3" :class="n.is_read ? 'opacity-50' : ''">
+            <span class="w-2 h-2 rounded-full mt-1.5 flex-shrink-0"
+                  :class="{ 'bg-red-400': n.level==='error', 'bg-yellow-400': n.level==='warning', 'bg-blue-400': n.level==='info' }"></span>
+            <div>
+              <p class="text-sm text-slate-200" x-text="n.message"></p>
+              <p class="text-xs text-slate-500" x-text="formatDate(n.created_at)"></p>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- KEYBOARD SHORTCUT HELP OVERLAY                                          -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<div x-show="showShortcutHelp"
+     @click="showShortcutHelp = false"
+     class="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+  <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-96 max-w-full mx-4" @click.stop>
+    <h2 class="font-bold text-slate-100 text-lg mb-4">Keyboard Shortcuts</h2>
+    <div class="space-y-2 text-sm">
+      <div class="flex justify-between"><span class="text-slate-400">New project</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">N</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Back / Close</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">Esc</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Trigger render</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">R</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Bookmark frame</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">B</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Compare frames (mark 2)</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">C</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Step frame</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">← →</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">Jump 10 frames</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">Shift + ← →</kbd></div>
+      <div class="flex justify-between"><span class="text-slate-400">This help</span><kbd class="bg-slate-700 px-2 py-0.5 rounded text-slate-300">?</kbd></div>
+    </div>
+    <button @click="showShortcutHelp = false" class="mt-5 w-full bg-slate-700 hover:bg-slate-600 text-slate-200 py-2 rounded-lg text-sm transition">
+      Close
+    </button>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer class="text-center text-xs text-slate-700 py-6 mt-8">
+  Protect Timelapse · <span x-text="projects.length"></span> project(s)
+  <span x-show="ws && ws.readyState === 1" class="ml-2 text-emerald-700">● Live</span>
+  <span x-show="!ws || ws.readyState !== 1" class="ml-2 text-slate-700">● Polling</span>
+</footer>
+
+</body>
+</html>

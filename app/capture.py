@@ -1,0 +1,551 @@
+"""
+Capture worker — APScheduler-based snapshot ingestion.
+
+Each active project maps to one APScheduler job (id = 'project_{id}').
+The snapshot_worker() runs the full visibility pipeline before saving a frame.
+"""
+
+import asyncio
+import io
+import logging
+import os
+import shutil
+from datetime import UTC, datetime
+
+import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from PIL import Image, ImageStat
+
+from app.config import get_settings
+from app.database import get_connection
+from app.thumbnails import generate_thumbnail_from_pillow
+from app.websocket import broadcast
+
+log = logging.getLogger("app.capture")
+
+scheduler = AsyncIOScheduler()
+
+# Disk check interval: every N captures we run a full disk check.
+# APScheduler calls snapshot_worker per project; disk check is cheap so we
+# run it every time rather than tracking a separate timer.
+_DISK_CHECK_EVERY_N = 1  # check every capture (matches spec: every 5-min loop)
+
+# -------------------------------------------------------------------------
+# Scheduler lifecycle
+# -------------------------------------------------------------------------
+
+
+async def start_scheduler() -> None:
+    """Boot APScheduler and register jobs for all currently active projects."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, interval_seconds FROM projects WHERE status = 'active'"
+        ).fetchall()
+
+    for row in rows:
+        _register_job(row["id"], row["interval_seconds"])
+
+    scheduler.start()
+    log.info("Capture scheduler started with %d active project(s)", len(rows))
+
+
+async def stop_scheduler() -> None:
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        log.info("Capture scheduler stopped")
+
+
+async def add_project_job(project_id: int, interval_seconds: int) -> None:
+    _register_job(project_id, interval_seconds)
+
+
+async def remove_project_job(project_id: int) -> None:
+    job_id = f"project_{project_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+
+async def reschedule_project_job(project_id: int, interval_seconds: int) -> None:
+    job_id = f"project_{project_id}"
+    if scheduler.get_job(job_id):
+        scheduler.reschedule_job(job_id, trigger=IntervalTrigger(seconds=interval_seconds))
+    else:
+        _register_job(project_id, interval_seconds)
+
+
+async def pause_project_job(project_id: int) -> None:
+    job_id = f"project_{project_id}"
+    if scheduler.get_job(job_id):
+        scheduler.pause_job(job_id)
+
+
+async def resume_project_job(project_id: int, interval_seconds: int) -> None:
+    job_id = f"project_{project_id}"
+    if scheduler.get_job(job_id):
+        scheduler.resume_job(job_id)
+    else:
+        _register_job(project_id, interval_seconds)
+
+
+def _register_job(project_id: int, interval_seconds: int) -> None:
+    job_id = f"project_{project_id}"
+    scheduler.add_job(
+        snapshot_worker,
+        trigger=IntervalTrigger(seconds=interval_seconds),
+        id=job_id,
+        args=[project_id],
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+
+# -------------------------------------------------------------------------
+# Snapshot worker — full visibility pipeline
+# -------------------------------------------------------------------------
+
+
+async def snapshot_worker(project_id: int) -> None:
+    """
+    Full capture pipeline for one project interval:
+    1. Disk failsafe
+    2. Reload project row (picks up live settings changes)
+    3. Astronomical filter (daylight_only)
+    4. Schedule window filter
+    5. NVR snapshot fetch
+    6. Luminance filter
+    7. Save JPEG + thumbnail
+    8. DB insert + frame_count increment
+    9. max_frames check
+    """
+    settings = get_settings()
+
+    # --- 1. Disk failsafe ---------------------------------------------------
+    try:
+        usage = shutil.disk_usage(settings.frames_path)
+        free_gb = usage.free / 1024**3
+        threshold_gb = _get_disk_threshold()
+        if free_gb < threshold_gb:
+            await _handle_disk_breach(free_gb, threshold_gb)
+            return
+    except Exception as exc:
+        log.warning("Disk check failed: %s", exc)
+
+    # --- 2. Reload project (live settings) ----------------------------------
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM projects WHERE id = ? AND status = 'active'", (project_id,)
+        ).fetchone()
+    if row is None:
+        # Project was paused, deleted, or completed — remove its job
+        await remove_project_job(project_id)
+        return
+
+    project = dict(row)
+
+    # --- 3. Astronomical filter ---------------------------------------------
+    if project["capture_mode"] == "daylight_only" and not _is_daylight(settings):
+        log.debug("Project %d: outside daylight window, skipping", project_id)
+        return
+
+    # --- 4. Schedule window filter ------------------------------------------
+    if project["capture_mode"] == "schedule" and not _is_in_schedule(project, settings.tz):
+        log.debug("Project %d: outside schedule window, skipping", project_id)
+        return
+
+    # --- 5. NVR snapshot ----------------------------------------------------
+    from app.protect import protect_manager
+
+    try:
+        client = await protect_manager.get_client()
+        cam = client.bootstrap.cameras.get(project["camera_id"])
+        if cam is None:
+            log.warning("Project %d: camera %s not found on NVR", project_id, project["camera_id"])
+            _increment_failures(project_id)
+            return
+
+        kwargs: dict = {}
+        if project["width"]:
+            kwargs["width"] = project["width"]
+        if project["height"]:
+            kwargs["height"] = project["height"]
+
+        snapshot_bytes: bytes = await cam.get_snapshot(**kwargs)
+        _reset_failures(project_id)
+
+    except (httpx.ReadTimeout, httpx.ConnectError, Exception) as exc:
+        log.warning("Project %d: NVR snapshot failed — %s", project_id, exc)
+        failures = _increment_failures(project_id)
+        if failures >= 3:
+            await _notify_nvr_offline(project_id, project["name"], failures)
+        return
+
+    # --- 6. Luminance filter ------------------------------------------------
+    is_dark = 0
+    pil_img: Image.Image | None = None
+
+    if project["use_luminance_check"]:
+        pil_img = Image.open(io.BytesIO(snapshot_bytes))
+        gray = pil_img.convert("L")
+        brightness = ImageStat.Stat(gray).mean[0]
+        if brightness < project["luminance_threshold"]:
+            is_dark = 1
+            log.debug(
+                "Project %d: frame is dark (brightness=%.1f < threshold=%d)",
+                project_id,
+                brightness,
+                project["luminance_threshold"],
+            )
+
+    # --- 7. Save JPEG + thumbnail ------------------------------------------
+    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    frame_dir = os.path.join(settings.frames_path, str(project_id))
+    thumb_dir = os.path.join(settings.thumbnails_path, str(project_id))
+    os.makedirs(frame_dir, exist_ok=True)
+    os.makedirs(thumb_dir, exist_ok=True)
+
+    frame_path = os.path.join(frame_dir, f"{timestamp}.jpg")
+    thumb_path = os.path.join(thumb_dir, f"{timestamp}.jpg")
+
+    with open(frame_path, "wb") as f:
+        f.write(snapshot_bytes)
+
+    # Reuse the already-decoded PIL image if available, otherwise decode now
+    if pil_img is None:
+        pil_img = Image.open(io.BytesIO(snapshot_bytes))
+    thumb_bytes = generate_thumbnail_from_pillow(pil_img)
+    with open(thumb_path, "wb") as f:
+        f.write(thumb_bytes)
+
+    file_size = len(snapshot_bytes)
+
+    # --- 8. DB insert + frame_count -----------------------------------------
+    now_utc = datetime.now(UTC).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size, is_dark)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, now_utc, frame_path, thumb_path, file_size, is_dark),
+        )
+        conn.execute(
+            "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
+            (project_id,),
+        )
+        new_count_row = conn.execute(
+            "SELECT frame_count FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        conn.commit()
+
+    new_count = new_count_row["frame_count"] if new_count_row else 0
+    log.debug(
+        "Project %d: frame saved (%s, is_dark=%d, count=%d)",
+        project_id,
+        timestamp,
+        is_dark,
+        new_count,
+    )
+
+    # Broadcast WebSocket event
+    await broadcast(
+        "capture_event",
+        {
+            "project_id": project_id,
+            "frame_count": new_count,
+            "is_dark": bool(is_dark),
+            "timestamp": now_utc,
+        },
+    )
+
+    # Broadcast disk update
+    try:
+        usage = shutil.disk_usage(settings.frames_path)
+        await broadcast(
+            "disk_update",
+            {
+                "free_gb": round(usage.free / 1024**3, 2),
+                "total_gb": round(usage.total / 1024**3, 2),
+            },
+        )
+    except Exception:
+        pass
+
+    # --- 9. max_frames check ------------------------------------------------
+    if project["max_frames"] and new_count >= project["max_frames"]:
+        log.info(
+            "Project %d reached max_frames=%d, marking completed", project_id, project["max_frames"]
+        )
+        with get_connection() as conn:
+            conn.execute("UPDATE projects SET status = 'completed' WHERE id = ?", (project_id,))
+            conn.commit()
+        await remove_project_job(project_id)
+        from app.notifications import notify as _notify
+
+        await _notify(
+            event="project_completed",
+            level="info",
+            message=f"Project '{project['name']}' reached {project['max_frames']} frames and was completed.",
+            project_id=project_id,
+        )
+
+
+# -------------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------------
+
+
+def _is_daylight(settings) -> bool:  # type: ignore[no-untyped-def]
+    from astral import LocationInfo
+    from astral.sun import sun
+
+    city = LocationInfo(
+        name="custom",
+        region="custom",
+        timezone=settings.tz,
+        latitude=settings.latitude,
+        longitude=settings.longitude,
+    )
+    now = datetime.now(UTC)
+    try:
+        s = sun(city.observer, date=now.date(), tzinfo=now.tzinfo)
+        return s["sunrise"] <= now <= s["sunset"]
+    except Exception:
+        # If astral fails (e.g. polar night), allow capture
+        return True
+
+
+def _is_in_schedule(project: dict, tz_name: str) -> bool:
+    import zoneinfo
+
+    tz = zoneinfo.ZoneInfo(tz_name)
+    local_now = datetime.now(tz)
+    weekday = local_now.isoweekday()  # 1=Mon … 7=Sun
+
+    allowed_days = {
+        int(d) for d in (project.get("schedule_days") or "1,2,3,4,5").split(",") if d.strip()
+    }
+    if weekday not in allowed_days:
+        return False
+
+    start_str = project.get("schedule_start_time") or "00:00"
+    end_str = project.get("schedule_end_time") or "23:59"
+    start_h, start_m = map(int, start_str.split(":"))
+    end_h, end_m = map(int, end_str.split(":"))
+
+    current_minutes = local_now.hour * 60 + local_now.minute
+    start_minutes = start_h * 60 + start_m
+    end_minutes = end_h * 60 + end_m
+
+    return start_minutes <= current_minutes <= end_minutes
+
+
+def _increment_failures(project_id: int) -> int:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE projects SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
+            (project_id,),
+        )
+        row = conn.execute(
+            "SELECT consecutive_failures FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        conn.commit()
+    return row["consecutive_failures"] if row else 0
+
+
+def _reset_failures(project_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET consecutive_failures = 0 WHERE id = ?", (project_id,))
+        conn.commit()
+
+
+async def _handle_disk_breach(free_gb: float, threshold_gb: int) -> None:
+    log.error(
+        "Disk space critical: %.2f GB free (threshold: %d GB) — pausing all projects",
+        free_gb,
+        threshold_gb,
+    )
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET status = 'paused_error' WHERE status = 'active'")
+        conn.commit()
+    if scheduler.running:
+        scheduler.pause()
+    from app.notifications import notify as _notify
+
+    await _notify(
+        event="storage_critical",
+        level="error",
+        message=f"Capture paused: Less than {threshold_gb}GB free on /data (free: {free_gb:.2f}GB).",
+        details={"free_gb": round(free_gb, 2)},
+    )
+    await broadcast("disk_update", {"free_gb": round(free_gb, 2), "critical": True})
+
+
+async def _notify_nvr_offline(project_id: int, project_name: str, failures: int) -> None:
+    from app.notifications import notify as _notify
+
+    await _notify(
+        event="nvr_offline",
+        level="warning",
+        message=f"Camera for project '{project_name}' has failed {failures} consecutive times.",
+        project_id=project_id,
+    )
+
+
+# -------------------------------------------------------------------------
+# Historical extraction
+# -------------------------------------------------------------------------
+
+
+async def run_historical_extraction(project_id: int) -> None:
+    """
+    Background task: download 1-hour NVR video chunks, extract frames via
+    ffmpeg, rename to UTC timestamps, generate thumbnails, then mark done.
+    """
+    import tempfile
+
+    settings = get_settings()
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if row is None:
+        return
+
+    project = dict(row)
+    start_dt = datetime.fromisoformat(project["start_date"]).replace(tzinfo=UTC)
+    end_dt = datetime.fromisoformat(project["end_date"]).replace(tzinfo=UTC)
+    interval = project["interval_seconds"]
+
+    frame_dir = os.path.join(settings.frames_path, str(project_id))
+    thumb_dir = os.path.join(settings.thumbnails_path, str(project_id))
+    os.makedirs(frame_dir, exist_ok=True)
+    os.makedirs(thumb_dir, exist_ok=True)
+
+    from app.protect import protect_manager
+
+    try:
+        client = await protect_manager.get_client()
+        cam = client.bootstrap.cameras.get(project["camera_id"])
+        if cam is None:
+            log.error("Historical extraction: camera %s not found", project["camera_id"])
+            return
+    except RuntimeError as exc:
+        log.error("Historical extraction: NVR unavailable — %s", exc)
+        return
+
+    # Chunk into 1-hour segments
+    from datetime import timedelta
+
+    chunk_start = start_dt
+    chunk_index = 0
+    total_frames = 0
+
+    while chunk_start < end_dt:
+        chunk_end = min(chunk_start + timedelta(hours=1), end_dt)
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp4", prefix=f"hist_{project_id}_{chunk_index}_", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            video_bytes = await cam.get_video(chunk_start, chunk_end)
+            with open(tmp_path, "wb") as f:
+                f.write(video_bytes)
+
+            # Extract frames via ffmpeg
+            extract_dir = os.path.join(frame_dir, f"_tmp_chunk_{chunk_index}")
+            os.makedirs(extract_dir, exist_ok=True)
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-threads",
+                str(settings.ffmpeg_threads),
+                "-i",
+                tmp_path,
+                "-vf",
+                f"fps=1/{interval}",
+                "-q:v",
+                "2",
+                os.path.join(extract_dir, "%014d.jpg"),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=settings.ffmpeg_timeout_seconds
+            )
+            if proc.returncode != 0:
+                log.error(
+                    "Historical extraction ffmpeg failed: %s", stderr.decode(errors="replace")
+                )
+                continue
+
+            # Rename extracted files to UTC timestamps and generate thumbnails
+            extracted = sorted(os.listdir(extract_dir))
+            for frame_index, filename in enumerate(extracted):
+                src = os.path.join(extract_dir, filename)
+                frame_utc = chunk_start + timedelta(seconds=frame_index * interval)
+                ts = frame_utc.strftime("%Y%m%d%H%M%S")
+                dst = os.path.join(frame_dir, f"{ts}.jpg")
+                os.rename(src, dst)
+
+                # Thumbnail
+                with open(dst, "rb") as fh:
+                    img_bytes = fh.read()
+                from app.thumbnails import generate_thumbnail
+
+                thumb_bytes = generate_thumbnail(img_bytes)
+                thumb_path = os.path.join(thumb_dir, f"{ts}.jpg")
+                with open(thumb_path, "wb") as fh:
+                    fh.write(thumb_bytes)
+
+                file_size = os.path.getsize(dst)
+                captured_at = frame_utc.isoformat()
+                with get_connection() as conn:
+                    conn.execute(
+                        "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size) VALUES (?,?,?,?,?)",
+                        (project_id, captured_at, dst, thumb_path, file_size),
+                    )
+                    conn.execute(
+                        "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
+                        (project_id,),
+                    )
+                    conn.commit()
+                total_frames += 1
+
+            import shutil as _shutil
+
+            with __import__("contextlib").suppress(Exception):
+                _shutil.rmtree(extract_dir)
+
+        except TimeoutError:
+            log.error("Historical extraction: ffmpeg timed out on chunk %d", chunk_index)
+        except Exception as exc:
+            log.error("Historical extraction error on chunk %d: %s", chunk_index, exc)
+        finally:
+            import contextlib
+
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_path)
+
+        chunk_start = chunk_end
+        chunk_index += 1
+
+    # Mark project completed
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET status = 'completed' WHERE id = ?", (project_id,))
+        conn.commit()
+
+    log.info("Historical extraction complete: project %d, %d frames", project_id, total_frames)
+
+
+# Config shorthand used in helpers (avoid circular import at module level)
+def _get_disk_threshold() -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT disk_warning_threshold_gb FROM settings WHERE id = 1").fetchone()
+    return row["disk_warning_threshold_gb"] if row else 5

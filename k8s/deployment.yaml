@@ -1,0 +1,166 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: protect-timelapse
+
+---
+# Persistent volume claim for /data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: timelapse-data
+  namespace: protect-timelapse
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  # storageClassName: local-path   # uncomment for k3s default storage class
+
+---
+# Secret for NVR credentials
+# kubectl create secret generic nvr-credentials \
+#   --namespace protect-timelapse \
+#   --from-literal=PROTECT_USERNAME=admin \
+#   --from-literal=PROTECT_PASSWORD=secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nvr-credentials
+  namespace: protect-timelapse
+type: Opaque
+# data:
+#   PROTECT_USERNAME: <base64>
+#   PROTECT_PASSWORD: <base64>
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: protect-timelapse
+  namespace: protect-timelapse
+  labels:
+    app: protect-timelapse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: protect-timelapse
+  strategy:
+    type: Recreate            # single replica with PVC — Recreate avoids attach conflicts
+  template:
+    metadata:
+      labels:
+        app: protect-timelapse
+    spec:
+      containers:
+        - name: app
+          image: protect-timelapse:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PROTECT_HOST
+              value: "argos.local"
+            - name: PROTECT_PORT
+              value: "443"
+            - name: PROTECT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: nvr-credentials
+                  key: PROTECT_USERNAME
+            - name: PROTECT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nvr-credentials
+                  key: PROTECT_PASSWORD
+            - name: DATABASE_PATH
+              value: /data/timelapse.db
+            - name: FRAMES_PATH
+              value: /data/frames
+            - name: RENDERS_PATH
+              value: /data/renders
+            - name: TZ
+              value: Europe/Copenhagen
+            - name: LOG_LEVEL
+              value: INFO
+            # Optional: set latitude/longitude for daylight-only mode
+            # - name: LATITUDE
+            #   value: "56.0361"
+            # - name: LONGITUDE
+            #   value: "12.6136"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: timelapse-data
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: protect-timelapse
+  namespace: protect-timelapse
+spec:
+  selector:
+    app: protect-timelapse
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+
+---
+# Ingress (Traefik — default k3s ingress controller)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: protect-timelapse
+  namespace: protect-timelapse
+  annotations:
+    # Uncomment for TLS via cert-manager
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  rules:
+    - host: timelapse.local    # change to your hostname
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: protect-timelapse
+                port:
+                  number: 80
+  # tls:
+  #   - hosts:
+  #       - timelapse.local
+  #     secretName: timelapse-tls
