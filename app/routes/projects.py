@@ -3,10 +3,13 @@ Project CRUD routes.
 Also responsible for mutating APScheduler when projects are created/updated/deleted.
 """
 
+import asyncio
+import contextlib
 import logging
+import os
 import shutil
 import unittest.mock as _mock
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -25,6 +28,9 @@ from app.database import get_connection
 
 router = APIRouter(prefix="/api", tags=["projects"])
 log = logging.getLogger("app.routes.projects")
+
+# Hold strong references to background extraction tasks so they aren't GC'd.
+_extraction_tasks: set[Any] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +195,6 @@ async def create_project(payload: ProjectCreate) -> dict:
         conn.commit()
 
     # Create frame / thumbnail directories on disk
-    import asyncio
-    import os
-
     for base in (settings.frames_path, settings.thumbnails_path):
         os.makedirs(f"{base}/{project_id}", exist_ok=True)
 
@@ -201,7 +204,12 @@ async def create_project(payload: ProjectCreate) -> dict:
 
     # Kick off historical extraction as a background task
     if payload.project_type == "historical":
-        asyncio.create_task(run_historical_extraction(project_id))
+        task = asyncio.create_task(
+            run_historical_extraction(project_id),
+            name=f"historical_extraction_{project_id}",
+        )
+        _extraction_tasks.add(task)
+        task.add_done_callback(_extraction_tasks.discard)
 
     return _get_project_or_404(project_id)
 
@@ -271,6 +279,13 @@ async def update_project(project_id: int, payload: ProjectUpdate) -> dict:
             await pause_project_job(project_id)
         elif updates["status"] == "active":
             project = _get_project_or_404(project_id)
+            # Reset failure counter when resuming (especially from paused_error)
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE projects SET consecutive_failures = 0 WHERE id = ?",
+                    (project_id,),
+                )
+                conn.commit()
             await resume_project_job(project_id, project["interval_seconds"])
 
     return _get_project_or_404(project_id)
@@ -285,8 +300,6 @@ async def clone_project(
 
     copy_frames_days: if set, copies frame DB records (and files) from the last N days.
     """
-    import os
-
     source = _get_project_or_404(project_id)
     settings = get_settings()
 
@@ -344,9 +357,6 @@ async def clone_project(
 
     # Optionally copy last N days of frames (F10)
     if copy_frames_days and copy_frames_days > 0:
-        import contextlib
-        from datetime import UTC, datetime, timedelta
-
         cutoff = (datetime.now(UTC) - timedelta(days=copy_frames_days)).isoformat()
         src_frame_dir = f"{settings.frames_path}/{project_id}"
         dst_frame_dir = f"{settings.frames_path}/{new_id}"
@@ -380,10 +390,8 @@ async def clone_project(
                 tsrc = frame["thumbnail_path"]
                 tdst = tsrc.replace(src_thumb_dir, dst_thumb_dir, 1)
                 with contextlib.suppress(OSError):
-                    import shutil as _shutil
-
                     os.makedirs(os.path.dirname(tdst), exist_ok=True)
-                    _shutil.copy2(tsrc, tdst)
+                    shutil.copy2(tsrc, tdst)
                     new_thumb_path = tdst
 
             with get_connection() as conn:
@@ -414,6 +422,31 @@ async def clone_project(
             conn.commit()
 
     return _get_project_or_404(new_id)
+
+
+@router.post("/projects/{project_id}/retry-extraction")
+async def retry_extraction(project_id: int) -> dict:
+    """Retry or resume a failed/completed historical extraction.
+
+    Skips timestamps that already have frames (resume support).
+    """
+    project = _get_project_or_404(project_id)
+    if project["project_type"] != "historical":
+        raise HTTPException(status_code=400, detail="Only historical projects can be retried")
+    if project["status"] not in ("error", "completed", "extracting"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot retry project in '{project['status']}' status",
+        )
+
+    task = asyncio.create_task(
+        run_historical_extraction(project_id),
+        name=f"historical_extraction_{project_id}",
+    )
+    _extraction_tasks.add(task)
+    task.add_done_callback(_extraction_tasks.discard)
+
+    return {"status": "started", "project_id": project_id}
 
 
 @router.get("/projects/{project_id}/schedule-test")
@@ -460,8 +493,6 @@ def schedule_test(
 
 @router.delete("/projects/{project_id}", status_code=204)
 async def delete_project(project_id: int) -> None:
-    import contextlib
-
     _get_project_or_404(project_id)
     settings = get_settings()
 

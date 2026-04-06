@@ -6,12 +6,11 @@ The snapshot_worker() runs the full visibility pipeline before saving a frame.
 """
 
 import asyncio
-import contextlib
 import io
 import logging
 import os
 import shutil
-import tempfile
+import zoneinfo
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -22,7 +21,7 @@ from PIL import Image, ImageFilter, ImageStat
 from app.config import get_settings
 from app.database import get_connection, get_db_overrides
 from app.protect import protect_manager
-from app.thumbnails import generate_thumbnail, generate_thumbnail_from_pillow
+from app.thumbnails import generate_thumbnail_from_pillow
 from app.websocket import broadcast
 
 log = logging.getLogger("app.capture")
@@ -31,6 +30,9 @@ scheduler = AsyncIOScheduler()
 
 # Default Laplacian variance threshold below which a frame is flagged as blurry.
 _BLUR_THRESHOLD = 20.0
+
+# Circuit breaker: auto-pause a project after this many consecutive capture failures.
+_CIRCUIT_BREAKER_THRESHOLD = 10
 
 # Per-camera semaphore: at most 2 concurrent snapshots per camera to avoid NVR overload.
 _camera_semaphores: dict[str, asyncio.Semaphore] = {}
@@ -54,6 +56,24 @@ async def start_scheduler() -> None:
 
     for row in rows:
         _register_job(row["id"], row["interval_seconds"], row["capture_mode"])
+
+    # Periodic NVR health check — detects disconnect/reconnect, broadcasts status
+    scheduler.add_job(
+        _nvr_health_check_job,
+        trigger=IntervalTrigger(seconds=60),
+        id="nvr_health_check",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Periodic bootstrap refresh — picks up new/removed cameras
+    scheduler.add_job(
+        _nvr_bootstrap_refresh_job,
+        trigger=IntervalTrigger(seconds=300),
+        id="nvr_bootstrap_refresh",
+        replace_existing=True,
+        max_instances=1,
+    )
 
     scheduler.start()
     log.info("Capture scheduler started with %d active project(s)", len(rows))
@@ -228,9 +248,40 @@ async def snapshot_worker(project_id: int) -> None:
 
     except (httpx.ReadTimeout, httpx.ConnectError, Exception) as exc:
         log.warning("Project %d: NVR snapshot failed — %s", project_id, exc)
+        # Signal NVR disconnect so next get_client() attempts reconnect
+        if isinstance(exc, httpx.ReadTimeout | httpx.ConnectError | RuntimeError):
+            protect_manager.mark_disconnected(str(exc))
         failures = _increment_failures(project_id)
         if failures >= 3:
             await _notify_nvr_offline(project_id, project["name"], failures)
+        # Circuit breaker: auto-pause after too many consecutive failures
+        if failures >= _CIRCUIT_BREAKER_THRESHOLD:
+            log.error(
+                "Project %d: circuit breaker tripped after %d failures — pausing",
+                project_id,
+                failures,
+            )
+            _set_project_status(project_id, "paused_error")
+            await remove_project_job(project_id)
+            from app.notifications import notify as _notify
+
+            await _notify(
+                event="project_paused",
+                level="error",
+                message=(
+                    f"Project '{project['name']}' auto-paused after {failures} "
+                    f"consecutive capture failures. Last error: {exc}"
+                ),
+                project_id=project_id,
+            )
+            await broadcast(
+                "project_status_change",
+                {
+                    "project_id": project_id,
+                    "status": "paused_error",
+                    "reason": f"Auto-paused after {failures} consecutive failures",
+                },
+            )
         return
 
     # --- 6. Luminance filter ------------------------------------------------
@@ -415,6 +466,35 @@ async def snapshot_worker(project_id: int) -> None:
 
 
 # -------------------------------------------------------------------------
+# NVR periodic jobs
+# -------------------------------------------------------------------------
+
+
+async def _nvr_health_check_job() -> None:
+    """Periodic health check — broadcast NVR status changes via WS."""
+    status = await protect_manager.health_check()
+    await broadcast("nvr_status", status)
+
+
+async def _nvr_bootstrap_refresh_job() -> None:
+    """Periodic bootstrap refresh — picks up added/removed cameras."""
+    await protect_manager.refresh_bootstrap()
+
+
+def get_scheduler_status() -> dict:
+    """Return scheduler state for the system status endpoint."""
+    jobs = []
+    if scheduler.running:
+        for job in scheduler.get_jobs():
+            jobs.append({"id": job.id, "next_run": str(job.next_run_time)})
+    return {
+        "running": scheduler.running,
+        "job_count": len(jobs),
+        "jobs": jobs,
+    }
+
+
+# -------------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------------
 
@@ -472,8 +552,6 @@ def _is_solar_noon_window(project: dict) -> bool:
 
 
 def _is_in_schedule(project: dict, tz_name: str) -> bool:
-    import zoneinfo
-
     tz = zoneinfo.ZoneInfo(tz_name)
     local_now = datetime.now(tz)
     weekday = local_now.isoweekday()  # 1=Mon … 7=Sun
@@ -593,6 +671,10 @@ async def run_historical_extraction(project_id: int) -> None:
     except Exception as exc:
         log.exception("Historical extraction project %d crashed: %s", project_id, exc)
         _set_project_status(project_id, "error")
+        await broadcast(
+            "extraction_progress",
+            {"project_id": project_id, "progress_pct": -1, "error": str(exc)},
+        )
 
 
 async def _run_historical_extraction_inner(project_id: int) -> None:
@@ -607,18 +689,45 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
     project = dict(row)
 
     if not project.get("start_date") or not project.get("end_date"):
-        log.error("Historical extraction: project %d missing start_date or end_date", project_id)
+        error_msg = "Missing start_date or end_date"
+        log.error("Historical extraction: project %d %s", project_id, error_msg)
         _set_project_status(project_id, "error")
+        await broadcast(
+            "extraction_progress",
+            {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+        )
         return
 
     _set_project_status(project_id, "extracting")
 
-    start_dt = datetime.fromisoformat(project["start_date"]).replace(tzinfo=UTC)
-    end_dt = datetime.fromisoformat(project["end_date"]).replace(tzinfo=UTC)
+    # Dates from the frontend are in the user's local time (datetime-local input).
+    # Parse as local time, then convert to UTC for the NVR API.
+    tz_name, _, _ = _get_location()
+    local_tz = zoneinfo.ZoneInfo(tz_name)
+
+    raw_start = datetime.fromisoformat(project["start_date"])
+    raw_end = datetime.fromisoformat(project["end_date"])
+
+    # If the datetime already has tzinfo (e.g. stored with Z suffix), use it as-is.
+    # Otherwise treat it as local time and convert to UTC.
+    if raw_start.tzinfo is None:
+        start_dt = raw_start.replace(tzinfo=local_tz).astimezone(UTC)
+    else:
+        start_dt = raw_start.astimezone(UTC)
+
+    if raw_end.tzinfo is None:
+        end_dt = raw_end.replace(tzinfo=local_tz).astimezone(UTC)
+    else:
+        end_dt = raw_end.astimezone(UTC)
 
     if end_dt <= start_dt:
-        log.error("Historical extraction: project %d end_date is not after start_date", project_id)
+        error_msg = "end_date must be after start_date"
+        log.error("Historical extraction: project %d %s", project_id, error_msg)
         _set_project_status(project_id, "error")
+        await broadcast(
+            "extraction_progress",
+            {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+        )
         return
 
     interval = project["interval_seconds"]
@@ -632,126 +741,226 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
         client = await protect_manager.get_client()
         cam = client.bootstrap.cameras.get(project["camera_id"])
         if cam is None:
-            log.error("Historical extraction: camera %s not found", project["camera_id"])
+            error_msg = f"Camera {project['camera_id']} not found on NVR"
+            log.error("Historical extraction: %s", error_msg)
             _set_project_status(project_id, "error")
+            await broadcast(
+                "extraction_progress",
+                {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+            )
             return
     except RuntimeError as exc:
         log.error("Historical extraction: NVR unavailable — %s", exc)
         _set_project_status(project_id, "error")
-        return
-
-    chunk_start = start_dt
-    chunk_index = 0
-    total_frames = 0
-    total_duration_h = max(1, (end_dt - start_dt).total_seconds() / 3600)
-
-    while chunk_start < end_dt:
-        chunk_end = min(chunk_start + timedelta(hours=1), end_dt)
-        elapsed_h = (chunk_start - start_dt).total_seconds() / 3600
-        progress_pct = int(elapsed_h / total_duration_h * 100)
         await broadcast(
             "extraction_progress",
-            {"project_id": project_id, "progress_pct": progress_pct, "frames": total_frames},
+            {"project_id": project_id, "progress_pct": -1, "error": f"NVR unavailable: {exc}"},
         )
+        return
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".mp4", prefix=f"hist_{project_id}_{chunk_index}_", delete=False
-        ) as tmp:
-            tmp_path = tmp.name
+    # ── Build list of timestamps to extract ──────────────────────────────
+    # One snapshot every `interval` seconds from start to end.
+    all_timestamps: list[datetime] = []
+    cursor = start_dt
+    while cursor < end_dt:
+        all_timestamps.append(cursor)
+        cursor += timedelta(seconds=interval)
+
+    if not all_timestamps:
+        error_msg = "Time range too short for the configured interval"
+        log.error("Historical extraction project %d: %s", project_id, error_msg)
+        _set_project_status(project_id, "error")
+        await broadcast(
+            "extraction_progress",
+            {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+        )
+        return
+
+    # ── Resume support: skip timestamps that already have frames ──────
+    with get_connection() as conn:
+        existing_rows = conn.execute(
+            "SELECT captured_at FROM frames WHERE project_id = ?", (project_id,)
+        ).fetchall()
+    existing_ts = {row["captured_at"] for row in existing_rows}
+
+    timestamps = [ts for ts in all_timestamps if ts.isoformat() not in existing_ts]
+    already_done = len(all_timestamps) - len(timestamps)
+    total_expected = len(timestamps)
+
+    if total_expected == 0:
+        log.info(
+            "Historical extraction project %d: all %d frames already extracted",
+            project_id,
+            already_done,
+        )
+        _set_project_status(project_id, "completed")
+        await broadcast(
+            "extraction_progress",
+            {
+                "project_id": project_id,
+                "progress_pct": 100,
+                "frames": already_done,
+            },
+        )
+        return
+
+    log.info(
+        "Historical extraction project %d: %d snapshots to fetch "
+        "(%d already done, %s → %s, every %ds)",
+        project_id,
+        total_expected,
+        already_done,
+        start_dt.isoformat(),
+        end_dt.isoformat(),
+        interval,
+    )
+
+    # ── Fetch historical snapshots directly from NVR ──────────────────
+    # Uses camera.get_snapshot(dt=...) which hits the NVR's
+    # "recording-snapshot" endpoint — returns a single JPEG per timestamp.
+    # No video download, no ffmpeg, no temp files.
+    _SNAPSHOT_TIMEOUT = 30  # seconds per snapshot request
+    total_frames = 0
+    consecutive_errors = 0
+
+    # Resolution kwargs (same as live capture)
+    snap_kwargs: dict = {}
+    if project["width"]:
+        snap_kwargs["width"] = project["width"]
+    if project["height"]:
+        snap_kwargs["height"] = project["height"]
+
+    for idx, frame_dt in enumerate(timestamps):
+        progress_pct = int(idx / total_expected * 100)
+
+        # Broadcast progress every 10 frames to avoid WS spam
+        if idx % 10 == 0:
+            await broadcast(
+                "extraction_progress",
+                {
+                    "project_id": project_id,
+                    "progress_pct": progress_pct,
+                    "frames": total_frames,
+                    "current": idx + 1,
+                    "total_expected": total_expected,
+                },
+            )
 
         try:
-            video_bytes = await cam.get_video(chunk_start, chunk_end)
-            if video_bytes is None:
-                raise RuntimeError("NVR returned empty video chunk")
-            with open(tmp_path, "wb") as f:
-                f.write(video_bytes)
-
-            # Extract frames via ffmpeg
-            extract_dir = os.path.join(frame_dir, f"_tmp_chunk_{chunk_index}")
-            os.makedirs(extract_dir, exist_ok=True)
-
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-threads",
-                str(settings.ffmpeg_threads),
-                "-i",
-                tmp_path,
-                "-vf",
-                f"fps=1/{interval}",
-                "-q:v",
-                "2",
-                os.path.join(extract_dir, "%014d.jpg"),
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
+            snapshot_bytes = await asyncio.wait_for(
+                cam.get_snapshot(dt=frame_dt, **snap_kwargs),
+                timeout=_SNAPSHOT_TIMEOUT,
             )
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=settings.ffmpeg_timeout_seconds
-            )
-            if proc.returncode != 0:
-                log.error(
-                    "Historical extraction ffmpeg failed: %s", stderr.decode(errors="replace")
+            if not snapshot_bytes:
+                log.debug(
+                    "Historical extraction project %d: empty snapshot at %s, skipping",
+                    project_id,
+                    frame_dt.isoformat(),
                 )
+                consecutive_errors += 1
+                if consecutive_errors >= 20:
+                    error_msg = (
+                        f"Aborted after {consecutive_errors} consecutive empty/failed snapshots. "
+                        "NVR may not have recordings for this time range."
+                    )
+                    log.error("Historical extraction project %d: %s", project_id, error_msg)
+                    _set_project_status(project_id, "error")
+                    await broadcast(
+                        "extraction_progress",
+                        {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+                    )
+                    return
                 continue
 
-            # Rename extracted files to UTC timestamps and generate thumbnails
-            extracted = sorted(os.listdir(extract_dir))
-            for frame_index, filename in enumerate(extracted):
-                src = os.path.join(extract_dir, filename)
-                frame_utc = chunk_start + timedelta(seconds=frame_index * interval)
-                ts = frame_utc.strftime("%Y%m%d%H%M%S")
-                dst = os.path.join(frame_dir, f"{ts}.jpg")
-                try:
-                    os.rename(src, dst)
-                except OSError as exc:
-                    log.warning("Historical extraction: rename failed %s → %s: %s", src, dst, exc)
-                    continue  # skip frame rather than crashing the chunk (#9)
+            consecutive_errors = 0
 
-                with open(dst, "rb") as fh:
-                    img_bytes = fh.read()
-                loop = asyncio.get_event_loop()
-                thumb_bytes = await loop.run_in_executor(None, generate_thumbnail, img_bytes)
-                thumb_path = os.path.join(thumb_dir, f"{ts}.jpg")
-                with open(thumb_path, "wb") as fh:
-                    fh.write(thumb_bytes)
+            ts = frame_dt.strftime("%Y%m%d%H%M%S")
+            frame_path = os.path.join(frame_dir, f"{ts}.jpg")
+            thumb_path = os.path.join(thumb_dir, f"{ts}.jpg")
 
-                file_size = os.path.getsize(dst)
-                captured_at = frame_utc.isoformat()
-                with get_connection() as conn:
-                    conn.execute(
-                        "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size) VALUES (?,?,?,?,?)",
-                        (project_id, captured_at, dst, thumb_path, file_size),
-                    )
-                    conn.execute(
-                        "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
-                        (project_id,),
-                    )
-                    conn.commit()
-                total_frames += 1
+            with open(frame_path, "wb") as f:
+                f.write(snapshot_bytes)
 
-            with contextlib.suppress(Exception):
-                shutil.rmtree(extract_dir)
+            # Generate thumbnail
+            pil_img = Image.open(io.BytesIO(snapshot_bytes))
+            loop = asyncio.get_event_loop()
+            thumb_bytes = await loop.run_in_executor(None, generate_thumbnail_from_pillow, pil_img)
+            with open(thumb_path, "wb") as f:
+                f.write(thumb_bytes)
+
+            file_size = len(snapshot_bytes)
+            captured_at = frame_dt.isoformat()
+            with get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size) "
+                    "VALUES (?,?,?,?,?)",
+                    (project_id, captured_at, frame_path, thumb_path, file_size),
+                )
+                conn.execute(
+                    "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
+                    (project_id,),
+                )
+                conn.commit()
+            total_frames += 1
 
         except TimeoutError:
-            log.error("Historical extraction: ffmpeg timed out on chunk %d", chunk_index)
+            log.warning(
+                "Historical extraction project %d: snapshot timed out at %s",
+                project_id,
+                frame_dt.isoformat(),
+            )
+            consecutive_errors += 1
         except Exception as exc:
-            log.error("Historical extraction error on chunk %d: %s", chunk_index, exc)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(tmp_path)
+            log.warning(
+                "Historical extraction project %d: snapshot failed at %s: %s",
+                project_id,
+                frame_dt.isoformat(),
+                exc,
+            )
+            consecutive_errors += 1
 
-        chunk_start = chunk_end
-        chunk_index += 1
+        if consecutive_errors >= 20:
+            error_msg = (
+                f"Aborted after {consecutive_errors} consecutive failures at "
+                f"{frame_dt.isoformat()}. Last frame fetched: {total_frames}."
+            )
+            log.error("Historical extraction project %d: %s", project_id, error_msg)
+            _set_project_status(project_id, "error")
+            await broadcast(
+                "extraction_progress",
+                {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+            )
+            return
+
+        # Yield to event loop periodically to avoid starving other tasks
+        if idx % 5 == 0:
+            await asyncio.sleep(0)
+
+    # ── Finalize ──────────────────────────────────────────────────────
+    if total_frames == 0:
+        error_msg = (
+            f"Extracted 0 frames out of {total_expected} attempts. "
+            "The NVR may not have recordings for this time range."
+        )
+        log.error("Historical extraction project %d: %s", project_id, error_msg)
+        _set_project_status(project_id, "error")
+        await broadcast(
+            "extraction_progress",
+            {"project_id": project_id, "progress_pct": -1, "error": error_msg},
+        )
+        return
 
     _set_project_status(project_id, "completed")
     await broadcast(
         "extraction_progress",
         {"project_id": project_id, "progress_pct": 100, "frames": total_frames},
     )
-    log.info("Historical extraction complete: project %d, %d frames", project_id, total_frames)
+    log.info(
+        "Historical extraction complete: project %d, %d/%d frames",
+        project_id,
+        total_frames,
+        total_expected,
+    )
 
 
 # Config shorthand used in helpers (avoid circular import at module level)

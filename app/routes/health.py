@@ -94,6 +94,65 @@ def pool_stats() -> dict:
     }
 
 
+@router.get("/api/system/status")
+def system_status() -> dict:
+    """Aggregated system status for the dashboard UI."""
+    from app.capture import get_scheduler_status
+    from app.database import get_wal_size_bytes
+
+    settings = get_settings()
+
+    # Disk
+    try:
+        usage = shutil.disk_usage(settings.frames_path)
+        disk = {
+            "free_gb": round(usage.free / 1024**3, 2),
+            "total_gb": round(usage.total / 1024**3, 2),
+        }
+    except FileNotFoundError:
+        disk = {"free_gb": -1, "total_gb": -1}
+
+    # Render worker
+    now = time.monotonic()
+    if _last_render_worker_heartbeat == 0.0:
+        render_worker = {"alive": True, "last_heartbeat_age_s": 0}
+    else:
+        age = now - _last_render_worker_heartbeat
+        render_worker = {"alive": age < 120, "last_heartbeat_age_s": int(age)}
+
+    # DB
+    wal_size = get_wal_size_bytes()
+
+    # Project summary
+    with get_connection() as conn:
+        project_counts = conn.execute(
+            """
+            SELECT status, COUNT(*) as cnt FROM projects GROUP BY status
+            """
+        ).fetchall()
+        recent_errors = conn.execute(
+            """
+            SELECT id, event, level, message, created_at, project_id
+            FROM notifications WHERE level IN ('error', 'warning')
+            ORDER BY created_at DESC LIMIT 10
+            """
+        ).fetchall()
+        pending_renders = conn.execute(
+            "SELECT COUNT(*) as cnt FROM renders WHERE status IN ('pending', 'rendering')"
+        ).fetchone()
+
+    return {
+        "nvr": protect_manager.status,
+        "scheduler": get_scheduler_status(),
+        "render_worker": render_worker,
+        "disk": disk,
+        "db": {"wal_size_bytes": wal_size, "wal_size_mb": round(wal_size / 1024 / 1024, 2)},
+        "projects": {row["status"]: row["cnt"] for row in project_counts},
+        "pending_renders": pending_renders["cnt"] if pending_renders else 0,
+        "recent_errors": [dict(r) for r in recent_errors],
+    }
+
+
 @router.get("/api/disk")
 def disk_breakdown() -> dict:
     """Per-project disk usage breakdown across frames, renders, and thumbs."""

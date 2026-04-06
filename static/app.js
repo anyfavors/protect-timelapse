@@ -30,6 +30,8 @@ document.addEventListener('alpine:init', () => {
     wsRetries: 0,
     wsMaxRetries: 3,
     diskSpace: { free_gb: null, total_gb: null },
+    systemStatus: null,
+    _systemStatusTimer: null,
     diskThreshold: 5,
     toasts: [],
     showNotifDropdown: false,
@@ -126,7 +128,11 @@ document.addEventListener('alpine:init', () => {
         this.loadTemplates(),
         this.loadNotifications(),
         this.loadHealth(),
+        this.loadSystemStatus(),
       ]);
+      // Poll system status every 30s
+      if (this._systemStatusTimer) clearInterval(this._systemStatusTimer);
+      this._systemStatusTimer = setInterval(() => this.loadSystemStatus(), 30000);
     },
 
     // ── Data loaders ──────────────────────────────────────────────────────
@@ -194,6 +200,26 @@ document.addEventListener('alpine:init', () => {
       const data = await this.api('/api/health');
       if (data) {
         this.diskSpace = { free_gb: data.disk_free_gb, total_gb: data.disk_total_gb };
+      }
+    },
+
+    async loadSystemStatus() {
+      const data = await this.api('/api/system/status');
+      if (data) {
+        this.systemStatus = data;
+        // Keep disk space in sync
+        if (data.disk) {
+          this.diskSpace = { free_gb: data.disk.free_gb, total_gb: data.disk.total_gb };
+        }
+      }
+    },
+
+    async retryExtraction(projectId) {
+      const r = await this.api(`/api/projects/${projectId}/retry-extraction`, 'POST');
+      if (r) {
+        this.toast('Extraction restarted (will resume from last checkpoint)', 'success', projectId);
+        const p = this.projects.find(p => p.id === projectId);
+        if (p) p.status = 'extracting';
       }
     },
 
@@ -1224,12 +1250,21 @@ document.addEventListener('alpine:init', () => {
         case 'extraction_progress': {
           const p = this.projects.find(p => p.id === msg.project_id);
           if (p) {
-            p.frame_count = msg.frames;
-            p._extraction_pct = msg.progress_pct;
-            if (msg.progress_pct >= 100) {
+            if (msg.progress_pct < 0 || msg.error) {
+              // Extraction failed
+              p.status = 'error';
+              p._extraction_pct = null;
+              this.toast(`Extraction failed: ${msg.error || 'Unknown error'}`, 'error', p.id);
+            } else if (msg.progress_pct >= 100) {
               p.status = 'completed';
               p._extraction_pct = null;
-              this.toast(`Extraction complete: ${p.name}`, 'success', p.id);
+              this.toast(`Extraction complete: ${p.name} (${msg.frames} frames)`, 'success', p.id);
+            } else {
+              p.frame_count = msg.frames || 0;
+              p._extraction_pct = msg.progress_pct;
+              if (msg.current && msg.total_expected) {
+                p._extraction_detail = `${msg.current}/${msg.total_expected}`;
+              }
             }
           }
           break;
@@ -1248,6 +1283,22 @@ document.addEventListener('alpine:init', () => {
           this.toast(msg.message, msg.level === 'error' ? 'error' : 'info');
           break;
         }
+        case 'nvr_status': {
+          if (this.systemStatus) this.systemStatus.nvr = msg;
+          break;
+        }
+        case 'project_status_change': {
+          const p = this.projects.find(p => p.id === msg.project_id);
+          if (p) {
+            p.status = msg.status;
+            if (msg.reason) p._status_reason = msg.reason;
+          }
+          if (msg.status === 'paused_error') {
+            const name = p?.name || `Project #${msg.project_id}`;
+            this.toast(`${name}: ${msg.reason || 'Auto-paused'}`, 'error', msg.project_id);
+          }
+          break;
+        }
       }
     },
 
@@ -1259,6 +1310,7 @@ document.addEventListener('alpine:init', () => {
       if (this.gifPollTimer) { clearInterval(this.gifPollTimer); this.gifPollTimer = null; }
       if (this.previewTimer) { clearInterval(this.previewTimer); this.previewTimer = null; }
       if (this._renderAutoRefreshTimer) { clearInterval(this._renderAutoRefreshTimer); this._renderAutoRefreshTimer = null; }
+      if (this._systemStatusTimer) { clearInterval(this._systemStatusTimer); this._systemStatusTimer = null; }
     },
 
     // ── Mobile tap-to-preview (UX8) ───────────────────────────────────────

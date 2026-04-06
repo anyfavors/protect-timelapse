@@ -33,6 +33,9 @@ async def run_maintenance() -> None:
     log.info("Maintenance run started")
     await _prune_old_frames()
     await _prune_old_renders()
+    await _recover_zombie_renders()
+    await _reconcile_frame_counts()
+    await _reconcile_project_status()
     await _schedule_auto_renders()
     await _backup_database()
     log.info("Maintenance run complete")
@@ -131,6 +134,94 @@ async def _prune_old_renders() -> None:
 
     if stale:
         log.info("Pruned %d stale auto-renders", len(stale))
+
+
+# -------------------------------------------------------------------------
+# Zombie render recovery
+# -------------------------------------------------------------------------
+
+
+async def _recover_zombie_renders() -> None:
+    """Detect renders stuck in 'rendering' for >2 hours and mark them failed."""
+    cutoff = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    with get_connection() as conn:
+        zombies = conn.execute(
+            "SELECT id, output_path FROM renders WHERE status = 'rendering' AND created_at < ?",
+            (cutoff,),
+        ).fetchall()
+
+    for render in zombies:
+        # Clean up partial output file
+        if render["output_path"]:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(render["output_path"])
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE renders SET status = 'error', error_msg = 'Recovered: stuck in rendering for >2h' WHERE id = ?",
+                (render["id"],),
+            )
+            conn.commit()
+        log.warning("Recovered zombie render id=%d", render["id"])
+
+    if zombies:
+        log.info("Recovered %d zombie render(s)", len(zombies))
+
+
+# -------------------------------------------------------------------------
+# Eventual consistency reconciliation
+# -------------------------------------------------------------------------
+
+
+async def _reconcile_frame_counts() -> None:
+    """Fix drifted frame_count values by comparing with actual COUNT(*)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.id, p.frame_count, COUNT(f.id) AS actual_count
+            FROM projects p
+            LEFT JOIN frames f ON f.project_id = p.id
+            GROUP BY p.id
+            HAVING p.frame_count != COUNT(f.id)
+            """
+        ).fetchall()
+
+    for row in rows:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE projects SET frame_count = ? WHERE id = ?",
+                (row["actual_count"], row["id"]),
+            )
+            conn.commit()
+        log.info(
+            "Reconciled frame_count for project %d: %d → %d",
+            row["id"],
+            row["frame_count"],
+            row["actual_count"],
+        )
+
+
+async def _reconcile_project_status() -> None:
+    """Fix stale project statuses that indicate a crashed worker."""
+    # Projects stuck in 'extracting' for >4 hours → error
+    cutoff = (datetime.now(UTC) - timedelta(hours=4)).isoformat()
+    with get_connection() as conn:
+        stale = conn.execute(
+            "SELECT id, name FROM projects WHERE status = 'extracting' AND created_at < ?",
+            (cutoff,),
+        ).fetchall()
+
+    for project in stale:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE projects SET status = 'error' WHERE id = ? AND status = 'extracting'",
+                (project["id"],),
+            )
+            conn.commit()
+        log.warning(
+            "Reconciled stale extraction: project %d '%s' → error",
+            project["id"],
+            project["name"],
+        )
 
 
 # -------------------------------------------------------------------------

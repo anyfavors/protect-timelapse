@@ -1,5 +1,6 @@
 .git
 .github
+.claude
 __pycache__
 *.pyc
 *.pyo
@@ -12,3 +13,8 @@ node_modules
 .env.*
 tests/
 requirements-dev.txt
+*.md
+project-design.md
+CLAUDE.md
+LICENSE
+static/app.css

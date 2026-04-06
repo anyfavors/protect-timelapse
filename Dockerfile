@@ -10,28 +10,37 @@ RUN npx @tailwindcss/cli -i app.css.src -o app.css --minify
 
 
 # ── Stage 2: Python runtime ──────────────────────────────────────────────────
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 ARG BUILD_DATE
 ARG VERSION=dev
 
 LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.title="protect-timelapse"
+      org.opencontainers.image.title="protect-timelapse" \
+      org.opencontainers.image.description="Self-hosted timelapse generator for UniFi Protect cameras" \
+      org.opencontainers.image.source="https://github.com/protect-timelapse/protect-timelapse"
+
+# Don't write .pyc files, flush stdout/stderr immediately
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# System deps: ffmpeg for rendering, curl for healthcheck, gosu for entrypoint privilege drop
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# System deps: ffmpeg for rendering
+RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
         ffmpeg \
-        curl \
-        gosu \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python deps (cached layer — only busts when requirements.txt changes)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy application code in specific layers for better cache granularity
+COPY app/ ./app/
+COPY templates/ ./templates/
+COPY static/app.js ./static/app.js
 
 # Inject compiled CSS from the CSS build stage
 COPY --from=css-build /src/app.css ./static/app.css
@@ -39,18 +48,15 @@ COPY --from=css-build /src/app.css ./static/app.css
 # Non-root user for security (B9)
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /data && \
-    chown -R appuser:appuser /app /data
+    chown appuser:appuser /data
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Storage volume — must be mounted at runtime
-VOLUME ["/data"]
-
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/api/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --start-interval=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')" || exit 1
 
-# Entrypoint runs as root to fix /data ownership, then drops to appuser via gosu
+# Entrypoint fixes /data ownership (top-level only), then drops to appuser
 ENTRYPOINT ["/entrypoint.sh"]

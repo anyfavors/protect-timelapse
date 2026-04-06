@@ -4,6 +4,7 @@ All route handlers and workers must import get_connection() from here.
 """
 
 import contextlib
+import os
 import queue
 import sqlite3
 from collections.abc import Generator
@@ -374,3 +375,14 @@ def get_db_overrides() -> dict:
         return {k: v for k, v in dict(row).items() if v is not None}
     except Exception:
         return {}
+
+
+def get_wal_size_bytes() -> int:
+    """Return the WAL file size in bytes (0 if WAL doesn't exist)."""
+    from app.config import get_settings
+
+    wal_path = get_settings().database_path + "-wal"
+    try:
+        return os.path.getsize(wal_path)
+    except FileNotFoundError:
+        return 0

@@ -5,6 +5,7 @@ All NVR access must go through ProtectClientManager.get_client().
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 from uiprotect import ProtectApiClient
 
@@ -23,6 +24,9 @@ class ProtectClientManager:
         self._client: ProtectApiClient | None = None
         self._lock = asyncio.Lock()
         self._connected = False
+        self._camera_count = 0
+        self._last_health_check: datetime | None = None
+        self._last_error: str | None = None
 
     async def setup(self) -> None:
         """Authenticate with the NVR and load the bootstrap data."""
@@ -49,14 +53,17 @@ class ProtectClientManager:
             try:
                 await self._client.update()
                 self._connected = True
+                self._camera_count = len(self._client.bootstrap.cameras)
+                self._last_error = None
                 log.info(
                     "Connected to UniFi Protect NVR at %s:%d — %d camera(s)",
                     settings.protect_host,
                     settings.protect_port,
-                    len(self._client.bootstrap.cameras),
+                    self._camera_count,
                 )
             except Exception as exc:
                 self._connected = False
+                self._last_error = str(exc)
                 log.warning("Could not connect to NVR at startup: %s", exc)
 
     async def reconnect(self) -> None:
@@ -89,14 +96,98 @@ class ProtectClientManager:
                 try:
                     await self._client.update()
                     self._connected = True
+                    self._camera_count = len(self._client.bootstrap.cameras)
+                    self._last_error = None
                     log.info("Reconnected to NVR")
                 except Exception as exc:
+                    self._last_error = str(exc)
                     raise RuntimeError(f"NVR offline: {exc}") from exc
             return self._client
+
+    def mark_disconnected(self, reason: str = "") -> None:
+        """Signal that the NVR connection has failed.
+
+        Callers (e.g. snapshot_worker) invoke this on connection/auth errors
+        so that the next get_client() call attempts a reconnect.
+        """
+        if self._connected:
+            log.warning("NVR marked disconnected: %s", reason or "unknown")
+        self._connected = False
+        self._last_error = reason or self._last_error
+
+    async def refresh_bootstrap(self) -> bool:
+        """Re-fetch bootstrap data (camera list, NVR info).
+
+        Returns True on success, False on failure.
+        """
+        async with self._lock:
+            if self._client is None:
+                return False
+            try:
+                await self._client.update()
+                old_count = self._camera_count
+                self._camera_count = len(self._client.bootstrap.cameras)
+                self._connected = True
+                self._last_error = None
+                if self._camera_count != old_count:
+                    log.info(
+                        "Bootstrap refreshed: camera count %d → %d",
+                        old_count,
+                        self._camera_count,
+                    )
+                return True
+            except Exception as exc:
+                self._connected = False
+                self._last_error = str(exc)
+                log.warning("Bootstrap refresh failed: %s", exc)
+                return False
+
+    async def health_check(self) -> dict:
+        """Lightweight NVR health probe. Returns status dict."""
+        self._last_health_check = datetime.now(UTC)
+        was_connected = self._connected
+
+        if self._client is None:
+            return {
+                "connected": False,
+                "camera_count": 0,
+                "last_error": self._last_error or "Client not initialised",
+            }
+
+        try:
+            async with self._lock:
+                await self._client.update()
+                self._connected = True
+                self._camera_count = len(self._client.bootstrap.cameras)
+                self._last_error = None
+        except Exception as exc:
+            self._connected = False
+            self._last_error = str(exc)
+
+        if was_connected != self._connected:
+            state = "connected" if self._connected else "disconnected"
+            log.info("NVR state changed → %s", state)
+
+        return {
+            "connected": self._connected,
+            "camera_count": self._camera_count,
+            "last_error": self._last_error,
+            "last_check": self._last_health_check.isoformat() if self._last_health_check else None,
+        }
 
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def status(self) -> dict:
+        """Current NVR status snapshot (no I/O)."""
+        return {
+            "connected": self._connected,
+            "camera_count": self._camera_count,
+            "last_error": self._last_error,
+            "last_check": self._last_health_check.isoformat() if self._last_health_check else None,
+        }
 
 
 # Module-level singleton — imported by routes and workers

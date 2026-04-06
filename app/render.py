@@ -249,6 +249,9 @@ async def _process_next_render() -> None:
     except Exception as exc:
         error_msg = str(exc)[:1000]
         log.error("Render id=%d failed: %s", render_id, error_msg)
+        # Clean up partial output file on failure
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(output_path)
         with get_connection() as conn:
             conn.execute(
                 "UPDATE renders SET status='error', error_msg=? WHERE id=?",

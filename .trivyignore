@@ -1,0 +1,5 @@
+# Trivy ignore file — document each exception with CVE ID and reason.
+# Format: one CVE per line, comment above explaining why it's acceptable.
+#
+# Example:
+# CVE-2024-XXXXX  # ffmpeg: unexploitable in our context (no untrusted input)

@@ -39,9 +39,46 @@
       </svg>
       Renders
     </button>
+    <button @click="view = 'system_log'"
+            class="hidden sm:inline-flex items-center gap-1.5 text-sm px-3 py-1 rounded-lg transition"
+            :class="view === 'system_log' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+      </svg>
+      System
+    </button>
   </div>
 
   <div class="flex items-center gap-4">
+    <!-- System status indicators -->
+    <div class="hidden sm:flex items-center gap-3 text-xs">
+      <!-- NVR status -->
+      <div class="flex items-center gap-1.5"
+           :title="systemStatus?.nvr?.connected ? 'NVR connected (' + (systemStatus?.nvr?.camera_count || 0) + ' cameras)' : 'NVR disconnected: ' + (systemStatus?.nvr?.last_error || 'unknown')">
+        <span class="w-2 h-2 rounded-full inline-block"
+              :class="systemStatus?.nvr?.connected ? 'bg-green-400' : 'bg-red-500 animate-pulse'"></span>
+        <span :class="systemStatus?.nvr?.connected ? 'text-slate-400' : 'text-red-400'"
+              x-text="systemStatus?.nvr?.connected ? 'NVR' : 'NVR offline'"></span>
+      </div>
+      <!-- Scheduler status -->
+      <div class="flex items-center gap-1.5"
+           :title="systemStatus?.scheduler?.running ? systemStatus.scheduler.job_count + ' jobs' : 'Scheduler stopped'">
+        <span class="w-2 h-2 rounded-full inline-block"
+              :class="systemStatus?.scheduler?.running ? 'bg-green-400' : 'bg-yellow-500'"></span>
+        <span class="text-slate-400"
+              x-text="systemStatus?.scheduler?.running ? systemStatus.scheduler.job_count + ' jobs' : 'Sched off'"></span>
+      </div>
+      <!-- Render worker -->
+      <div class="flex items-center gap-1.5"
+           x-show="systemStatus?.render_worker"
+           :title="systemStatus?.render_worker?.alive ? 'Render worker alive' : 'Render worker stalled!'">
+        <span class="w-2 h-2 rounded-full inline-block"
+              :class="systemStatus?.render_worker?.alive ? 'bg-green-400' : 'bg-red-500 animate-pulse'"></span>
+        <span class="text-slate-400"
+              x-text="(systemStatus?.pending_renders || 0) > 0 ? systemStatus.pending_renders + ' queued' : 'Render'"></span>
+      </div>
+    </div>
     <!-- Disk gauge (click to open breakdown modal, hover tooltip shows breakdown UI4) -->
     <div class="hidden sm:block relative group">
       <button class="flex items-center gap-2 text-xs text-slate-400 hover:text-slate-200 transition"
@@ -170,6 +207,14 @@
             d="M7 4v16M17 4v16M3 8h4m10 0h4M3 16h4m10 0h4M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/>
     </svg>
     Renders
+  </button>
+  <button @click="view = 'system_log'" class="flex-1 flex flex-col items-center py-2 text-xs gap-0.5"
+          :class="view === 'system_log' ? 'text-blue-400' : 'text-slate-500'">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+    </svg>
+    System
   </button>
   <button @click="openSettings()" class="flex-1 flex flex-col items-center py-2 text-xs gap-0.5"
           :class="view === 'settings' ? 'text-blue-400' : 'text-slate-500'">
@@ -469,7 +514,7 @@
                 <template x-if="proj.status === 'extracting'">
                   <div class="mt-1">
                     <div class="flex justify-between text-xs text-slate-500 mb-0.5">
-                      <span>Extracting…</span>
+                      <span>Extracting<span x-show="proj._extraction_detail" x-text="' ' + proj._extraction_detail"></span>…</span>
                       <span x-text="(proj._extraction_pct || 0) + '%'"></span>
                     </div>
                     <div class="h-1 bg-slate-700 rounded-full overflow-hidden">
@@ -477,6 +522,12 @@
                            :style="`width: ${proj._extraction_pct || 0}%`"></div>
                     </div>
                   </div>
+                </template>
+                <!-- Error/paused_error reason banner -->
+                <template x-if="proj.status === 'error' || proj.status === 'paused_error'">
+                  <div class="mt-1 text-xs text-red-400 bg-red-950/40 rounded px-2 py-1 truncate"
+                       x-text="proj._status_reason || (proj.status === 'paused_error' ? 'Auto-paused after repeated failures' : 'Error — check logs')"
+                       :title="proj._status_reason || ''"></div>
                 </template>
               </div>
               <!-- Quick actions -->
@@ -491,6 +542,12 @@
                   <button @click="resumeProject(proj.id)"
                           class="flex-1 text-xs bg-slate-700 hover:bg-emerald-700 text-slate-300 hover:text-emerald-100 py-1 rounded transition">
                     Resume
+                  </button>
+                </template>
+                <template x-if="proj.project_type === 'historical' && (proj.status === 'error' || proj.status === 'completed')">
+                  <button @click="retryExtraction(proj.id)"
+                          class="flex-1 text-xs bg-slate-700 hover:bg-blue-700 text-slate-300 hover:text-blue-100 py-1 rounded transition">
+                    <span x-text="proj.status === 'error' ? 'Retry' : 'Re-extract'"></span>
                   </button>
                 </template>
                 <button @click="cloneProject(proj.id)"
@@ -1220,6 +1277,89 @@
           </div>
         </template>
       </div>
+    </div>
+  </div>
+
+  <!-- ── SYSTEM LOG ──────────────────────────────────────────────────────── -->
+  <div x-show="view === 'system_log'">
+    <div class="flex items-center gap-3 mb-6">
+      <h1 class="text-xl font-bold text-slate-100">System Status</h1>
+    </div>
+
+    <!-- Status cards -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6" x-show="systemStatus">
+      <div class="bg-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500 mb-1">NVR</div>
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full" :class="systemStatus?.nvr?.connected ? 'bg-green-400' : 'bg-red-500'"></span>
+          <span class="text-sm" :class="systemStatus?.nvr?.connected ? 'text-green-400' : 'text-red-400'"
+                x-text="systemStatus?.nvr?.connected ? systemStatus.nvr.camera_count + ' cameras' : 'Disconnected'"></span>
+        </div>
+        <div class="text-xs text-slate-600 mt-1 truncate" x-show="systemStatus?.nvr?.last_error" x-text="systemStatus?.nvr?.last_error"></div>
+      </div>
+      <div class="bg-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500 mb-1">Scheduler</div>
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full" :class="systemStatus?.scheduler?.running ? 'bg-green-400' : 'bg-yellow-500'"></span>
+          <span class="text-sm text-slate-200" x-text="(systemStatus?.scheduler?.job_count || 0) + ' jobs'"></span>
+        </div>
+      </div>
+      <div class="bg-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500 mb-1">Render Worker</div>
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full" :class="systemStatus?.render_worker?.alive ? 'bg-green-400' : 'bg-red-500'"></span>
+          <span class="text-sm text-slate-200" x-text="(systemStatus?.pending_renders || 0) + ' queued'"></span>
+        </div>
+      </div>
+      <div class="bg-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500 mb-1">Disk</div>
+        <div class="text-sm text-slate-200" x-text="(systemStatus?.disk?.free_gb || 0).toFixed(1) + ' / ' + (systemStatus?.disk?.total_gb || 0).toFixed(1) + ' GB'"></div>
+        <div class="text-xs text-slate-500 mt-1" x-text="'WAL: ' + (systemStatus?.db?.wal_size_mb || 0).toFixed(1) + ' MB'"></div>
+      </div>
+    </div>
+
+    <!-- Projects by status -->
+    <div class="bg-slate-800 rounded-xl p-4 mb-6" x-show="systemStatus?.projects">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">Projects by Status</h2>
+      <div class="flex flex-wrap gap-3">
+        <template x-for="[status, count] in Object.entries(systemStatus?.projects || {})" :key="status">
+          <div class="flex items-center gap-1.5 text-xs">
+            <span class="w-2 h-2 rounded-full"
+                  :class="{
+                    active: 'bg-green-400',
+                    paused: 'bg-yellow-400',
+                    paused_error: 'bg-red-400',
+                    error: 'bg-red-500',
+                    completed: 'bg-blue-400',
+                    extracting: 'bg-purple-400',
+                  }[status] || 'bg-slate-500'"></span>
+            <span class="text-slate-300" x-text="status"></span>
+            <span class="text-slate-500" x-text="'(' + count + ')'"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Recent errors/warnings -->
+    <div class="bg-slate-800 rounded-xl p-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">Recent Errors &amp; Warnings</h2>
+      <div class="space-y-2 max-h-96 overflow-y-auto" x-show="systemStatus?.recent_errors?.length">
+        <template x-for="err in systemStatus?.recent_errors || []" :key="err.id">
+          <div class="flex items-start gap-3 text-xs p-2 rounded-lg"
+               :class="err.level === 'error' ? 'bg-red-950/30 border border-red-900/50' : 'bg-yellow-950/30 border border-yellow-900/50'">
+            <span class="shrink-0 mt-0.5 w-2 h-2 rounded-full"
+                  :class="err.level === 'error' ? 'bg-red-500' : 'bg-yellow-500'"></span>
+            <div class="min-w-0 flex-1">
+              <div class="text-slate-300 break-words" x-text="err.message"></div>
+              <div class="text-slate-600 mt-0.5" x-text="err.created_at ? new Date(err.created_at).toLocaleString() : ''"></div>
+            </div>
+            <button x-show="err.project_id"
+                    @click="openProject(projects.find(p => p.id === err.project_id))"
+                    class="text-blue-400 hover:text-blue-300 shrink-0">→</button>
+          </div>
+        </template>
+      </div>
+      <div x-show="!systemStatus?.recent_errors?.length" class="text-sm text-slate-500">No recent errors.</div>
     </div>
   </div>
 
