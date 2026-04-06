@@ -47,8 +47,8 @@ COPY --from=css-build /src/app.css ./static/app.css
 
 # Non-root user for security (B9)
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data && \
-    chown appuser:appuser /data
+    mkdir -p /data /home/appuser/.config/ufp && \
+    chown -R appuser:appuser /data /home/appuser/.config/ufp
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
