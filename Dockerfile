@@ -1,5 +1,5 @@
 # ── Stage 1: Compile Tailwind CSS ───────────────────────────────────────────
-FROM node:22-slim AS css-build
+FROM node:25-slim AS css-build
 
 WORKDIR /src
 COPY package.json .
