@@ -109,6 +109,7 @@ async def update_settings(payload: SettingsUpdate) -> dict:
     if any(k in _GEO_FIELDS for k in data):
         with contextlib.suppress(Exception):
             from app.capture import invalidate_location_cache
+
             invalidate_location_cache()
 
     # Re-register maintenance job if schedule changed
@@ -117,6 +118,7 @@ async def update_settings(payload: SettingsUpdate) -> dict:
         with contextlib.suppress(Exception):
             from app.capture import scheduler
             from app.maintenance import register_maintenance_job
+
             register_maintenance_job(scheduler)
 
     return _get_settings_row()

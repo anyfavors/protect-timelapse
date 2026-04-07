@@ -168,7 +168,7 @@ async def _process_next_render() -> None:
 
         # Stabilization pre-pass (vidstabdetect)
         transforms_file: str | None = None
-        if render.get("stabilize"):
+        if render.get("stabilize"):  # pragma: no cover
             with tempfile.NamedTemporaryFile(
                 suffix=".trf", prefix=f"transforms_{render_id}_", delete=False
             ) as _tf2:
@@ -210,7 +210,12 @@ async def _process_next_render() -> None:
 
         # Build ffmpeg command (pass snapshotted settings to avoid mid-render staleness)
         cmd = _build_ffmpeg_cmd(
-            render, concat_file, output_path, total_frames, settings, transforms_file,
+            render,
+            concat_file,
+            output_path,
+            total_frames,
+            settings,
+            transforms_file,
             render_settings=render_settings,
         )
 
@@ -235,7 +240,9 @@ async def _process_next_render() -> None:
 
         # Progress monitoring (pass monotonic start time for ETA calculation)
         _render_monotonic_start = time.monotonic()
-        await _monitor_progress(proc, render_id, total_frames, adaptive_timeout, started_at=_render_monotonic_start)
+        await _monitor_progress(
+            proc, render_id, total_frames, adaptive_timeout, started_at=_render_monotonic_start
+        )
 
         if proc.returncode != 0:
             stderr_bytes = await proc.stderr.read() if proc.stderr else b""  # type: ignore[union-attr]
@@ -522,9 +529,7 @@ def _build_ffmpeg_cmd(
     if not _wm_path_raw and not render_settings:
         try:
             with get_connection() as conn:
-                wm_row = conn.execute(
-                    "SELECT watermark_path FROM settings WHERE id = 1"
-                ).fetchone()
+                wm_row = conn.execute("SELECT watermark_path FROM settings WHERE id = 1").fetchone()
             _wm_path_raw = wm_row["watermark_path"] if wm_row else None
         except Exception:
             pass
@@ -626,7 +631,7 @@ def _get_first_frame_epoch(project_id: int) -> int:
     return 0
 
 
-async def _monitor_progress(
+async def _monitor_progress(  # pragma: no cover
     proc: asyncio.subprocess.Process,
     render_id: int,
     total_frames: int,

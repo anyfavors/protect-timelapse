@@ -343,9 +343,7 @@ def test_is_daylight_returns_bool(tmp_db: Path, monkeypatch: pytest.MonkeyPatch)
     assert isinstance(result, bool)
 
 
-def test_is_solar_noon_window_returns_bool(
-    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_is_solar_noon_window_returns_bool(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_is_solar_noon_window returns True or False for a project with window settings."""
     import app.capture as cap_mod
     import app.config as config_mod
@@ -382,9 +380,7 @@ def test_reschedule_project_job_no_existing_job(
     assert 99999 in registered
 
 
-def test_resume_project_job_no_existing_job(
-    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resume_project_job_no_existing_job(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """resume_project_job falls back to _register_job when job doesn't exist."""
     import app.capture as cap_mod
 
@@ -397,7 +393,91 @@ def test_resume_project_job_no_existing_job(
 
     import asyncio
 
-    asyncio.get_event_loop().run_until_complete(
-        cap_mod.resume_project_job(99998, 60, "continuous")
-    )
+    asyncio.get_event_loop().run_until_complete(cap_mod.resume_project_job(99998, 60, "continuous"))
     assert 99998 in registered
+
+
+# ===========================================================================
+# _is_in_schedule and _check_capture_mode
+# ===========================================================================
+
+
+def test_is_in_schedule_within_window(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_is_in_schedule returns True when local time falls within schedule window."""
+    import app.capture as cap_mod
+
+    # Build a project that always matches (Mon-Sun, 00:00-23:59)
+    project = {
+        "id": 1,
+        "schedule_days": "1,2,3,4,5,6,7",
+        "schedule_start_time": "00:00",
+        "schedule_end_time": "23:59",
+    }
+    result = cap_mod._is_in_schedule(project, "Europe/Copenhagen")
+    assert result is True
+
+
+def test_is_in_schedule_outside_time_window(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_is_in_schedule returns False when current time is outside the allowed window."""
+    import app.capture as cap_mod
+
+    # Restrict schedule to only 00:00-00:01 — almost certainly outside during test runs
+    project = {
+        "id": 1,
+        "schedule_days": "1,2,3,4,5,6,7",
+        "schedule_start_time": "00:00",
+        "schedule_end_time": "00:01",
+    }
+    import datetime
+    import zoneinfo
+
+    local_now = datetime.datetime.now(zoneinfo.ZoneInfo("Europe/Copenhagen"))
+    current_minutes = local_now.hour * 60 + local_now.minute
+    if current_minutes <= 1:
+        # Edge case: running exactly at midnight — skip rather than flake
+        return
+
+    result = cap_mod._is_in_schedule(project, "Europe/Copenhagen")
+    assert result is False
+
+
+def test_is_in_schedule_invalid_time_fails_open(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_is_in_schedule returns True (fail open) for malformed time strings."""
+    import app.capture as cap_mod
+
+    project = {
+        "id": 1,
+        "schedule_days": "1,2,3,4,5,6,7",
+        "schedule_start_time": "bad",
+        "schedule_end_time": "also_bad",
+    }
+    result = cap_mod._is_in_schedule(project, "Europe/Copenhagen")
+    assert result is True
+
+
+def test_check_capture_mode_continuous(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_check_capture_mode returns True for continuous mode."""
+    import app.capture as cap_mod
+
+    assert cap_mod._check_capture_mode({"capture_mode": "continuous"}) is True
+    assert cap_mod._check_capture_mode({}) is True  # default
+
+
+def test_check_capture_mode_schedule(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_check_capture_mode delegates to _is_in_schedule for schedule mode."""
+    import app.capture as cap_mod
+    import app.config as config_mod
+
+    monkeypatch.setenv("TZ", "Europe/Copenhagen")
+    monkeypatch.setattr(config_mod, "_settings", None)
+
+    project = {
+        "capture_mode": "schedule",
+        "schedule_days": "1,2,3,4,5,6,7",
+        "schedule_start_time": "00:00",
+        "schedule_end_time": "23:59",
+    }
+    result = cap_mod._check_capture_mode(project)
+    assert isinstance(result, bool)

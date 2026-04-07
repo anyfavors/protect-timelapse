@@ -399,7 +399,9 @@ def test_estimate_render_with_frames(tmp_db: Path, monkeypatch: pytest.MonkeyPat
 # ===========================================================================
 
 
-def test_get_frame_paths_range(tmp_db: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_get_frame_paths_range(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """_get_frame_paths returns only frames within the range window."""
     import app.database as db_mod
     import app.render as render_mod
@@ -494,6 +496,7 @@ def test_build_ffmpeg_cmd_valid_lut(tmp_db: Path, monkeypatch: pytest.MonkeyPatc
     cmd_str = " ".join(cmd)
     # lut3d filter only included if the neutral.cube file exists
     import os
+
     lut_path = os.path.join(render_mod._LUT_DIR, "neutral.cube")
     if os.path.exists(lut_path):
         assert "lut3d" in cmd_str
@@ -678,7 +681,9 @@ class _noop_conn:
 # ===========================================================================
 
 
-def test_recording_range_with_stats(camera_api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recording_range_with_stats(
+    camera_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Returns earliest/latest when camera stats are available."""
     import app.protect as protect_mod
 
@@ -697,7 +702,9 @@ def test_recording_range_with_stats(camera_api: TestClient, monkeypatch: pytest.
 
     mock_client = MagicMock()
     mock_client.bootstrap.cameras = {"cam-x": cam}
-    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+    monkeypatch.setattr(
+        protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client)
+    )
 
     r = camera_api.get("/api/cameras/cam-x/recording-range")
     assert r.status_code == 200
@@ -716,7 +723,9 @@ def test_recording_range_no_stats(camera_api: TestClient, monkeypatch: pytest.Mo
 
     mock_client = MagicMock()
     mock_client.bootstrap.cameras = {"cam-y": cam}
-    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+    monkeypatch.setattr(
+        protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client)
+    )
 
     r = camera_api.get("/api/cameras/cam-y/recording-range")
     assert r.status_code == 200
@@ -726,12 +735,16 @@ def test_recording_range_no_stats(camera_api: TestClient, monkeypatch: pytest.Mo
     assert data["latest"] is None
 
 
-def test_recording_range_camera_not_found(camera_api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recording_range_camera_not_found(
+    camera_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.protect as protect_mod
 
     mock_client = MagicMock()
     mock_client.bootstrap.cameras = {}
-    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+    monkeypatch.setattr(
+        protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client)
+    )
 
     r = camera_api.get("/api/cameras/ghost/recording-range")
     assert r.status_code == 404

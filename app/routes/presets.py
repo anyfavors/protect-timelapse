@@ -17,9 +17,7 @@ class PresetCreate(BaseModel):
     framerate: int = Field(default=30, ge=1, le=120)
     resolution: str = Field(default="1920x1080", pattern=r"^\d{1,5}x\d{1,5}$")
     quality: str = Field(default="standard", pattern="^(draft|standard|high|archive)$")
-    flicker_reduction: str = Field(
-        default="standard", pattern="^(off|standard|strong|holy_grail)$"
-    )
+    flicker_reduction: str = Field(default="standard", pattern="^(off|standard|strong|holy_grail)$")
     frame_blend: bool = False
     stabilize: bool = False
     color_grade: str = Field(default="none", pattern="^(none|neutral|warm|cool|cinematic)$")
@@ -31,9 +29,7 @@ def _row_to_dict(row: Any) -> dict:
 
 def _get_preset_or_404(preset_id: int) -> dict:
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM render_presets WHERE id = ?", (preset_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM render_presets WHERE id = ?", (preset_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"Preset {preset_id} not found")
     return _row_to_dict(row)

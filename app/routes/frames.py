@@ -235,7 +235,6 @@ def list_dark_frames(project_id: int, limit: int = Query(default=100, ge=1, le=5
 
 @router.delete("/projects/{project_id}/frames/{frame_id}", status_code=204)
 def delete_frame(project_id: int, frame_id: int) -> None:
-
     frame = _get_frame_or_404(project_id, frame_id)
 
     # Remove files from disk before DB row (safe to retry if DB fails)
@@ -512,7 +511,9 @@ _gif_jobs: dict[int, dict] = {}
 
 @router.post("/projects/{project_id}/gif", status_code=202)
 @limiter.limit("5/minute")
-async def start_gif_export(request: Request, project_id: int, background_tasks: BackgroundTasks) -> dict:
+async def start_gif_export(
+    request: Request, project_id: int, background_tasks: BackgroundTasks
+) -> dict:
     _get_project_or_404(project_id)
     _gif_jobs[project_id] = {"status": "pending", "path": None, "error": None}
     background_tasks.add_task(_run_gif_export, project_id)
@@ -625,6 +626,7 @@ async def _run_gif_export(project_id: int) -> None:
             import asyncio as _asyncio
 
             from app.notifications import notify
+
             _asyncio.get_event_loop().create_task(
                 notify(
                     event="gif_export_failed",

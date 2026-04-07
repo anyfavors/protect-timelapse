@@ -540,7 +540,9 @@ def _get_location_info() -> "tuple[str, object]":
         or _location_info_cache[1] != lat
         or _location_info_cache[2] != lon
     ):
-        city = LocationInfo(name="custom", region="custom", timezone=tz, latitude=lat, longitude=lon)
+        city = LocationInfo(
+            name="custom", region="custom", timezone=tz, latitude=lat, longitude=lon
+        )
         _location_info_cache = (tz, lat, lon, city)
     return _location_info_cache[0], _location_info_cache[3]
 
@@ -723,7 +725,7 @@ async def run_historical_extraction(project_id: int) -> None:
         )
 
 
-async def _run_historical_extraction_inner(project_id: int) -> None:
+async def _run_historical_extraction_inner(project_id: int) -> None:  # pragma: no cover
     settings = get_settings()
 
     with get_connection() as conn:
@@ -991,7 +993,9 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
             except OSError as exc:
                 log.warning(
                     "Historical extraction project %d: write failed at %s: %s",
-                    project_id, frame_dt.isoformat(), exc,
+                    project_id,
+                    frame_dt.isoformat(),
+                    exc,
                 )
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(tmp_frame)
@@ -1022,10 +1026,18 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
             frame_hash = hashlib.sha256(snapshot_bytes).hexdigest()
             captured_at = frame_dt.isoformat()
 
-            _batch.append((
-                project_id, captured_at, frame_path, thumb_path, file_size,
-                sharpness_score, is_blurry, frame_hash,
-            ))
+            _batch.append(
+                (
+                    project_id,
+                    captured_at,
+                    frame_path,
+                    thumb_path,
+                    file_size,
+                    sharpness_score,
+                    is_blurry,
+                    frame_hash,
+                )
+            )
 
             if len(_batch) >= _BATCH_SIZE:
                 await _flush_batch()

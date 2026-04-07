@@ -110,9 +110,18 @@ def _insert_frame(project_id: int, tmp_path: Path, is_dark: int = 0) -> int:
         cur = conn.execute(
             "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size, is_dark)"
             " VALUES (?,?,?,?,?,?)",
-            (project_id, "2024-01-01T12:00:00", str(frame_file), str(thumb_file), len(jpeg), is_dark),
+            (
+                project_id,
+                "2024-01-01T12:00:00",
+                str(frame_file),
+                str(thumb_file),
+                len(jpeg),
+                is_dark,
+            ),
         )
-        conn.execute("UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?", (project_id,))
+        conn.execute(
+            "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?", (project_id,)
+        )
         conn.commit()
     return cur.lastrowid  # type: ignore[return-value]
 
@@ -211,7 +220,9 @@ def test_pin_unpin_project(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.Mon
     assert row["is_pinned"] == 0
 
 
-def test_pinned_projects_sort_first(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pinned_projects_sort_first(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     id1 = _insert_project("Alpha")
     id2 = _insert_project("Beta")
@@ -246,7 +257,9 @@ def test_project_capacity(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.Monk
     assert data["frame_count"] == 1
 
 
-def test_project_capacity_not_found(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_project_capacity_not_found(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     r = api.get("/api/projects/9999/capacity")
     assert r.status_code == 404
@@ -257,7 +270,9 @@ def test_project_capacity_not_found(tmp_db: Path, tmp_path: Path, monkeypatch: p
 # ===========================================================================
 
 
-def test_render_pause_pending(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_render_pause_pending(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     pid = _insert_project()
     rid = _insert_render(pid, status="pending")
@@ -285,7 +300,9 @@ def test_render_resume(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert row["status"] == "pending"
 
 
-def test_render_pause_wrong_state(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_render_pause_wrong_state(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     pid = _insert_project()
     rid = _insert_render(pid, status="done")
@@ -294,7 +311,9 @@ def test_render_pause_wrong_state(tmp_db: Path, tmp_path: Path, monkeypatch: pyt
     assert r.status_code == 409
 
 
-def test_render_resume_wrong_state(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_render_resume_wrong_state(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     pid = _insert_project()
     rid = _insert_render(pid, status="pending")
@@ -308,7 +327,9 @@ def test_render_resume_wrong_state(tmp_db: Path, tmp_path: Path, monkeypatch: py
 # ===========================================================================
 
 
-def test_list_renders_has_eta_field(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_list_renders_has_eta_field(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     pid = _insert_project()
     _insert_render(pid, status="pending")
@@ -327,7 +348,9 @@ def test_list_renders_has_eta_field(tmp_db: Path, tmp_path: Path, monkeypatch: p
 # ===========================================================================
 
 
-def test_settings_maintenance_window(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_maintenance_window(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
 
     r = api.put("/api/settings", json={"maintenance_hour": 3, "maintenance_minute": 30})
@@ -341,7 +364,9 @@ def test_settings_maintenance_window(tmp_db: Path, tmp_path: Path, monkeypatch: 
     assert row["maintenance_minute"] == 30
 
 
-def test_settings_nvr_backoff(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_nvr_backoff(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
 
     r = api.put("/api/settings", json={"nvr_reconnect_backoff_seconds": 60})
@@ -354,7 +379,9 @@ def test_settings_nvr_backoff(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.
     assert row["nvr_reconnect_backoff_seconds"] == 60
 
 
-def test_settings_muted_project_ids(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_muted_project_ids(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
 
     r = api.put("/api/settings", json={"muted_project_ids": [1, 2, 3]})
@@ -363,6 +390,7 @@ def test_settings_muted_project_ids(tmp_db: Path, tmp_path: Path, monkeypatch: p
     with get_connection() as conn:
         row = conn.execute("SELECT muted_project_ids FROM settings WHERE id = 1").fetchone()
     import json
+
     assert json.loads(row["muted_project_ids"]) == [1, 2, 3]
 
 
@@ -371,7 +399,9 @@ def test_settings_muted_project_ids(tmp_db: Path, tmp_path: Path, monkeypatch: p
 # ===========================================================================
 
 
-def test_manual_maintenance_trigger(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_manual_maintenance_trigger(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.maintenance as _maint_mod
 
     called = []
@@ -405,7 +435,9 @@ def test_backup_endpoint(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_notification_suppressed_for_muted_project(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_notification_suppressed_for_muted_project(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import json
 
     import app.database as db_mod
@@ -446,7 +478,9 @@ async def test_notification_suppressed_for_muted_project(tmp_db: Path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_notification_not_suppressed_for_unmuted_project(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_notification_not_suppressed_for_unmuted_project(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.database as db_mod
     import app.notifications as notif_mod
 
@@ -544,7 +578,12 @@ def test_schema_v9_columns_exist(tmp_db: Path) -> None:
         # settings new columns
         info = conn.execute("PRAGMA table_info(settings)").fetchall()
         cols = [r["name"] for r in info]
-        for col in ("maintenance_hour", "maintenance_minute", "nvr_reconnect_backoff_seconds", "muted_project_ids"):
+        for col in (
+            "maintenance_hour",
+            "maintenance_minute",
+            "nvr_reconnect_backoff_seconds",
+            "muted_project_ids",
+        ):
             assert col in cols, f"Missing settings column: {col}"
 
         # frames.file_hash
@@ -567,7 +606,9 @@ def test_schema_v10_index_exists(tmp_db: Path) -> None:
 # ===========================================================================
 
 
-def test_estimate_render_excludes_blurry(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_estimate_render_excludes_blurry(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.config as config_mod
 
     monkeypatch.setenv("FRAMES_PATH", str(tmp_path / "frames"))
@@ -587,13 +628,13 @@ def test_estimate_render_excludes_blurry(tmp_db: Path, tmp_path: Path, monkeypat
             conn.execute(
                 "INSERT INTO frames (project_id, captured_at, file_path, file_size, is_dark, is_blurry)"
                 " VALUES (?,?,?,?,0,0)",
-                (pid, f"2024-01-01T{10+i:02d}:00:00", f"/tmp/f{i}.jpg", 100_000),
+                (pid, f"2024-01-01T{10 + i:02d}:00:00", f"/tmp/f{i}.jpg", 100_000),
             )
         for i in range(2):
             conn.execute(
                 "INSERT INTO frames (project_id, captured_at, file_path, file_size, is_dark, is_blurry)"
                 " VALUES (?,?,?,?,0,1)",
-                (pid, f"2024-01-01T{13+i:02d}:00:00", f"/tmp/b{i}.jpg", 100_000),
+                (pid, f"2024-01-01T{13 + i:02d}:00:00", f"/tmp/b{i}.jpg", 100_000),
             )
         conn.execute("UPDATE projects SET frame_count = 5 WHERE id = ?", (pid,))
         conn.commit()
@@ -620,7 +661,9 @@ def test_metrics_endpoint(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.Monk
 # ===========================================================================
 
 
-def test_log_endpoint_no_source(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_log_endpoint_no_source(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     r = api.get("/api/logs")
     assert r.status_code == 200
@@ -628,7 +671,9 @@ def test_log_endpoint_no_source(tmp_db: Path, tmp_path: Path, monkeypatch: pytes
     assert "lines" in data
 
 
-def test_log_endpoint_with_file(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_log_endpoint_with_file(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _make_app(tmp_db, tmp_path, monkeypatch)
     log_file = tmp_path / "test.log"
     log_file.write_text("line1\nline2\nline3\n")
@@ -673,7 +718,9 @@ async def test_vacuum_runs_on_first_of_month(tmp_db: Path, monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_recover_stalled_renders(tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_recover_stalled_renders(
+    tmp_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import app.config as config_mod
     import app.database as db_mod
     import app.maintenance as maint_mod
