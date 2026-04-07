@@ -359,7 +359,8 @@ def test_is_solar_noon_window_returns_bool(tmp_db: Path, monkeypatch: pytest.Mon
     assert isinstance(result, bool)
 
 
-def test_reschedule_project_job_no_existing_job(
+@pytest.mark.asyncio
+async def test_reschedule_project_job_no_existing_job(
     tmp_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """reschedule_project_job falls back to _register_job when job doesn't exist."""
@@ -371,16 +372,14 @@ def test_reschedule_project_job_no_existing_job(
         registered.append(pid)
 
     monkeypatch.setattr(cap_mod, "_register_job", _fake_register)
-    # Ensure job doesn't exist (fresh scheduler)
-    import asyncio
-
-    asyncio.get_event_loop().run_until_complete(
-        cap_mod.reschedule_project_job(99999, 60, "continuous")
-    )
+    await cap_mod.reschedule_project_job(99999, 60, "continuous")
     assert 99999 in registered
 
 
-def test_resume_project_job_no_existing_job(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_resume_project_job_no_existing_job(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """resume_project_job falls back to _register_job when job doesn't exist."""
     import app.capture as cap_mod
 
@@ -390,10 +389,7 @@ def test_resume_project_job_no_existing_job(tmp_db: Path, monkeypatch: pytest.Mo
         registered.append(pid)
 
     monkeypatch.setattr(cap_mod, "_register_job", _fake_register)
-
-    import asyncio
-
-    asyncio.get_event_loop().run_until_complete(cap_mod.resume_project_job(99998, 60, "continuous"))
+    await cap_mod.resume_project_job(99998, 60, "continuous")
     assert 99998 in registered
 
 

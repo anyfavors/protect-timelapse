@@ -559,7 +559,7 @@ def _is_daylight() -> bool:
     tz, city = _get_location_info()
     now = datetime.now(UTC)
     try:
-        s = sun(city.observer, date=now.date(), tzinfo=tz)  # type: ignore[union-attr]
+        s = sun(city.observer, date=now.date(), tzinfo=tz)  # type: ignore[union-attr,attr-defined]
         return s["sunrise"] <= now <= s["sunset"]
     except Exception:
         # If astral fails (e.g. polar night), allow capture
@@ -591,7 +591,7 @@ def _is_solar_noon_window(project: dict) -> bool:
 
     try:
         now = datetime.now(UTC)
-        s = sun(city.observer, date=now.date(), tzinfo=tz_name)  # type: ignore[union-attr]
+        s = sun(city.observer, date=now.date(), tzinfo=tz_name)  # type: ignore[union-attr,attr-defined]
         noon = s["noon"]
         diff_minutes = abs((now - noon).total_seconds()) / 60
         return diff_minutes <= window
@@ -843,7 +843,7 @@ async def _run_historical_extraction_inner(project_id: int) -> None:  # pragma: 
         filtered_ts: list[datetime] = []
         for _ts in timestamps:
             with contextlib.suppress(Exception):
-                _s = _astral_sun(city_hist.observer, date=_ts.date(), tzinfo=tz_name_hist)  # type: ignore[union-attr]
+                _s = _astral_sun(city_hist.observer, date=_ts.date(), tzinfo=tz_name_hist)  # type: ignore[union-attr,attr-defined]
                 if _s["sunrise"] <= _ts <= _s["sunset"]:
                     filtered_ts.append(_ts)
                 continue
