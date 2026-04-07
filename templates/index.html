@@ -6,9 +6,9 @@
   <title>Protect Timelapse</title>
 
   <!-- app.js MUST come before Alpine so alpine:init fires correctly -->
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v={{ js_hash }}" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/app.css?v={{ css_hash }}" />
 </head>
 
 <body class="bg-slate-950 text-slate-100 min-h-screen" x-data="timelapseApp()">
@@ -259,12 +259,11 @@
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-2xl font-bold text-slate-100">Render Queue</h1>
       <div class="flex items-center gap-2">
-        <!-- Auto-refresh toggle (UX10) -->
         <button @click="toggleRenderAutoRefresh()"
                 :class="renderAutoRefresh ? 'bg-blue-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'"
                 class="text-xs px-3 py-1.5 rounded-lg transition"
                 :title="renderAutoRefresh ? 'Auto-refresh on (every 7s)' : 'Enable auto-refresh'">
-          <span x-text="renderAutoRefresh ? '⟳ Auto' : '⟳ Auto'"></span>
+          ⟳ Auto
           <span class="ml-1 w-1.5 h-1.5 rounded-full inline-block"
                 :class="renderAutoRefresh ? 'bg-blue-300 animate-pulse' : 'bg-slate-600'"></span>
         </button>
@@ -279,62 +278,105 @@
       <div class="text-center py-20 text-slate-500">No renders yet.</div>
     </template>
 
-    <div class="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden">
-      <table class="w-full text-sm">
-        <thead>
-          <tr class="border-b border-slate-700 text-xs text-slate-400 uppercase tracking-wide">
-            <th class="text-left px-4 py-3">Project</th>
-            <th class="text-left px-4 py-3 hidden sm:table-cell">Type</th>
-            <th class="text-left px-4 py-3">Status</th>
-            <th class="text-left px-4 py-3 hidden md:table-cell">Progress</th>
-            <th class="text-left px-4 py-3 hidden lg:table-cell">Size</th>
-            <th class="text-left px-4 py-3 hidden lg:table-cell">Created</th>
-            <th class="text-right px-4 py-3">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          <template x-for="r in allRenders" :key="r.id">
-            <tr class="border-b border-slate-700/50 hover:bg-slate-700/30 transition">
-              <td class="px-4 py-3 text-slate-200" x-text="r.project_name || ('#' + r.project_id)"></td>
-              <td class="px-4 py-3 text-slate-400 capitalize hidden sm:table-cell" x-text="r.render_type"></td>
-              <td class="px-4 py-3">
+    <!-- Render cards -->
+    <div class="space-y-3">
+      <template x-for="r in allRenders" :key="r.id">
+        <div class="bg-slate-800 border border-slate-700 rounded-xl p-4 hover:border-slate-600 transition"
+             :class="r.status === 'rendering' ? 'border-blue-700/60' : ''">
+          <div class="flex items-start justify-between gap-4">
+
+            <!-- Left: info -->
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="font-medium text-slate-100 truncate"
+                      x-text="r.project_name || ('#' + r.project_id)"></span>
+                <span class="text-xs text-slate-500" x-text="'#' + r.id"></span>
+                <!-- Status badge -->
                 <span class="px-2 py-0.5 rounded-full text-xs font-medium"
                       :class="{
                         'bg-yellow-700/50 text-yellow-300': r.status === 'pending',
-                        'bg-blue-700/50 text-blue-300': r.status === 'rendering',
+                        'bg-blue-700/50 text-blue-300 animate-pulse': r.status === 'rendering',
                         'bg-emerald-700/50 text-emerald-300': r.status === 'done',
                         'bg-red-700/50 text-red-300': r.status === 'error',
                       }"
                       x-text="r.status"></span>
-              </td>
-              <td class="px-4 py-3 hidden md:table-cell">
-                <div class="w-24 h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                  <div class="h-full bg-blue-500 rounded-full transition-all"
-                       :style="`width:${r.progress_pct || 0}%`"></div>
+              </div>
+
+              <!-- Metadata row -->
+              <div class="flex items-center gap-3 mt-1 text-xs text-slate-400 flex-wrap">
+                <span class="capitalize" x-text="r.render_type?.replace('_', ' ')"></span>
+                <span x-show="r.resolution" x-text="r.resolution"></span>
+                <span x-show="r.framerate" x-text="r.framerate + ' fps'"></span>
+                <span x-show="r.quality" class="capitalize" x-text="r.quality"></span>
+                <span x-show="r.file_size" x-text="(r.file_size / 1048576).toFixed(1) + ' MB'"></span>
+                <span x-show="r.estimated_duration_seconds && r.status !== 'done'" class="text-slate-500"
+                      x-text="'~' + Math.round(r.estimated_duration_seconds) + 's video'"></span>
+                <span class="text-slate-600" x-text="formatDate(r.created_at)"></span>
+              </div>
+
+              <!-- Error message -->
+              <div x-show="r.status === 'error' && r.error_msg"
+                   class="mt-2 text-xs text-red-400 bg-red-900/20 rounded px-2 py-1 font-mono break-all"
+                   x-text="r.error_msg"></div>
+
+              <!-- Progress bar (rendering or done) -->
+              <template x-if="r.status === 'rendering' || (r.status === 'done' && r.progress_pct > 0)">
+                <div class="mt-3">
+                  <div class="flex items-center justify-between text-xs text-slate-400 mb-1">
+                    <span x-text="r.status === 'done' ? 'Complete' : 'Encoding…'"></span>
+                    <span x-text="(r.progress_pct || 0) + '%'"></span>
+                  </div>
+                  <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
+                    <div class="h-full rounded-full transition-all duration-500"
+                         :class="r.status === 'done' ? 'bg-emerald-500' : 'bg-blue-500'"
+                         :style="`width:${r.progress_pct || 0}%`"></div>
+                  </div>
                 </div>
-              </td>
-              <td class="px-4 py-3 text-slate-400 hidden lg:table-cell"
-                  x-text="r.file_size_bytes ? (r.file_size_bytes / 1048576).toFixed(1) + ' MB' : '—'"></td>
-              <td class="px-4 py-3 text-slate-400 hidden lg:table-cell"
-                  x-text="formatDate(r.created_at)"></td>
-              <td class="px-4 py-3 text-right">
-                <div class="flex justify-end gap-2">
-                  <template x-if="r.status === 'done'">
-                    <a :href="`/api/renders/${r.id}/download`"
-                       class="text-xs bg-blue-700 hover:bg-blue-600 text-blue-100 px-2 py-1 rounded transition">
-                      Download
-                    </a>
-                  </template>
-                  <button @click="deleteRender(r.id)"
-                          class="text-xs bg-slate-700 hover:bg-red-800 text-slate-400 hover:text-red-200 px-2 py-1 rounded transition">
-                    ✕
-                  </button>
+              </template>
+
+              <!-- Pending queue position -->
+              <template x-if="r.status === 'pending'">
+                <div class="mt-2 text-xs text-slate-500">
+                  Waiting in queue
+                  <span x-show="r.priority && r.priority !== 5"
+                        x-text="' · priority ' + r.priority"></span>
                 </div>
-              </td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
+              </template>
+            </div>
+
+            <!-- Right: actions -->
+            <div class="flex flex-col gap-2 items-end shrink-0">
+              <!-- Play -->
+              <template x-if="r.status === 'done'">
+                <button @click="openVideoPlayer(r.id)"
+                        class="flex items-center gap-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 text-emerald-100 px-3 py-1.5 rounded-lg transition font-medium">
+                  <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M6.3 2.84A1.5 1.5 0 004 4.11v11.78a1.5 1.5 0 002.3 1.27l9.344-5.891a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                  </svg>
+                  Play
+                </button>
+              </template>
+              <!-- Download -->
+              <template x-if="r.status === 'done'">
+                <a :href="`/api/renders/${r.id}/download`"
+                   class="flex items-center gap-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-3 py-1.5 rounded-lg transition">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                  </svg>
+                  Download
+                </a>
+              </template>
+              <!-- Delete -->
+              <button @click="deleteRender(r.id)"
+                      class="text-xs text-slate-500 hover:text-red-400 hover:bg-red-900/20 px-2 py-1 rounded transition">
+                Delete
+              </button>
+            </div>
+
+          </div>
+        </div>
+      </template>
     </div>
   </div>
 

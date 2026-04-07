@@ -1,5 +1,4 @@
-"""
-Tests for new features added in fixes round 2.
+"""Tests for batch operations and API utilities.
 Covers: batch frame delete, CSV export, analyze-interval, render cancel,
         render compare, render priority, schedule-test, health probes,
         pool-stats, maintenance backup, frame filter params.

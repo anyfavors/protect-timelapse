@@ -80,6 +80,19 @@ document.addEventListener('alpine:init', () => {
     renderFrameBlend: false,
     renderStabilize: false,
     renderColorGrade: 'none',
+    renderPresets: [],
+
+    // Scrubber quality filter
+    scrubberQualityFilter: 'all',  // all | dark | blurry | bookmarked
+
+    // Interval analyzer
+    intervalAnalyzer: { targetMinutes: 2, targetFps: 30, result: null },
+
+    // Pinned / muted state
+    mutedProjectIds: [],
+
+    // Drag-to-reorder state for render queue
+    dragRenderFrom: null,
 
     // Render comparison & video player
     compareRenders: [],
@@ -93,8 +106,12 @@ document.addEventListener('alpine:init', () => {
     async init() {
       // Load settings first so theme is applied before anything renders
       const s = await this.api('/api/settings');
-      if (s) this.loadTheme(s.dark_mode);
-      else this.loadTheme(true);
+      if (s) {
+        this.loadTheme(s.dark_mode);
+        if (s.muted_project_ids) {
+          try { this.mutedProjectIds = JSON.parse(s.muted_project_ids); } catch(e) { this.mutedProjectIds = []; }
+        }
+      } else this.loadTheme(true);
       this.initKeyboardShortcuts();
       await this.loadAll();
       this.connectWebSocket();
@@ -112,12 +129,15 @@ document.addEventListener('alpine:init', () => {
       this.darkMode = !this.darkMode;
       document.documentElement.classList.toggle('dark', this.darkMode);
       localStorage.setItem('darkMode', String(this.darkMode));
+      // Keep settingsData in sync so saveSettings() doesn't overwrite the toggle
+      if (this.settingsData) this.settingsData.dark_mode = this.darkMode ? 1 : 0;
       // Await save — revert on failure so UI stays consistent (#29)
       const result = await this.api('/api/settings', 'PUT', { dark_mode: this.darkMode });
       if (!result) {
         this.darkMode = !this.darkMode;
         document.documentElement.classList.toggle('dark', this.darkMode);
         localStorage.setItem('darkMode', String(this.darkMode));
+        if (this.settingsData) this.settingsData.dark_mode = this.darkMode ? 1 : 0;
       }
     },
 
@@ -129,6 +149,7 @@ document.addEventListener('alpine:init', () => {
         this.loadNotifications(),
         this.loadHealth(),
         this.loadSystemStatus(),
+        this.loadPresets(),
       ]);
       // Poll system status every 30s
       if (this._systemStatusTimer) clearInterval(this._systemStatusTimer);
@@ -345,10 +366,13 @@ document.addEventListener('alpine:init', () => {
 
     // ── Project detail ────────────────────────────────────────────────────
     async openProject(project) {
+      // Clear any pending undo toasts from previous view before navigating
+      this.toasts = this.toasts.filter(t => !t.undoId);
       this.activeProject = project;
       this.detailTab = 'overview';
       this.view = 'project_detail';
       this.scrubberIndex = 0;
+      this.scrubberQualityFilter = 'all';
       this.framePage = 0;  // reset pagination (FE3)
       this.rangeStart = null;
       this.rangeEnd = null;
@@ -590,6 +614,198 @@ document.addEventListener('alpine:init', () => {
       if (count < 200) return 'bg-emerald-700';
       if (count < 500) return 'bg-emerald-500';
       return 'bg-emerald-300';
+    },
+
+    // Build a 52-week × 7-day grid from daily stats data [{date, count}]
+    buildHeatmapGrid(dailyStats) {
+      const map = {};
+      for (const row of (dailyStats || [])) map[row.date] = row.count;
+      const grid = []; // array of weeks (each week = array of 7 day objects)
+      const today = new Date();
+      today.setHours(0,0,0,0);
+      // Start 52 weeks back, on the most recent Sunday
+      const start = new Date(today);
+      start.setDate(start.getDate() - 52 * 7 - start.getDay());
+      const cursor = new Date(start);
+      let week = [];
+      while (cursor <= today) {
+        const iso = cursor.toISOString().slice(0, 10);
+        week.push({ date: iso, count: map[iso] || 0 });
+        if (week.length === 7) { grid.push(week); week = []; }
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      if (week.length) grid.push(week);
+      return grid;
+    },
+
+    // ── Scrubber quality filter ───────────────────────────────────────────
+    async setScrubberFilter(filter) {
+      this.scrubberQualityFilter = filter;
+      const id = this.activeProject?.id;
+      if (!id) return;
+      let url = `/api/projects/${id}/frames?fields=id,captured_at&limit=500`;
+      if (filter === 'dark') url += '&is_dark=true';
+      else if (filter === 'blurry') url += '&is_blurry=true';
+      else if (filter === 'bookmarked') url += '&bookmarked=true';
+      const data = await this.api(url);
+      if (data) {
+        this.activeProjectFrames = data;
+        this.scrubberIndex = 0;
+        this.updateScrubberFrame();
+      }
+    },
+
+    // ── Interval analyzer ────────────────────────────────────────────────
+    async runIntervalAnalyzer() {
+      const id = this.activeProject?.id;
+      if (!id) return;
+      const secs = this.intervalAnalyzer.targetMinutes * 60;
+      const fps = this.intervalAnalyzer.targetFps;
+      const data = await this.api(
+        `/api/projects/${id}/frames/analyze-interval?target_duration_seconds=${secs}&target_fps=${fps}`
+      );
+      if (data) this.intervalAnalyzer.result = data;
+    },
+
+    // ── Render ETA formatting ────────────────────────────────────────────
+    formatEta(etaSeconds) {
+      if (!etaSeconds || etaSeconds <= 0) return null;
+      if (etaSeconds < 60) return `${etaSeconds}s`;
+      if (etaSeconds < 3600) return `${Math.round(etaSeconds / 60)}m`;
+      return `${Math.round(etaSeconds / 3600)}h`;
+    },
+
+    // ── Render queue drag-to-reorder ─────────────────────────────────────
+    onRenderDragStart(renderId) {
+      this.dragRenderFrom = renderId;
+    },
+
+    async onRenderDrop(targetRenderId) {
+      if (!this.dragRenderFrom || this.dragRenderFrom === targetRenderId) return;
+      // Find positions in allRenders
+      const pending = this.allRenders.filter(r => r.status === 'pending');
+      const fromIdx = pending.findIndex(r => r.id === this.dragRenderFrom);
+      const toIdx   = pending.findIndex(r => r.id === targetRenderId);
+      if (fromIdx < 0 || toIdx < 0) return;
+
+      // Assign priorities: highest index = highest priority (10 down to 1)
+      const reordered = [...pending];
+      const [moved] = reordered.splice(fromIdx, 1);
+      reordered.splice(toIdx, 0, moved);
+      // Assign descending priorities
+      const updates = reordered.map((r, i) => ({
+        id: r.id, priority: reordered.length - i,
+      }));
+      await Promise.all(updates.map(u =>
+        this.api(`/api/renders/${u.id}/priority?priority=${u.priority}`, 'PUT')
+      ));
+      await this.loadRendersQueue();
+      this.dragRenderFrom = null;
+    },
+
+    // ── Per-project notification mute ────────────────────────────────────
+    isProjectMuted(projectId) {
+      return this.mutedProjectIds.includes(projectId);
+    },
+
+    async toggleProjectMute(projectId) {
+      let newList;
+      if (this.mutedProjectIds.includes(projectId)) {
+        newList = this.mutedProjectIds.filter(id => id !== projectId);
+        this.toast('Notifications unmuted for this project');
+      } else {
+        newList = [...this.mutedProjectIds, projectId];
+        this.toast('Notifications muted for this project');
+      }
+      this.mutedProjectIds = newList;
+      await this.api('/api/settings', 'PUT', { muted_project_ids: newList });
+    },
+
+    // ── Pinned / favourite projects ──────────────────────────────────────
+    async togglePin(project) {
+      const wasPinned = project.is_pinned;
+      const method = wasPinned ? 'DELETE' : 'POST';
+      const r = await this.api(`/api/projects/${project.id}/pin`, method);
+      if (r !== null) {
+        project.is_pinned = !wasPinned;
+        this.toast(wasPinned ? 'Project unpinned' : 'Project pinned to top');
+      }
+    },
+
+    // ── Render presets ────────────────────────────────────────────────────
+    async loadPresets() {
+      const data = await this.api('/api/presets');
+      if (data) this.renderPresets = data;
+    },
+
+    async applyPreset(preset) {
+      this.renderFramerate = preset.framerate;
+      this.renderResolution = preset.resolution;
+      this.renderQuality = preset.quality;
+      this.renderFlicker = preset.flicker_reduction;
+      this.renderFrameBlend = !!preset.frame_blend;
+      this.renderStabilize = !!preset.stabilize;
+      this.renderColorGrade = preset.color_grade;
+      this.toast(`Preset "${preset.name}" applied`);
+    },
+
+    async saveRenderPreset() {
+      const name = prompt('Preset name:');
+      if (!name) return;
+      const payload = {
+        name,
+        framerate: this.renderFramerate,
+        resolution: this.renderResolution,
+        quality: this.renderQuality,
+        flicker_reduction: this.renderFlicker,
+        frame_blend: this.renderFrameBlend,
+        stabilize: this.renderStabilize,
+        color_grade: this.renderColorGrade,
+      };
+      const r = await this.api('/api/presets', 'POST', payload);
+      if (r) {
+        this.renderPresets.push(r);
+        this.toast(`Preset "${name}" saved`);
+      }
+    },
+
+    async deletePreset(presetId) {
+      if (!await this.confirm('Delete this preset?', 'Delete Preset')) return;
+      await this.api(`/api/presets/${presetId}`, 'DELETE');
+      this.renderPresets = this.renderPresets.filter(p => p.id !== presetId);
+      this.toast('Preset deleted');
+    },
+
+    // ── Historical range validation / NVR recording range snapping ────────
+    async validateHistoricalRange() {
+      const cameraId = this.form.camera_id;
+      if (!cameraId || this.form.project_type !== 'historical') return;
+      const data = await this.api(`/api/cameras/${cameraId}/recording-range`);
+      if (!data || !data.available) return;
+
+      let changed = false;
+      if (this.form.start_date && data.earliest) {
+        const startMs  = new Date(this.form.start_date).getTime();
+        const earliest = new Date(data.earliest).getTime();
+        if (startMs < earliest) {
+          // Snap to earliest available
+          this.form.start_date = new Date(earliest).toISOString().slice(0, 16);
+          this.toast(`Start date snapped to earliest NVR recording: ${new Date(earliest).toLocaleString()}`, 'warning');
+          changed = true;
+        }
+      }
+      if (this.form.end_date && data.latest) {
+        const endMs  = new Date(this.form.end_date).getTime();
+        const latest = new Date(data.latest).getTime();
+        if (endMs > latest) {
+          this.form.end_date = new Date(latest).toISOString().slice(0, 16);
+          this.toast(`End date snapped to latest NVR recording: ${new Date(latest).toLocaleString()}`, 'warning');
+          changed = true;
+        }
+      }
+      if (!changed) {
+        this.toast('Date range is within available NVR recordings', 'success');
+      }
     },
 
     // ── Renders ───────────────────────────────────────────────────────────
@@ -1233,15 +1449,21 @@ document.addEventListener('alpine:init', () => {
           break;
         }
         case 'render_progress': {
+          // Update both the per-project tab and the global queue view
           const r = this.activeProjectRenders.find(r => r.id === msg.render_id);
-          if (r) { r.progress_pct = msg.progress_pct; }
+          if (r) { r.progress_pct = msg.progress_pct; r.status = 'rendering'; }
+          const rq = this.allRenders.find(r => r.id === msg.render_id);
+          if (rq) { rq.progress_pct = msg.progress_pct; rq.status = 'rendering'; }
           break;
         }
         case 'render_complete': {
           const r = this.activeProjectRenders.find(r => r.id === msg.render_id);
-          if (r) { r.status = msg.status; r.progress_pct = 100; }
-          this.loadDetailTab('renders');
-          const projId = r?.project_id ?? msg.project_id;
+          if (r) { r.status = msg.status; r.progress_pct = msg.status === 'done' ? 100 : r.progress_pct; }
+          const rq = this.allRenders.find(r => r.id === msg.render_id);
+          if (rq) { rq.status = msg.status; if (msg.status === 'done') rq.progress_pct = 100; }
+          if (this.view === 'project_detail') this.loadDetailTab('renders');
+          if (this.view === 'renders_queue') this.loadRendersQueue();
+          const projId = r?.project_id ?? rq?.project_id ?? msg.project_id;
           const pName = this.projects.find(p => p.id === projId)?.name || 'project';
           const label = msg.status === 'done' ? `Render done: ${pName}` : `Render failed: ${pName}`;
           this.toast(label, msg.status === 'done' ? 'success' : 'error', projId);
@@ -1382,7 +1604,10 @@ document.addEventListener('alpine:init', () => {
             if (this.view === 'dashboard') { e.preventDefault(); this.openCreateForm(); }
             break;
           case 'Escape':
-            if (this.view !== 'dashboard') { this.view = 'dashboard'; }
+            if (this.view !== 'dashboard') {
+              this.toasts = this.toasts.filter(t => !t.undoId);
+              this.view = 'dashboard';
+            }
             this.showNotifDropdown = false;
             this.showShortcutHelp = false;
             break;

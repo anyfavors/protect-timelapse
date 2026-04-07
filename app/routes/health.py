@@ -1,8 +1,9 @@
+import collections
 import os
 import shutil
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import Response
 
 from app.config import get_settings
@@ -151,6 +152,36 @@ def system_status() -> dict:
         "pending_renders": pending_renders["cnt"] if pending_renders else 0,
         "recent_errors": [dict(r) for r in recent_errors],
     }
+
+
+@router.get("/api/logs")
+def get_logs(
+    lines: int = Query(default=500, ge=1, le=5000),
+    log_file: str | None = Query(default=None, description="Path to log file (optional)"),
+) -> dict:
+    """Tail recent application log lines. Uses log_file if provided, otherwise returns empty."""
+    if log_file and os.path.isfile(log_file):
+        try:
+            with open(log_file) as f:
+                tail = list(collections.deque(f, maxlen=lines))
+            return {"lines": [line.rstrip("\n") for line in tail], "source": log_file}
+        except OSError as exc:
+            return {"lines": [], "source": log_file, "error": str(exc)}
+    # Fall back to journalctl if available (Docker/systemd environments)
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["journalctl", "-u", "protect-timelapse", f"-n{lines}", "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return {"lines": result.stdout.splitlines(), "source": "journalctl"}
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return {"lines": [], "source": "unavailable", "error": "No log source configured"}
 
 
 @router.get("/api/disk")

@@ -18,15 +18,34 @@ log = logging.getLogger("app.maintenance")
 
 
 def register_maintenance_job(scheduler) -> None:  # type: ignore[no-untyped-def]
-    """Register the daily maintenance cron in the given APScheduler instance."""
+    """Register the daily maintenance cron in the given APScheduler instance.
+
+    The hour/minute are read from the settings table so users can configure them
+    without restarting. Call this again with replace_existing=True after a settings change.
+    """
+    hour = 2
+    minute = 0
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT maintenance_hour, maintenance_minute FROM settings WHERE id = 1"
+            ).fetchone()
+        if row:
+            if row["maintenance_hour"] is not None:
+                hour = int(row["maintenance_hour"])
+            if row["maintenance_minute"] is not None:
+                minute = int(row["maintenance_minute"])
+    except Exception:
+        pass
+
     scheduler.add_job(
         run_maintenance,
-        trigger=CronTrigger(hour=2, minute=0),
+        trigger=CronTrigger(hour=hour, minute=minute),
         id="maintenance_daily",
         replace_existing=True,
         max_instances=1,
     )
-    log.info("Maintenance job registered (daily at 02:00)")
+    log.info("Maintenance job registered (daily at %02d:%02d)", hour, minute)
 
 
 async def run_maintenance() -> None:
@@ -34,10 +53,12 @@ async def run_maintenance() -> None:
     await _prune_old_frames()
     await _prune_old_renders()
     await _recover_zombie_renders()
+    await _recover_stalled_renders()
     await _reconcile_frame_counts()
     await _reconcile_project_status()
     await _schedule_auto_renders()
     await _backup_database()
+    await _maybe_vacuum_database()
     log.info("Maintenance run complete")
 
 
@@ -268,6 +289,26 @@ async def _schedule_auto_renders() -> None:
             )
 
 
+async def _recover_stalled_renders() -> None:
+    """Reset renders stuck in 'stalled' status back to pending so the worker retries."""
+    with get_connection() as conn:
+        stalled = conn.execute(
+            "SELECT id, output_path FROM renders WHERE status = 'stalled'"
+        ).fetchall()
+
+    for render in stalled:
+        if render["output_path"]:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(render["output_path"])
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE renders SET status = 'pending', progress_pct = 0 WHERE id = ?",
+                (render["id"],),
+            )
+            conn.commit()
+        log.warning("Reset stalled render id=%d to pending", render["id"])
+
+
 async def _backup_database() -> None:
     """Create a daily SQLite backup alongside the main DB (B5)."""
     from app.config import get_settings
@@ -282,6 +323,27 @@ async def _backup_database() -> None:
         log.info("Database backed up to %s", backup_path)
     except OSError as exc:
         log.error("Database backup failed: %s", exc)
+
+
+async def _maybe_vacuum_database() -> None:
+    """Run VACUUM on the first day of each month to reclaim WAL space."""
+    if datetime.now(UTC).day != 1:
+        return
+    try:
+        import sqlite3
+
+        from app.config import get_settings
+
+        settings = get_settings()
+        # VACUUM cannot run inside a transaction — use a direct autocommit connection
+        conn = sqlite3.connect(settings.database_path, isolation_level=None)
+        try:
+            conn.execute("VACUUM")
+            log.info("Database VACUUM complete")
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.error("Database VACUUM failed: %s", exc)
 
 
 async def _maybe_insert_render(

@@ -1,5 +1,4 @@
-"""
-Integration tests for Phase 1b correctness fixes:
+"""Integration tests for scheduler isolation and historical project handling:
 - Historical project status / scheduler isolation
 - snapshot_worker skips historical projects
 - Resolution validation on POST /api/renders

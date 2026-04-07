@@ -134,7 +134,7 @@ def list_projects() -> list[dict]:
                 ORDER BY captured_at DESC
                 LIMIT 1
             )
-            ORDER BY p.created_at DESC
+            ORDER BY p.is_pinned DESC, p.created_at DESC
             """,
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
@@ -489,6 +489,71 @@ def schedule_test(
         "would_capture": would_capture,
         "error": error_msg,
     }
+
+
+@router.get("/projects/{project_id}/capacity")
+def project_capacity(project_id: int) -> dict:
+    """Estimate days of capture remaining given current disk space and capture rate."""
+    import shutil as _shutil
+
+    _get_project_or_404(project_id)
+    settings = get_settings()
+
+    # Average frame file size
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt, AVG(file_size) as avg_size FROM frames WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        proj_row = conn.execute(
+            "SELECT interval_seconds FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+
+    frame_count = row["cnt"] if row else 0
+    avg_frame_bytes = row["avg_size"] or 200_000
+    interval_seconds = proj_row["interval_seconds"] if proj_row else 60
+
+    frames_per_day = 86400 / max(interval_seconds, 1)
+    bytes_per_day = frames_per_day * avg_frame_bytes
+
+    try:
+        usage = _shutil.disk_usage(settings.frames_path)
+        free_bytes = usage.free
+    except FileNotFoundError:
+        free_bytes = 0
+
+    days_remaining = free_bytes / bytes_per_day if bytes_per_day > 0 else 0
+
+    return {
+        "project_id": project_id,
+        "frame_count": frame_count,
+        "avg_frame_bytes": int(avg_frame_bytes),
+        "frames_per_day": round(frames_per_day, 1),
+        "bytes_per_day": int(bytes_per_day),
+        "free_bytes": free_bytes,
+        "free_gb": round(free_bytes / 1024**3, 2),
+        "days_remaining": round(days_remaining, 1),
+    }
+
+
+@router.post("/projects/{project_id}/pin", status_code=200)
+def pin_project(project_id: int) -> dict:
+    """Pin / favourite a project so it appears at the top of the dashboard."""
+    _get_project_or_404(project_id)
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET is_pinned = 1 WHERE id = ?", (project_id,))
+        conn.commit()
+    return {"project_id": project_id, "is_pinned": True}
+
+
+@router.delete("/projects/{project_id}/pin", status_code=200)
+def unpin_project(project_id: int) -> dict:
+    """Unpin a project."""
+    _get_project_or_404(project_id)
+    with get_connection() as conn:
+        conn.execute("UPDATE projects SET is_pinned = 0 WHERE id = ?", (project_id,))
+        conn.commit()
+    return {"project_id": project_id, "is_pinned": False}
 
 
 @router.delete("/projects/{project_id}", status_code=204)

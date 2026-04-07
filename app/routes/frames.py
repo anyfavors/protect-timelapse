@@ -1,11 +1,13 @@
 """Frame listing, serving, bookmarks, stats, and export routes."""
 
 import asyncio
+import contextlib
 import csv
 import io
 import logging
 import os
 import shutil
+import tempfile
 import zipfile
 from typing import Any
 
@@ -14,6 +16,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.database import get_connection
+from app.limiter import limiter
 
 router = APIRouter(prefix="/api", tags=["frames"])
 log = logging.getLogger("app.routes.frames")
@@ -232,7 +235,6 @@ def list_dark_frames(project_id: int, limit: int = Query(default=100, ge=1, le=5
 
 @router.delete("/projects/{project_id}/frames/{frame_id}", status_code=204)
 def delete_frame(project_id: int, frame_id: int) -> None:
-    import contextlib
 
     frame = _get_frame_or_404(project_id, frame_id)
 
@@ -264,7 +266,6 @@ def delete_frames_batch(
     limit: int = Query(default=500, ge=1, le=5000),
 ) -> dict:
     """Bulk delete frames by quality filter. Returns count of deleted frames."""
-    import contextlib
 
     _get_project_or_404(project_id)
 
@@ -339,7 +340,8 @@ def list_blurry_frames(
 
 
 @router.get("/projects/{project_id}/frames/export")
-def export_frames(project_id: int) -> StreamingResponse:
+@limiter.limit("5/minute")
+def export_frames(request: Request, project_id: int) -> StreamingResponse:
     _get_project_or_404(project_id)
     with get_connection() as conn:
         rows = conn.execute(
@@ -509,7 +511,8 @@ _gif_jobs: dict[int, dict] = {}
 
 
 @router.post("/projects/{project_id}/gif", status_code=202)
-async def start_gif_export(project_id: int, background_tasks: BackgroundTasks) -> dict:
+@limiter.limit("5/minute")
+async def start_gif_export(request: Request, project_id: int, background_tasks: BackgroundTasks) -> dict:
     _get_project_or_404(project_id)
     _gif_jobs[project_id] = {"status": "pending", "path": None, "error": None}
     background_tasks.add_task(_run_gif_export, project_id)
@@ -569,10 +572,12 @@ async def _run_gif_export(project_id: int) -> None:
         if not all_paths:
             raise ValueError("No frames available for GIF export")
 
-        concat_file = f"/tmp/gif_{project_id}.txt"
-        with open(concat_file, "w") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix=f"gif_{project_id}_", delete=False
+        ) as _tf:
+            concat_file = _tf.name
             for p in all_paths:
-                f.write(f"file '{p}'\n")
+                _tf.write(f"file '{p}'\n")
 
         output_path = os.path.join(
             settings.renders_path, str(project_id), f"export_{project_id}.gif"
@@ -612,8 +617,22 @@ async def _run_gif_export(project_id: int) -> None:
         log.info("GIF export complete for project %d: %s", project_id, output_path)
 
     except Exception as exc:
-        _gif_jobs[project_id] = {"status": "error", "path": None, "error": str(exc)[:500]}
+        err_str = str(exc)[:500]
+        _gif_jobs[project_id] = {"status": "error", "path": None, "error": err_str}
         log.error("GIF export failed for project %d: %s", project_id, exc)
+        # Surface failure as a notification so the user sees it in the UI
+        with contextlib.suppress(Exception):
+            import asyncio as _asyncio
+
+            from app.notifications import notify
+            _asyncio.get_event_loop().create_task(
+                notify(
+                    event="gif_export_failed",
+                    level="error",
+                    message=f"GIF export failed for project {project_id}: {err_str[:200]}",
+                    project_id=project_id,
+                )
+            )
 
 
 # -------------------------------------------------------------------------

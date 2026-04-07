@@ -3,14 +3,16 @@
 import contextlib
 import logging
 import os
+from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.database import get_connection
-from app.render import cancel_active_render, estimate_render
+from app.limiter import limiter
+from app.render import cancel_active_render, estimate_render, pause_active_render
 
 router = APIRouter(prefix="/api", tags=["renders"])
 log = logging.getLogger("app.routes.renders")
@@ -47,7 +49,8 @@ def _get_render_or_404(render_id: int) -> dict:
 
 
 @router.post("/renders", status_code=201)
-def create_render(payload: RenderCreate) -> dict:
+@limiter.limit("30/minute")
+def create_render(request: Request, payload: RenderCreate) -> dict:
     # Validate project exists
     with get_connection() as conn:
         proj = conn.execute(
@@ -123,6 +126,23 @@ def render_status(render_id: int) -> dict:
     }
 
 
+def _enrich_render(r: dict) -> dict:
+    """Add ETA field to a render dict if it is currently rendering."""
+    if r.get("status") == "rendering" and r.get("started_at") and r.get("progress_pct", 0) > 0:
+        try:
+            started = datetime.fromisoformat(r["started_at"])
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            elapsed = (datetime.now(UTC) - started).total_seconds()
+            pct = r["progress_pct"]
+            r["eta_seconds"] = int(elapsed / (pct / 100) * (1 - pct / 100))
+        except Exception:
+            r["eta_seconds"] = None
+    else:
+        r["eta_seconds"] = None
+    return r
+
+
 @router.get("/renders")
 def list_all_renders() -> list[dict]:
     """Global render queue — all projects, newest first, with project name joined."""
@@ -136,7 +156,7 @@ def list_all_renders() -> list[dict]:
             LIMIT 200
             """,
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [_enrich_render(_row_to_dict(r)) for r in rows]
 
 
 @router.get("/projects/{project_id}/renders")
@@ -198,6 +218,52 @@ async def cancel_render(render_id: int) -> dict:
 
     log.info("Render id=%d cancelled (ffmpeg_killed=%s)", render_id, killed)
     return {"render_id": render_id, "cancelled": True, "ffmpeg_killed": killed}
+
+
+@router.post("/renders/{render_id}/pause", status_code=200)
+async def pause_render(render_id: int) -> dict:
+    """Pause a pending or in-progress render (sets status to 'paused')."""
+    render = _get_render_or_404(render_id)
+    if render["status"] not in ("pending", "rendering"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Render {render_id} cannot be paused (status={render['status']})",
+        )
+
+    killed = False
+    if render["status"] == "rendering":
+        killed = await pause_active_render(render_id)
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE renders SET status = 'paused' WHERE id = ? AND status IN ('pending', 'rendering')",
+            (render_id,),
+        )
+        conn.commit()
+
+    log.info("Render id=%d paused (ffmpeg_killed=%s)", render_id, killed)
+    return {"render_id": render_id, "paused": True, "ffmpeg_killed": killed}
+
+
+@router.post("/renders/{render_id}/resume", status_code=200)
+def resume_render(render_id: int) -> dict:
+    """Resume a paused render by setting its status back to 'pending'."""
+    render = _get_render_or_404(render_id)
+    if render["status"] != "paused":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Render {render_id} is not paused (status={render['status']})",
+        )
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE renders SET status = 'pending', progress_pct = 0 WHERE id = ?",
+            (render_id,),
+        )
+        conn.commit()
+
+    log.info("Render id=%d resumed", render_id)
+    return {"render_id": render_id, "resumed": True}
 
 
 @router.get("/renders/{render_id_a}/compare/{render_id_b}")

@@ -1,6 +1,7 @@
 """Global settings routes (single row, id=1)."""
 
 import contextlib
+import json
 import os
 from typing import Any
 
@@ -33,6 +34,13 @@ class SettingsUpdate(BaseModel):
     tz: str | None = None
     # UI
     dark_mode: bool | None = None
+    # Maintenance window (hour 0-23, minute 0-59)
+    maintenance_hour: int | None = None
+    maintenance_minute: int | None = None
+    # NVR reconnect backoff
+    nvr_reconnect_backoff_seconds: int | None = None
+    # Per-project notification mute (JSON list of project IDs)
+    muted_project_ids: list[int] | None = None
 
 
 def _get_settings_row() -> dict[str, Any]:
@@ -57,10 +65,14 @@ async def update_settings(payload: SettingsUpdate) -> dict:
     values: list[Any] = []
 
     _bool_as_int = {"timestamp_burn_in", "protect_verify_ssl", "dark_mode"}
+    _json_fields = {"muted_project_ids"}
     for key, val in data.items():
         if key in _bool_as_int and val is not None:
             set_parts.append(f"{key} = ?")
             values.append(int(val))
+        elif key in _json_fields and val is not None:
+            set_parts.append(f"{key} = ?")
+            values.append(json.dumps(val))
         elif val is not None:
             set_parts.append(f"{key} = ?")
             values.append(val)
@@ -91,6 +103,21 @@ async def update_settings(payload: SettingsUpdate) -> dict:
 
         with contextlib.suppress(Exception):
             await protect_manager.reconnect()
+
+    # Invalidate LocationInfo cache if geolocation fields changed
+    _GEO_FIELDS = {"latitude", "longitude", "tz"}
+    if any(k in _GEO_FIELDS for k in data):
+        with contextlib.suppress(Exception):
+            from app.capture import invalidate_location_cache
+            invalidate_location_cache()
+
+    # Re-register maintenance job if schedule changed
+    _MAINT_FIELDS = {"maintenance_hour", "maintenance_minute"}
+    if any(k in _MAINT_FIELDS and data.get(k) is not None for k in _MAINT_FIELDS):
+        with contextlib.suppress(Exception):
+            from app.capture import scheduler
+            from app.maintenance import register_maintenance_job
+            register_maintenance_job(scheduler)
 
     return _get_settings_row()
 

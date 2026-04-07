@@ -6,6 +6,8 @@ The snapshot_worker() runs the full visibility pipeline before saving a frame.
 """
 
 import asyncio
+import contextlib
+import hashlib
 import io
 import logging
 import os
@@ -25,6 +27,9 @@ from app.thumbnails import generate_thumbnail_from_pillow
 from app.websocket import broadcast
 
 log = logging.getLogger("app.capture")
+
+# Cached LocationInfo — rebuilt lazily when location settings change
+_location_info_cache: tuple[str, float, float, object] | None = None  # (tz, lat, lon, LocationInfo)
 
 scheduler = AsyncIOScheduler()
 
@@ -353,12 +358,28 @@ async def snapshot_worker(project_id: int) -> None:
     frame_path = os.path.join(frame_dir, f"{timestamp}.jpg")
     thumb_path = os.path.join(thumb_dir, f"{timestamp}.jpg")
 
+    # Frame deduplication: skip if an identical frame (by hash) already exists
+    frame_hash = hashlib.sha256(snapshot_bytes).hexdigest()
+    with get_connection() as conn:
+        dup = conn.execute(
+            "SELECT id FROM frames WHERE project_id = ? AND file_hash = ? LIMIT 1",
+            (project_id, frame_hash),
+        ).fetchone()
+    if dup:
+        log.debug("Project %d: duplicate frame skipped (hash=%s)", project_id, frame_hash[:16])
+        return
+
+    # Atomic frame write: write to .tmp then rename (crash-safe)
     # Abort early if frame file can't be written — don't insert orphaned DB record (#7)
+    tmp_frame_path = frame_path + ".tmp"
     try:
-        with open(frame_path, "wb") as f:
+        with open(tmp_frame_path, "wb") as f:
             f.write(snapshot_bytes)
+        os.replace(tmp_frame_path, frame_path)
     except OSError as exc:
         log.error("Project %d: failed to write frame file %s: %s", project_id, frame_path, exc)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_frame_path)
         return
 
     # Reuse the already-decoded PIL image if available, otherwise decode now
@@ -366,8 +387,15 @@ async def snapshot_worker(project_id: int) -> None:
         pil_img = Image.open(io.BytesIO(snapshot_bytes))
     loop = asyncio.get_event_loop()
     thumb_bytes = await loop.run_in_executor(None, generate_thumbnail_from_pillow, pil_img)
-    with open(thumb_path, "wb") as f:
-        f.write(thumb_bytes)
+    tmp_thumb_path = thumb_path + ".tmp"
+    try:
+        with open(tmp_thumb_path, "wb") as f:
+            f.write(thumb_bytes)
+        os.replace(tmp_thumb_path, thumb_path)
+    except OSError:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_thumb_path)
+        thumb_path = frame_path  # fall back to original
 
     file_size = len(snapshot_bytes)
 
@@ -377,8 +405,8 @@ async def snapshot_worker(project_id: int) -> None:
         conn.execute(
             """
             INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size,
-                                is_dark, sharpness_score, is_blurry)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                is_dark, sharpness_score, is_blurry, file_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
@@ -389,6 +417,7 @@ async def snapshot_worker(project_id: int) -> None:
                 is_dark,
                 sharpness_score,
                 is_blurry,
+                frame_hash,
             ),
         )
         conn.execute(
@@ -499,15 +528,36 @@ def get_scheduler_status() -> dict:
 # -------------------------------------------------------------------------
 
 
-def _is_daylight() -> bool:
+def _get_location_info() -> "tuple[str, object]":
+    """Return (tz_name, LocationInfo) using a lazy cache invalidated when settings change."""
+    global _location_info_cache
     from astral import LocationInfo
-    from astral.sun import sun
 
     tz, lat, lon = _get_location()
-    city = LocationInfo(name="custom", region="custom", timezone=tz, latitude=lat, longitude=lon)
+    if (
+        _location_info_cache is None
+        or _location_info_cache[0] != tz
+        or _location_info_cache[1] != lat
+        or _location_info_cache[2] != lon
+    ):
+        city = LocationInfo(name="custom", region="custom", timezone=tz, latitude=lat, longitude=lon)
+        _location_info_cache = (tz, lat, lon, city)
+    return _location_info_cache[0], _location_info_cache[3]
+
+
+def invalidate_location_cache() -> None:
+    """Call this after settings update to force LocationInfo rebuild on next use."""
+    global _location_info_cache
+    _location_info_cache = None
+
+
+def _is_daylight() -> bool:
+    from astral.sun import sun
+
+    tz, city = _get_location_info()
     now = datetime.now(UTC)
     try:
-        s = sun(city.observer, date=now.date(), tzinfo=tz)
+        s = sun(city.observer, date=now.date(), tzinfo=tz)  # type: ignore[union-attr]
         return s["sunrise"] <= now <= s["sunset"]
     except Exception:
         # If astral fails (e.g. polar night), allow capture
@@ -532,18 +582,14 @@ def _is_solar_noon_window(project: dict) -> bool:
     regardless of season. The scheduler runs every minute; this gate fires
     only during the configured window so exactly one capture occurs per day.
     """
-    from astral import LocationInfo
     from astral.sun import sun
 
-    tz_name, lat, lon = _get_location()
+    tz_name, city = _get_location_info()
     window = int(project.get("solar_noon_window_minutes") or 30)
 
     try:
-        city = LocationInfo(
-            name="custom", region="custom", timezone=tz_name, latitude=lat, longitude=lon
-        )
         now = datetime.now(UTC)
-        s = sun(city.observer, date=now.date(), tzinfo=tz_name)
+        s = sun(city.observer, date=now.date(), tzinfo=tz_name)  # type: ignore[union-attr]
         noon = s["noon"]
         diff_minutes = abs((now - noon).total_seconds()) / 60
         return diff_minutes <= window
@@ -784,6 +830,23 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
     existing_ts = {row["captured_at"] for row in existing_rows}
 
     timestamps = [ts for ts in all_timestamps if ts.isoformat() not in existing_ts]
+
+    # ── Apply daylight filter on resume (fix: don't re-apply time-window filter) ──
+    # Only filter timestamps that fall outside daylight if capture_mode requires it.
+    # We check by actual sun times, not by current time, so resume is correct.
+    if project.get("capture_mode") == "daylight_only":
+        from astral.sun import sun as _astral_sun
+
+        tz_name_hist, city_hist = _get_location_info()
+        filtered_ts: list[datetime] = []
+        for _ts in timestamps:
+            with contextlib.suppress(Exception):
+                _s = _astral_sun(city_hist.observer, date=_ts.date(), tzinfo=tz_name_hist)  # type: ignore[union-attr]
+                if _s["sunrise"] <= _ts <= _s["sunset"]:
+                    filtered_ts.append(_ts)
+                continue
+            filtered_ts.append(_ts)  # fail open
+        timestamps = filtered_ts
     already_done = len(all_timestamps) - len(timestamps)
     total_expected = len(timestamps)
 
@@ -820,8 +883,12 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
     # "recording-snapshot" endpoint — returns a single JPEG per timestamp.
     # No video download, no ffmpeg, no temp files.
     _SNAPSHOT_TIMEOUT = 30  # seconds per snapshot request
+    _BATCH_SIZE = 100  # frames per DB batch insert
     total_frames = 0
     consecutive_errors = 0
+
+    # Accumulate batch rows before DB insert
+    _batch: list[tuple] = []
 
     # Resolution kwargs (same as live capture)
     snap_kwargs: dict = {}
@@ -829,6 +896,42 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
         snap_kwargs["width"] = project["width"]
     if project["height"]:
         snap_kwargs["height"] = project["height"]
+
+    async def _flush_batch() -> None:
+        nonlocal total_frames
+        if not _batch:
+            return
+        with get_connection() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO frames "
+                "(project_id, captured_at, file_path, thumbnail_path, file_size, "
+                "sharpness_score, is_blurry, file_hash) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                _batch,
+            )
+            conn.execute(
+                "UPDATE projects SET frame_count = frame_count + ? WHERE id = ?",
+                (len(_batch), project_id),
+            )
+            # Upsert frame_stats for each batch row
+            for _b in _batch:
+                _cat = _b[1]  # captured_at isostring
+                _is_dark_val = 0  # historical frames not luminance-checked
+                _fdate = _cat[:10]
+                _fhour = int(_cat[11:13]) if len(_cat) >= 13 else 0
+                conn.execute(
+                    """
+                    INSERT INTO frame_stats (project_id, date, hour, captured, dark)
+                    VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(project_id, date, hour) DO UPDATE SET
+                        captured = captured + 1,
+                        dark = dark + excluded.dark
+                    """,
+                    (project_id, _fdate, _fhour, _is_dark_val),
+                )
+            conn.commit()
+        total_frames += len(_batch)
+        _batch.clear()
 
     for idx, frame_dt in enumerate(timestamps):
         progress_pct = int(idx / total_expected * 100)
@@ -859,6 +962,7 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
                 )
                 consecutive_errors += 1
                 if consecutive_errors >= 20:
+                    await _flush_batch()
                     error_msg = (
                         f"Aborted after {consecutive_errors} consecutive empty/failed snapshots. "
                         "NVR may not have recordings for this time range."
@@ -878,30 +982,53 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
             frame_path = os.path.join(frame_dir, f"{ts}.jpg")
             thumb_path = os.path.join(thumb_dir, f"{ts}.jpg")
 
-            with open(frame_path, "wb") as f:
-                f.write(snapshot_bytes)
+            # Atomic write: .tmp → rename
+            tmp_frame = frame_path + ".tmp"
+            try:
+                with open(tmp_frame, "wb") as f:
+                    f.write(snapshot_bytes)
+                os.replace(tmp_frame, frame_path)
+            except OSError as exc:
+                log.warning(
+                    "Historical extraction project %d: write failed at %s: %s",
+                    project_id, frame_dt.isoformat(), exc,
+                )
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(tmp_frame)
+                consecutive_errors += 1
+                continue
 
-            # Generate thumbnail
+            # Generate thumbnail (atomic)
             pil_img = Image.open(io.BytesIO(snapshot_bytes))
             loop = asyncio.get_event_loop()
             thumb_bytes = await loop.run_in_executor(None, generate_thumbnail_from_pillow, pil_img)
-            with open(thumb_path, "wb") as f:
-                f.write(thumb_bytes)
+            tmp_thumb = thumb_path + ".tmp"
+            try:
+                with open(tmp_thumb, "wb") as f:
+                    f.write(thumb_bytes)
+                os.replace(tmp_thumb, thumb_path)
+            except OSError:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(tmp_thumb)
+                thumb_path = frame_path
+
+            # Blur/sharpness detection (same pipeline as live capture)
+            gray_for_sharp = pil_img.convert("L")
+            edges = gray_for_sharp.filter(ImageFilter.FIND_EDGES)
+            sharpness_score = float(ImageStat.Stat(edges).var[0])
+            is_blurry = 1 if sharpness_score < _BLUR_THRESHOLD else 0
 
             file_size = len(snapshot_bytes)
+            frame_hash = hashlib.sha256(snapshot_bytes).hexdigest()
             captured_at = frame_dt.isoformat()
-            with get_connection() as conn:
-                conn.execute(
-                    "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size) "
-                    "VALUES (?,?,?,?,?)",
-                    (project_id, captured_at, frame_path, thumb_path, file_size),
-                )
-                conn.execute(
-                    "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
-                    (project_id,),
-                )
-                conn.commit()
-            total_frames += 1
+
+            _batch.append((
+                project_id, captured_at, frame_path, thumb_path, file_size,
+                sharpness_score, is_blurry, frame_hash,
+            ))
+
+            if len(_batch) >= _BATCH_SIZE:
+                await _flush_batch()
 
         except TimeoutError:
             log.warning(
@@ -920,6 +1047,7 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
             consecutive_errors += 1
 
         if consecutive_errors >= 20:
+            await _flush_batch()
             error_msg = (
                 f"Aborted after {consecutive_errors} consecutive failures at "
                 f"{frame_dt.isoformat()}. Last frame fetched: {total_frames}."
@@ -935,6 +1063,9 @@ async def _run_historical_extraction_inner(project_id: int) -> None:
         # Yield to event loop periodically to avoid starving other tasks
         if idx % 5 == 0:
             await asyncio.sleep(0)
+
+    # Flush any remaining batch
+    await _flush_batch()
 
     # ── Finalize ──────────────────────────────────────────────────────
     if total_frames == 0:

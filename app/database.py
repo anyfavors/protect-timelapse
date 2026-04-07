@@ -298,6 +298,61 @@ def _migrate_v7(conn: sqlite3.Connection) -> None:
     _migrate_alter(conn, _SCHEMA_V7)
 
 
+_SCHEMA_V8 = """
+ALTER TABLE renders ADD COLUMN started_at TIMESTAMP;
+"""
+
+
+def _migrate_v8(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, _SCHEMA_V8)
+
+
+_SCHEMA_V9_ALTER = """
+ALTER TABLE projects ADD COLUMN is_pinned INTEGER DEFAULT 0;
+ALTER TABLE settings ADD COLUMN maintenance_hour INTEGER DEFAULT 2;
+ALTER TABLE settings ADD COLUMN maintenance_minute INTEGER DEFAULT 0;
+ALTER TABLE settings ADD COLUMN nvr_reconnect_backoff_seconds INTEGER DEFAULT 30;
+ALTER TABLE settings ADD COLUMN muted_project_ids TEXT DEFAULT '[]';
+ALTER TABLE frames ADD COLUMN file_hash TEXT;
+"""
+
+_SCHEMA_V9_CREATE = """
+CREATE TABLE IF NOT EXISTS render_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    framerate INTEGER NOT NULL DEFAULT 30,
+    resolution TEXT NOT NULL DEFAULT '1920x1080',
+    quality TEXT NOT NULL DEFAULT 'standard',
+    flicker_reduction TEXT NOT NULL DEFAULT 'standard',
+    frame_blend INTEGER NOT NULL DEFAULT 0,
+    stabilize INTEGER NOT NULL DEFAULT 0,
+    color_grade TEXT NOT NULL DEFAULT 'none',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_frames_hash
+    ON frames(project_id, file_hash)
+    WHERE file_hash IS NOT NULL;
+"""
+
+
+def _migrate_v9(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, _SCHEMA_V9_ALTER)
+    conn.executescript(_SCHEMA_V9_CREATE)
+    conn.commit()
+
+
+_SCHEMA_V10 = """
+CREATE INDEX IF NOT EXISTS idx_frames_project_quality
+    ON frames(project_id, captured_at, is_dark);
+"""
+
+
+def _migrate_v10(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_V10)
+    conn.commit()
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
@@ -307,6 +362,9 @@ MIGRATIONS: dict[int, object] = {
     5: _migrate_v5,
     6: _migrate_v6,
     7: _migrate_v7,
+    8: _migrate_v8,
+    9: _migrate_v9,
+    10: _migrate_v10,
 }
 
 
@@ -336,10 +394,10 @@ def init_database() -> None:
         )  # int() guards against non-integer (#28)
         conn.commit()
 
-        # Zombie render recovery: any render stuck in 'rendering' from a
+        # Zombie render recovery: any render stuck in 'rendering' or 'stalled' from a
         # previous crash is reset to 'pending' so the worker picks it up.
         zombies = conn.execute(
-            "SELECT id, output_path FROM renders WHERE status = 'rendering'"
+            "SELECT id, output_path FROM renders WHERE status IN ('rendering', 'stalled')"
         ).fetchall()
 
         for row in zombies:

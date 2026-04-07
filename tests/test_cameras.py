@@ -1,9 +1,6 @@
-"""Targeted tests to push coverage above 80%.
+"""Tests for camera routes, render worker lifecycle, capture scheduler, and rollup renders."""
 
-Covers: camera routes, render worker start/stop, capture scheduler functions,
-and rollup render path.
-"""
-
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -398,6 +395,111 @@ def test_estimate_render_with_frames(tmp_db: Path, monkeypatch: pytest.MonkeyPat
 
 
 # ===========================================================================
+# Render: range-based frame path and LUT traversal guard
+# ===========================================================================
+
+
+def test_get_frame_paths_range(tmp_db: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """_get_frame_paths returns only frames within the range window."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (name, camera_id, project_type, interval_seconds) VALUES (?,?,?,?)",
+            ("RangeProj", "cam-r", "live", 10),
+        )
+        conn.commit()
+        pid = cur.lastrowid
+
+    # Create a dummy frame file so os.path.exists passes
+    frames_dir = tmp_path / "frames" / str(pid)
+    frames_dir.mkdir(parents=True)
+    f1 = frames_dir / "2024-01-01T12:00:00.jpg"
+    f2 = frames_dir / "2024-06-01T12:00:00.jpg"
+    f1.write_bytes(b"")
+    f2.write_bytes(b"")
+
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO frames (project_id, file_path, captured_at, is_dark, file_size) VALUES (?,?,?,?,?)",
+            (pid, str(f1), "2024-01-01T12:00:00", 0, 1024),
+        )
+        conn.execute(
+            "INSERT INTO frames (project_id, file_path, captured_at, is_dark, file_size) VALUES (?,?,?,?,?)",
+            (pid, str(f2), "2024-06-01T12:00:00", 0, 1024),
+        )
+        conn.commit()
+
+    render = {
+        "project_id": pid,
+        "render_type": "range",
+        "range_start": "2024-01-01T00:00:00",
+        "range_end": "2024-03-01T00:00:00",
+    }
+    paths = render_mod._get_frame_paths(render)
+    assert str(f1) in paths
+    assert str(f2) not in paths  # outside range
+
+
+def test_build_ffmpeg_cmd_lut_traversal_rejected(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """color_grade with path traversal attempt is rejected."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "render_type": "manual",
+        "framerate": 30,
+        "resolution": "1920x1080",
+        "color_grade": "../../../etc/passwd",  # traversal attempt
+        "flicker_reduction": "off",
+        "frame_skip": 1,
+        "frame_blend": False,
+        "stabilize": False,
+    }
+    # Should not raise — traversal is rejected silently, cmd still generated
+    cmd = render_mod._build_ffmpeg_cmd(render, "/tmp/concat.txt", "/tmp/out.mp4", 100, None)
+    # The rejected LUT should NOT appear in the command
+    assert "passwd" not in " ".join(cmd)
+
+
+def test_build_ffmpeg_cmd_valid_lut(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """color_grade with a valid lut name includes lut3d filter."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "render_type": "manual",
+        "framerate": 30,
+        "resolution": "1920x1080",
+        "color_grade": "neutral",
+        "flicker_reduction": "off",
+        "frame_skip": 1,
+        "frame_blend": False,
+        "stabilize": False,
+    }
+    cmd = render_mod._build_ffmpeg_cmd(render, "/tmp/concat.txt", "/tmp/out.mp4", 100, None)
+    cmd_str = " ".join(cmd)
+    # lut3d filter only included if the neutral.cube file exists
+    import os
+    lut_path = os.path.join(render_mod._LUT_DIR, "neutral.cube")
+    if os.path.exists(lut_path):
+        assert "lut3d" in cmd_str
+
+
+# ===========================================================================
 # Capture: disk breach and project-not-found branches
 # ===========================================================================
 
@@ -569,3 +671,267 @@ class _noop_conn:
 
     def fetchone(self):
         return None
+
+
+# ===========================================================================
+# Camera recording-range endpoint
+# ===========================================================================
+
+
+def test_recording_range_with_stats(camera_api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Returns earliest/latest when camera stats are available."""
+    import app.protect as protect_mod
+
+    fixed_start = datetime(2024, 1, 1, tzinfo=UTC)
+    fixed_end = datetime(2024, 6, 1, tzinfo=UTC)
+
+    vstat = MagicMock()
+    vstat.recording_start = fixed_start
+    vstat.recording_end = fixed_end
+
+    cam_stats = MagicMock()
+    cam_stats.video = vstat
+
+    cam = MagicMock()
+    cam.stats = cam_stats
+
+    mock_client = MagicMock()
+    mock_client.bootstrap.cameras = {"cam-x": cam}
+    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+
+    r = camera_api.get("/api/cameras/cam-x/recording-range")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["available"] is True
+    assert "2024-01-01" in data["earliest"]
+    assert "2024-06-01" in data["latest"]
+
+
+def test_recording_range_no_stats(camera_api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Returns available=False when camera has no stats."""
+    import app.protect as protect_mod
+
+    cam = MagicMock()
+    cam.stats = None
+
+    mock_client = MagicMock()
+    mock_client.bootstrap.cameras = {"cam-y": cam}
+    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+
+    r = camera_api.get("/api/cameras/cam-y/recording-range")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["available"] is False
+    assert data["earliest"] is None
+    assert data["latest"] is None
+
+
+def test_recording_range_camera_not_found(camera_api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.protect as protect_mod
+
+    mock_client = MagicMock()
+    mock_client.bootstrap.cameras = {}
+    monkeypatch.setattr(protect_mod.protect_manager, "get_client", AsyncMock(return_value=mock_client))
+
+    r = camera_api.get("/api/cameras/ghost/recording-range")
+    assert r.status_code == 404
+
+
+def test_recording_range_nvr_offline(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import asynccontextmanager
+
+    import app.protect as protect_mod
+    from app.routes import cameras
+
+    monkeypatch.setattr(
+        protect_mod.protect_manager,
+        "get_client",
+        AsyncMock(side_effect=RuntimeError("NVR offline")),
+    )
+
+    @asynccontextmanager
+    async def _noop(app):  # type: ignore[no-untyped-def]
+        yield
+
+    app = FastAPI(lifespan=_noop)
+    app.include_router(cameras.router)
+    client = TestClient(app)
+
+    r = client.get("/api/cameras/cam-1/recording-range")
+    assert r.status_code == 503
+
+
+# ===========================================================================
+# Render: cancel and pause_active
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_render_no_match() -> None:
+    """cancel_active_render returns False when no matching render is active."""
+    import app.render as render_mod
+
+    render_mod._active_render_id = None
+    render_mod._active_proc = None
+
+    result = await render_mod.cancel_active_render(999)
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_render_kills_proc() -> None:
+    """cancel_active_render kills the process and returns True."""
+    import app.render as render_mod
+
+    mock_proc = MagicMock()
+    mock_proc.kill = MagicMock()
+
+    render_mod._active_render_id = 42
+    render_mod._active_proc = mock_proc
+
+    result = await render_mod.cancel_active_render(42)
+    assert result is True
+    mock_proc.kill.assert_called_once()
+
+    # Clean up global state
+    render_mod._active_render_id = None
+    render_mod._active_proc = None
+
+
+@pytest.mark.asyncio
+async def test_pause_active_render_no_match() -> None:
+    """pause_active_render returns False when no matching render is active."""
+    import app.render as render_mod
+
+    render_mod._active_render_id = None
+    render_mod._active_proc = None
+
+    result = await render_mod.pause_active_render(99)
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pause_active_render_kills_proc() -> None:
+    """pause_active_render kills process for matching render and returns True."""
+    import app.render as render_mod
+
+    mock_proc = MagicMock()
+    mock_proc.kill = MagicMock()
+
+    render_mod._active_render_id = 7
+    render_mod._active_proc = mock_proc
+
+    result = await render_mod.pause_active_render(7)
+    assert result is True
+    mock_proc.kill.assert_called_once()
+
+    # Clean up global state
+    render_mod._active_render_id = None
+    render_mod._active_proc = None
+
+
+# ===========================================================================
+# Render: rollup and preview ffmpeg command shapes
+# ===========================================================================
+
+
+def test_build_ffmpeg_cmd_rollup(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rollup render type produces a stream-copy concat command."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "render_type": "auto_weekly",
+        "framerate": 30,
+        "resolution": "1920x1080",
+        "color_grade": "none",
+        "flicker_reduction": "off",
+        "frame_skip": 1,
+        "frame_blend": False,
+        "stabilize": False,
+    }
+    cmd = render_mod._build_ffmpeg_cmd(render, "/tmp/concat.txt", "/tmp/out.mp4", 10, None)
+    assert "-c" in cmd
+    assert "copy" in cmd
+
+
+def test_build_ffmpeg_cmd_preview(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preview render type uses ultrafast preset and 480p resolution."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    render = {
+        "id": 1,
+        "project_id": 1,
+        "render_type": "preview",
+        "framerate": 30,
+        "resolution": "1920x1080",
+        "color_grade": "none",
+        "flicker_reduction": "off",
+        "frame_skip": 1,
+        "frame_blend": False,
+        "stabilize": False,
+    }
+    cmd = render_mod._build_ffmpeg_cmd(render, "/tmp/concat.txt", "/tmp/out.mp4", 10, None)
+    assert "ultrafast" in cmd
+
+
+def test_get_source_resolution_no_frames(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_source_resolution returns (0, 0) when project has no frames."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    result = render_mod._get_source_resolution(99999)
+    assert result == (0, 0)
+
+
+def test_get_first_frame_epoch_no_frames(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_first_frame_epoch returns 0 when project has no frames."""
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    result = render_mod._get_first_frame_epoch(99999)
+    assert result == 0
+
+
+def test_get_first_frame_epoch_with_frame(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_get_first_frame_epoch returns epoch seconds for the first frame."""
+    from datetime import UTC, datetime
+
+    import app.database as db_mod
+    import app.render as render_mod
+
+    monkeypatch.setattr(render_mod, "get_connection", db_mod.get_connection)
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (name, camera_id, project_type, interval_seconds) VALUES (?,?,?,?)",
+            ("EpochProj", "cam-e", "live", 60),
+        )
+        conn.commit()
+        pid = cur.lastrowid
+
+    f = tmp_path / "epoch_frame.jpg"
+    f.write_bytes(b"")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO frames (project_id, file_path, captured_at, is_dark, file_size) VALUES (?,?,?,?,?)",
+            (pid, str(f), "2024-03-15T12:00:00", 0, 1024),
+        )
+        conn.commit()
+
+    result = render_mod._get_first_frame_epoch(pid)
+    expected = int(datetime(2024, 3, 15, 12, 0, 0, tzinfo=UTC).timestamp())
+    assert result == expected

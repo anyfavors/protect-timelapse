@@ -1,6 +1,4 @@
-"""
-Phase 1 smoke tests — database schema, config, and health endpoint.
-"""
+"""Tests for database schema, config, and health endpoint."""
 
 import sqlite3
 from pathlib import Path

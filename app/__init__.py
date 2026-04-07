@@ -18,7 +18,10 @@ from app.routes import (
     cameras,
     frames,
     health,
+    maintenance,
+    metrics,
     notifications,
+    presets,
     projects,
     renders,
     settings,
@@ -93,6 +96,15 @@ def create_app() -> FastAPI:
     application = FastAPI(title="Protect Timelapse", lifespan=lifespan)
     application.add_middleware(GZipMiddleware, minimum_size=500)
 
+    # Attach rate limiter state (slowapi)
+    from slowapi import _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+
+    from app.limiter import limiter
+
+    application.state.limiter = limiter
+    application.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+
     application.include_router(health.router)
     application.include_router(cameras.router)
     application.include_router(projects.router)
@@ -101,6 +113,9 @@ def create_app() -> FastAPI:
     application.include_router(templates.router)
     application.include_router(notifications.router)
     application.include_router(settings.router)
+    application.include_router(presets.router)
+    application.include_router(maintenance.router)
+    application.include_router(metrics.router)
     application.include_router(ws_router)
 
     # Serve compiled CSS + app.js
@@ -108,14 +123,32 @@ def create_app() -> FastAPI:
     if os.path.isdir(static_dir):
         application.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-    # Serve the SPA shell
+    # Serve the SPA shell with cache-busting query strings on static assets
     templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
     if os.path.isdir(templates_dir):
-        from fastapi.responses import FileResponse
+        import hashlib
+
+        from fastapi.templating import Jinja2Templates
+        from starlette.requests import Request
+
+        _jinja = Jinja2Templates(directory=templates_dir)
+
+        def _file_hash(path: str) -> str:
+            """Return first 8 hex chars of the SHA-256 of a file, or 'dev' if missing."""
+            try:
+                with open(path, "rb") as fh:
+                    return hashlib.sha256(fh.read()).hexdigest()[:8]
+            except OSError:
+                return "dev"
+
+        _js_hash = _file_hash(os.path.join(static_dir, "app.js"))
+        _css_hash = _file_hash(os.path.join(static_dir, "app.css"))
 
         @application.get("/", include_in_schema=False)
-        async def serve_spa() -> FileResponse:
-            return FileResponse(os.path.join(templates_dir, "index.html"))
+        async def serve_spa(request: Request):  # type: ignore[return]
+            return _jinja.TemplateResponse(
+                request, "index.html", {"js_hash": _js_hash, "css_hash": _css_hash}
+            )
 
     return application
 

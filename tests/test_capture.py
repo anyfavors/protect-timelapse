@@ -280,3 +280,124 @@ async def test_motion_filter_skips_static_frame(tmp_db: Path, monkeypatch, tmp_p
         ]
     # Frame count should still be 1 (second frame skipped)
     assert count2 == 1
+
+
+# ===========================================================================
+# Location cache and daylight/solar-noon helpers
+# ===========================================================================
+
+
+def test_get_location_info_returns_location(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_location_info builds a LocationInfo and caches it."""
+    import app.capture as cap_mod
+    import app.config as config_mod
+
+    monkeypatch.setenv("LATITUDE", "55.676098")
+    monkeypatch.setenv("LONGITUDE", "12.568337")
+    monkeypatch.setenv("TZ", "Europe/Copenhagen")
+    monkeypatch.setattr(config_mod, "_settings", None)
+    # Reset cache so the fresh env is picked up
+    cap_mod._location_info_cache = None
+
+    tz_name, city = cap_mod._get_location_info()
+    assert tz_name == "Europe/Copenhagen"
+    assert hasattr(city, "observer")
+
+    # Second call should hit cache
+    tz_name2, city2 = cap_mod._get_location_info()
+    assert city2 is city  # same object = cache hit
+
+
+def test_invalidate_location_cache(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """invalidate_location_cache clears the cache so next call rebuilds."""
+    import app.capture as cap_mod
+    import app.config as config_mod
+
+    monkeypatch.setenv("LATITUDE", "55.676098")
+    monkeypatch.setenv("LONGITUDE", "12.568337")
+    monkeypatch.setenv("TZ", "Europe/Copenhagen")
+    monkeypatch.setattr(config_mod, "_settings", None)
+    cap_mod._location_info_cache = None
+
+    _, city1 = cap_mod._get_location_info()
+    cap_mod.invalidate_location_cache()
+    assert cap_mod._location_info_cache is None
+
+    _, city2 = cap_mod._get_location_info()
+    # After invalidation a new LocationInfo is built (different object)
+    assert city2 is not city1
+
+
+def test_is_daylight_returns_bool(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_is_daylight returns True or False without raising."""
+    import app.capture as cap_mod
+    import app.config as config_mod
+
+    monkeypatch.setenv("LATITUDE", "55.676098")
+    monkeypatch.setenv("LONGITUDE", "12.568337")
+    monkeypatch.setenv("TZ", "Europe/Copenhagen")
+    monkeypatch.setattr(config_mod, "_settings", None)
+    cap_mod._location_info_cache = None
+
+    result = cap_mod._is_daylight()
+    assert isinstance(result, bool)
+
+
+def test_is_solar_noon_window_returns_bool(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_is_solar_noon_window returns True or False for a project with window settings."""
+    import app.capture as cap_mod
+    import app.config as config_mod
+
+    monkeypatch.setenv("LATITUDE", "55.676098")
+    monkeypatch.setenv("LONGITUDE", "12.568337")
+    monkeypatch.setenv("TZ", "Europe/Copenhagen")
+    monkeypatch.setattr(config_mod, "_settings", None)
+    cap_mod._location_info_cache = None
+
+    project = {"solar_noon_window_minutes": 30}
+    result = cap_mod._is_solar_noon_window(project)
+    assert isinstance(result, bool)
+
+
+def test_reschedule_project_job_no_existing_job(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reschedule_project_job falls back to _register_job when job doesn't exist."""
+    import app.capture as cap_mod
+
+    registered: list[int] = []
+
+    def _fake_register(pid: int, interval: int, mode: str = "continuous") -> None:
+        registered.append(pid)
+
+    monkeypatch.setattr(cap_mod, "_register_job", _fake_register)
+    # Ensure job doesn't exist (fresh scheduler)
+    import asyncio
+
+    asyncio.get_event_loop().run_until_complete(
+        cap_mod.reschedule_project_job(99999, 60, "continuous")
+    )
+    assert 99999 in registered
+
+
+def test_resume_project_job_no_existing_job(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """resume_project_job falls back to _register_job when job doesn't exist."""
+    import app.capture as cap_mod
+
+    registered: list[int] = []
+
+    def _fake_register(pid: int, interval: int, mode: str = "continuous") -> None:
+        registered.append(pid)
+
+    monkeypatch.setattr(cap_mod, "_register_job", _fake_register)
+
+    import asyncio
+
+    asyncio.get_event_loop().run_until_complete(
+        cap_mod.resume_project_job(99998, 60, "continuous")
+    )
+    assert 99998 in registered

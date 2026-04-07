@@ -5,6 +5,7 @@ The webhook POST is fire-and-forget with a 10-second timeout.
 """
 
 import ipaddress
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -29,6 +30,22 @@ async def notify(
     Never raises — errors are logged and suppressed.
     """
     now = datetime.now(UTC).isoformat()
+
+    # 0. Check per-project mute list
+    if project_id is not None:
+        try:
+            with get_connection() as conn:
+                mute_row = conn.execute(
+                    "SELECT muted_project_ids FROM settings WHERE id = 1"
+                ).fetchone()
+            muted: list[int] = json.loads(
+                (mute_row["muted_project_ids"] or "[]") if mute_row else "[]"
+            )
+            if project_id in muted:
+                log.debug("Notification suppressed for muted project %d", project_id)
+                return
+        except Exception:
+            pass
 
     # 1. Persist to notifications table (always)
     try:

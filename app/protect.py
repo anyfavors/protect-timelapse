@@ -14,6 +14,22 @@ from app.config import get_settings
 log = logging.getLogger("app.protect")
 
 
+def _classify_nvr_error(exc: Exception) -> str:
+    """Classify an NVR exception into a short error type string."""
+    s = str(exc).lower()
+    if "timeout" in s or "timed out" in s:
+        return "timeout"
+    if "401" in s or "unauthorized" in s or "authentication" in s:
+        return "auth_failure"
+    if "404" in s or "not found" in s:
+        return "not_found"
+    if "ssl" in s or "certificate" in s:
+        return "ssl_error"
+    if "refused" in s or "connect" in s:
+        return "connection_refused"
+    return "unknown"
+
+
 class ProtectClientManager:
     """
     Lazy-initialising, lock-protected singleton for the uiprotect client.
@@ -27,6 +43,7 @@ class ProtectClientManager:
         self._camera_count = 0
         self._last_health_check: datetime | None = None
         self._last_error: str | None = None
+        self._last_error_type: str | None = None
 
     async def setup(self) -> None:
         """Authenticate with the NVR and load the bootstrap data."""
@@ -64,6 +81,7 @@ class ProtectClientManager:
             except Exception as exc:
                 self._connected = False
                 self._last_error = str(exc)
+                self._last_error_type = _classify_nvr_error(exc)
                 log.warning("Could not connect to NVR at startup: %s", exc)
 
     async def reconnect(self) -> None:
@@ -101,6 +119,7 @@ class ProtectClientManager:
                     log.info("Reconnected to NVR")
                 except Exception as exc:
                     self._last_error = str(exc)
+                    self._last_error_type = _classify_nvr_error(exc)
                     raise RuntimeError(f"NVR offline: {exc}") from exc
             return self._client
 
@@ -139,6 +158,7 @@ class ProtectClientManager:
             except Exception as exc:
                 self._connected = False
                 self._last_error = str(exc)
+                self._last_error_type = _classify_nvr_error(exc)
                 log.warning("Bootstrap refresh failed: %s", exc)
                 return False
 
@@ -163,6 +183,7 @@ class ProtectClientManager:
         except Exception as exc:
             self._connected = False
             self._last_error = str(exc)
+            self._last_error_type = _classify_nvr_error(exc)
 
         if was_connected != self._connected:
             state = "connected" if self._connected else "disconnected"
@@ -172,6 +193,7 @@ class ProtectClientManager:
             "connected": self._connected,
             "camera_count": self._camera_count,
             "last_error": self._last_error,
+            "last_error_type": self._last_error_type,
             "last_check": self._last_health_check.isoformat() if self._last_health_check else None,
         }
 
@@ -186,6 +208,7 @@ class ProtectClientManager:
             "connected": self._connected,
             "camera_count": self._camera_count,
             "last_error": self._last_error,
+            "last_error_type": self._last_error_type,
             "last_check": self._last_health_check.isoformat() if self._last_health_check else None,
         }
 

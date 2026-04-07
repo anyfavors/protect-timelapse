@@ -1,5 +1,4 @@
-"""
-Tests for Phase 4 additions and coverage gaps.
+"""Tests for API route coverage.
 
 Covers: disk endpoint, settings watermark, NVR tester, frame delete,
         blurry frames, GIF export, cursor pagination, ETag on thumbnails,

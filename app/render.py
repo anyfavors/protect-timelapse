@@ -26,6 +26,12 @@ _worker_task: asyncio.Task | None = None  # type: ignore[type-arg]
 _active_render_id: int | None = None
 _active_proc: asyncio.subprocess.Process | None = None  # type: ignore[type-arg]
 
+# Pre-compiled regex for ffmpeg progress lines — avoids re-compiling on every stderr line
+_FRAME_RE = re.compile(r"frame=\s*(\d+)")
+
+# Stall detection: if render progress doesn't advance for this long, mark stalled
+_STALL_TIMEOUT_SECONDS = 600
+
 
 def get_active_render_id() -> int | None:
     return _active_render_id
@@ -39,6 +45,19 @@ async def cancel_active_render(render_id: int) -> bool:
     try:
         _active_proc.kill()
         log.info("Render id=%d cancelled by user request", render_id)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+async def pause_active_render(render_id: int) -> bool:
+    """Pause a rendering job: kill ffmpeg and set status to 'paused'. Returns True if paused."""
+    global _active_proc, _active_render_id
+    if _active_render_id != render_id or _active_proc is None:
+        return False
+    try:
+        _active_proc.kill()
+        log.info("Render id=%d paused by user request", render_id)
         return True
     except (ProcessLookupError, OSError):
         return False
@@ -103,9 +122,20 @@ async def _process_next_render() -> None:
     project_id = render["project_id"]
     settings = get_settings()
 
-    # Lock the row
+    # Snapshot DB settings at render-start so mid-render changes don't affect this job
+    try:
+        with get_connection() as conn:
+            _settings_row = conn.execute("SELECT * FROM settings WHERE id = 1").fetchone()
+        render_settings: dict = dict(_settings_row) if _settings_row else {}
+    except Exception:
+        render_settings = {}
+
+    # Lock the row and stamp start time (for ETA calculation in UI)
     with get_connection() as conn:
-        conn.execute("UPDATE renders SET status = 'rendering' WHERE id = ?", (render_id,))
+        conn.execute(
+            "UPDATE renders SET status = 'rendering', started_at = ? WHERE id = ?",
+            (datetime.now(UTC).isoformat(), render_id),
+        )
         conn.commit()
 
     global _active_render_id
@@ -178,9 +208,10 @@ async def _process_next_render() -> None:
                 )
                 transforms_file = None
 
-        # Build ffmpeg command
+        # Build ffmpeg command (pass snapshotted settings to avoid mid-render staleness)
         cmd = _build_ffmpeg_cmd(
-            render, concat_file, output_path, total_frames, settings, transforms_file
+            render, concat_file, output_path, total_frames, settings, transforms_file,
+            render_settings=render_settings,
         )
 
         proc = await asyncio.create_subprocess_exec(
@@ -192,9 +223,9 @@ async def _process_next_render() -> None:
         global _active_proc
         _active_proc = proc  # expose for cancellation (F1)
 
-        # Adaptive timeout: base + 2s per frame, capped at configured max (B8)
+        # Adaptive timeout: at least base_timeout, grows by 2s/frame (so large renders don't timeout)
         base_timeout = getattr(settings, "ffmpeg_timeout_seconds", 7200)
-        adaptive_timeout = min(base_timeout, max(300, total_frames * 2))
+        adaptive_timeout = max(base_timeout, total_frames * 2)
         log.debug(
             "Render id=%d: adaptive timeout=%ds for %d frames",
             render_id,
@@ -202,8 +233,9 @@ async def _process_next_render() -> None:
             total_frames,
         )
 
-        # Progress monitoring
-        await _monitor_progress(proc, render_id, total_frames, adaptive_timeout)
+        # Progress monitoring (pass monotonic start time for ETA calculation)
+        _render_monotonic_start = time.monotonic()
+        await _monitor_progress(proc, render_id, total_frames, adaptive_timeout, started_at=_render_monotonic_start)
 
         if proc.returncode != 0:
             stderr_bytes = await proc.stderr.read() if proc.stderr else b""  # type: ignore[union-attr]
@@ -364,6 +396,7 @@ def _build_ffmpeg_cmd(
     total_frames: int,
     settings: object,
     transforms_file: str | None = None,
+    render_settings: dict | None = None,
 ) -> list[str]:
     framerate = render["framerate"]
     render_type = render["render_type"]
@@ -414,16 +447,17 @@ def _build_ffmpeg_cmd(
     if render.get("frame_blend") and total_frames >= 3:
         filters.append("tmix=frames=3:weights='1 2 1'")
 
-    # Deflicker — needs at least `size` frames or ffmpeg aborts (exit -6 / SIGABRT)
+    # Deflicker — needs at least `size` frames after skip_factor reduction or ffmpeg
+    # aborts with a boundary error (exit -6 / SIGABRT).
+    # Use effective_frames (post-skip) to guard the window size.
+    effective_frames = math.ceil(total_frames / skip_factor) if skip_factor > 1 else total_frames
     flicker = render.get("flicker_reduction") or "standard"
-    if flicker == "standard" and total_frames >= 10:
-        filters.append("deflicker=mode=pm:size=10")
-    elif flicker in ("strong", "holy_grail") and total_frames >= 50:
-        filters.append("deflicker=mode=pm:size=50")
-    elif flicker in ("strong", "holy_grail") and total_frames >= 10:
-        # Fall back to smaller window when not enough frames for size=50
-        filters.append("deflicker=mode=pm:size=10")
-    # "off" or too few frames → no deflicker filter added
+    if flicker != "off":
+        if effective_frames >= 50 and flicker in ("strong", "holy_grail"):
+            filters.append("deflicker=mode=pm:size=50")
+        elif effective_frames >= 10:
+            filters.append("deflicker=mode=pm:size=10")
+        # too few effective frames → skip deflicker silently
 
     # Resolution / scale
     resolution = render.get("resolution") or "1920x1080"
@@ -459,13 +493,21 @@ def _build_ffmpeg_cmd(
         filters.append(f"vidstabtransform=input={transforms_file}:zoom=1:smoothing=30")
         filters.append("unsharp=5:5:0.8:3:3:0.4")
 
-    # Timestamp burn-in
-    try:
-        with get_connection() as conn:
-            row = conn.execute("SELECT timestamp_burn_in FROM settings WHERE id = 1").fetchone()
-        burn_in = row["timestamp_burn_in"] if row else 0
-    except Exception:
-        burn_in = 0
+    # Use snapshotted settings if provided, otherwise fall back to live DB read
+    _rs = render_settings or {}
+
+    # Timestamp burn-in — prefer snapshotted value; fall back to live DB read if no snapshot
+    if render_settings is not None:
+        burn_in = _rs.get("timestamp_burn_in") or 0
+    else:
+        try:
+            with get_connection() as conn:
+                _bi_row = conn.execute(
+                    "SELECT timestamp_burn_in FROM settings WHERE id = 1"
+                ).fetchone()
+            burn_in = _bi_row["timestamp_burn_in"] if _bi_row else 0
+        except Exception:
+            burn_in = 0
 
     if burn_in:
         epoch = _get_first_frame_epoch(render["project_id"])
@@ -476,20 +518,23 @@ def _build_ffmpeg_cmd(
 
     # Watermark overlay (movie filter + overlay) — validate path to prevent traversal (#3)
     watermark_path: str | None = None
-    try:
-        with get_connection() as conn:
-            wm_row = conn.execute("SELECT watermark_path FROM settings WHERE id = 1").fetchone()
-        if wm_row and wm_row["watermark_path"]:
-            wm_real = os.path.realpath(wm_row["watermark_path"])
-            # Only allow paths inside /data/ to prevent arbitrary file inclusion
-            if wm_real.startswith("/data/") and os.path.exists(wm_real):
-                watermark_path = wm_real
-            else:
-                log.warning(
-                    "Render: rejected watermark path outside /data/: %r", wm_row["watermark_path"]
-                )
-    except Exception:
-        pass
+    _wm_path_raw = _rs.get("watermark_path")
+    if not _wm_path_raw and not render_settings:
+        try:
+            with get_connection() as conn:
+                wm_row = conn.execute(
+                    "SELECT watermark_path FROM settings WHERE id = 1"
+                ).fetchone()
+            _wm_path_raw = wm_row["watermark_path"] if wm_row else None
+        except Exception:
+            pass
+    if _wm_path_raw:
+        wm_real = os.path.realpath(_wm_path_raw)
+        # Only allow paths inside /data/ to prevent arbitrary file inclusion
+        if wm_real.startswith("/data/") and os.path.exists(wm_real):
+            watermark_path = wm_real
+        else:
+            log.warning("Render: rejected watermark path outside /data/: %r", _wm_path_raw)
 
     # Build final vf / filter_complex
     filter_complex: str | None = None
@@ -586,24 +631,65 @@ async def _monitor_progress(
     render_id: int,
     total_frames: int,
     timeout_seconds: int,
+    started_at: float | None = None,
 ) -> None:
-    """Read stderr line by line, update progress_pct at most once per second."""
+    """Read stderr line by line, update progress_pct at most once per second.
+
+    Also detects stalls (no progress for _STALL_TIMEOUT_SECONDS) and kills ffmpeg.
+    """
     last_update = 0.0
-    frame_re = re.compile(r"frame=\s*(\d+)")
+    last_pct = -1
+    last_progress_change = time.monotonic()
+    stalled = False
 
     async def _read_stderr() -> None:
-        nonlocal last_update
+        nonlocal last_update, last_pct, last_progress_change, stalled
         if proc.stderr is None:
             return
         async for line in proc.stderr:
             decoded = line.decode(errors="replace")
-            m = frame_re.search(decoded)
+            m = _FRAME_RE.search(decoded)
             if m and total_frames > 0:
                 current = int(m.group(1))
                 pct = min(100, int(current / total_frames * 100))
                 now = time.monotonic()
+
+                # Stall detection
+                if pct != last_pct:
+                    last_pct = pct
+                    last_progress_change = now
+                elif now - last_progress_change > _STALL_TIMEOUT_SECONDS:
+                    stalled = True
+                    log.error(
+                        "Render id=%d stalled (no progress for %ds) — killing ffmpeg",
+                        render_id,
+                        _STALL_TIMEOUT_SECONDS,
+                    )
+                    with contextlib.suppress(Exception), get_connection() as conn:
+                        conn.execute(
+                            "UPDATE renders SET status = 'stalled' WHERE id = ?",
+                            (render_id,),
+                        )
+                        conn.commit()
+                    from app.notifications import notify
+
+                    with contextlib.suppress(Exception):
+                        await notify(
+                            event="render_stalled",
+                            level="error",
+                            message=f"Render #{render_id} stalled — no progress for {_STALL_TIMEOUT_SECONDS // 60} min.",
+                        )
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
+                    return
+
                 if now - last_update >= 1.0:
                     last_update = now
+                    # Compute ETA from elapsed time and progress
+                    eta_seconds: int | None = None
+                    if started_at is not None and pct > 0:
+                        elapsed = now - started_at
+                        eta_seconds = int(elapsed / (pct / 100) * (1 - pct / 100))
                     with contextlib.suppress(Exception), get_connection() as conn:
                         conn.execute(
                             "UPDATE renders SET progress_pct = ? WHERE id = ?",
@@ -618,6 +704,7 @@ async def _monitor_progress(
                             {
                                 "render_id": render_id,
                                 "progress_pct": pct,
+                                "eta_seconds": eta_seconds,
                             },
                         )
 
@@ -632,6 +719,9 @@ async def _monitor_progress(
             proc.kill()
         raise
 
+    if stalled:
+        raise RuntimeError(f"Render stalled: no ffmpeg progress for {_STALL_TIMEOUT_SECONDS}s")
+
 
 # -------------------------------------------------------------------------
 # Render estimate (used by POST /api/renders)
@@ -639,10 +729,15 @@ async def _monitor_progress(
 
 
 def estimate_render(project_id: int, framerate: int, render_type: str = "manual") -> dict:
-    """Return estimated render duration and output file size."""
+    """Return estimated render duration and output file size.
+
+    Applies the same is_dark + is_blurry filters as the actual render so
+    the estimate reflects what ffmpeg will actually process.
+    """
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt, AVG(file_size) as avg_size FROM frames WHERE project_id = ? AND is_dark = 0",
+            "SELECT COUNT(*) as cnt, AVG(file_size) as avg_size FROM frames "
+            "WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)",
             (project_id,),
         ).fetchone()
 
