@@ -1330,11 +1330,16 @@ document.addEventListener('alpine:init', () => {
         'webhook_url','disk_warning_threshold_gb','timestamp_burn_in','default_framerate',
         'render_poll_interval_seconds','protect_host','protect_port','protect_verify_ssl',
         'latitude','longitude','tz','dark_mode','maintenance_hour','maintenance_minute',
-        'nvr_reconnect_backoff_seconds','muted_project_ids',
+        'nvr_reconnect_backoff_seconds',
       ];
       const payload = Object.fromEntries(
         SETTINGS_FIELDS.map(k => [k, this.settingsData[k] !== undefined ? this.settingsData[k] : null])
       );
+      // muted_project_ids is stored as a JSON string in the DB — parse before sending
+      const rawMuted = this.settingsData['muted_project_ids'];
+      payload['muted_project_ids'] = rawMuted
+        ? (Array.isArray(rawMuted) ? rawMuted : JSON.parse(rawMuted))
+        : [];
       const data = await this.api('/api/settings', 'PUT', payload);
       if (data) {
         this.settingsData = data;
