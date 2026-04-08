@@ -1326,7 +1326,16 @@ document.addEventListener('alpine:init', () => {
     },
 
     async saveSettings() {
-      const data = await this.api('/api/settings', 'PUT', this.settingsData);
+      const SETTINGS_FIELDS = [
+        'webhook_url','disk_warning_threshold_gb','timestamp_burn_in','default_framerate',
+        'render_poll_interval_seconds','protect_host','protect_port','protect_verify_ssl',
+        'latitude','longitude','tz','dark_mode','maintenance_hour','maintenance_minute',
+        'nvr_reconnect_backoff_seconds','muted_project_ids',
+      ];
+      const payload = Object.fromEntries(
+        SETTINGS_FIELDS.map(k => [k, this.settingsData[k] !== undefined ? this.settingsData[k] : null])
+      );
+      const data = await this.api('/api/settings', 'PUT', payload);
       if (data) {
         this.settingsData = data;
         this.loadTheme(data.dark_mode);

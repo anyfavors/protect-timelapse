@@ -118,7 +118,7 @@ def test_health_api_ok(e2e_server: str) -> None:
 
 
 def test_dark_mode_toggle_persists(page: Page, e2e_server: str) -> None:
-    """Toggling dark mode changes the <html> class and persists to localStorage."""
+    """Toggling dark mode changes the <html> class, persists to localStorage AND the DB."""
     page.goto(e2e_server)
     page.wait_for_selector("nav", timeout=10_000)
 
@@ -130,9 +130,9 @@ def test_dark_mode_toggle_persists(page: Page, e2e_server: str) -> None:
     html = page.locator("html")
     initial_dark = "dark" in (html.get_attribute("class") or "")
 
-    # Click toggle
+    # Click toggle — wait long enough for the async PUT /api/settings to complete
     toggle.click()
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(1500)
 
     after_dark = "dark" in (html.get_attribute("class") or "")
     assert after_dark != initial_dark, "Dark class should have toggled on <html>"
@@ -141,11 +141,20 @@ def test_dark_mode_toggle_persists(page: Page, e2e_server: str) -> None:
     stored = page.evaluate("() => localStorage.getItem('darkMode')")
     assert stored == str(after_dark).lower(), f"localStorage.darkMode should be {after_dark}"
 
+    # Verify the API actually persisted it to the DB (not silently failed)
+    r = requests.get(f"{e2e_server}/api/settings")
+    db_dark = bool(r.json().get("dark_mode"))
+    assert db_dark == after_dark, "DB dark_mode should match the toggled state"
+
     # Toggle back
     toggle.click()
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(1500)
     final_dark = "dark" in (html.get_attribute("class") or "")
     assert final_dark == initial_dark, "Second toggle should restore original state"
+
+    # Verify DB is back to initial state too — proves toggleDark doesn't wipe other fields
+    r2 = requests.get(f"{e2e_server}/api/settings")
+    assert bool(r2.json().get("dark_mode")) == final_dark, "DB should reflect restored state"
 
 
 def test_dark_mode_survives_reload(page: Page, e2e_server: str) -> None:
@@ -244,6 +253,29 @@ def test_dark_mode_api_roundtrip(e2e_server: str) -> None:
 
     r2 = requests.get(f"{e2e_server}/api/settings")
     assert r2.json()["dark_mode"] in (1, True)
+
+    # Restore
+    requests.put(f"{e2e_server}/api/settings", json={"dark_mode": False})
+
+
+def test_toggle_dark_does_not_clear_protect_host(e2e_server: str) -> None:
+    """Toggling dark mode via the API must not wipe protect_host or other fields.
+
+    This is a regression test for the bug where PUT /api/settings with only
+    {dark_mode: true} would NULL out protect_host because the backend used
+    model_dump() instead of model_dump(exclude_unset=True).
+    """
+    # Set a known protect_host value
+    requests.put(f"{e2e_server}/api/settings", json={"protect_host": "192.168.1.1"})
+
+    r = requests.get(f"{e2e_server}/api/settings")
+    assert r.json()["protect_host"] == "192.168.1.1", "protect_host should be set before test"
+
+    # Toggle dark mode only — must NOT clear protect_host
+    requests.put(f"{e2e_server}/api/settings", json={"dark_mode": True})
+
+    r2 = requests.get(f"{e2e_server}/api/settings")
+    assert r2.json()["protect_host"] == "192.168.1.1", "protect_host must not be wiped by dark mode toggle"
 
     # Restore
     requests.put(f"{e2e_server}/api/settings", json={"dark_mode": False})

@@ -56,6 +56,10 @@ def get_settings_route() -> dict:
 
 @router.put("/settings")
 async def update_settings(payload: SettingsUpdate) -> dict:
+    # Use exclude_unset=True so fields absent from the request body are not touched.
+    # This prevents partial updates (e.g. toggleDark sending only dark_mode) from
+    # inadvertently NULLing out other fields like protect_host.
+    sent = payload.model_dump(exclude_unset=True)
     data = payload.model_dump()
 
     # Build SET clause — include explicit None values so fields can be cleared
@@ -66,7 +70,8 @@ async def update_settings(payload: SettingsUpdate) -> dict:
 
     _bool_as_int = {"timestamp_burn_in", "protect_verify_ssl", "dark_mode"}
     _json_fields = {"muted_project_ids"}
-    for key, val in data.items():
+    _nullable_overrides = {"protect_host", "protect_port", "protect_verify_ssl", "latitude", "longitude", "tz"}
+    for key, val in sent.items():
         if key in _bool_as_int and val is not None:
             set_parts.append(f"{key} = ?")
             values.append(int(val))
@@ -77,15 +82,8 @@ async def update_settings(payload: SettingsUpdate) -> dict:
             set_parts.append(f"{key} = ?")
             values.append(val)
         else:
-            # Explicit None — only clear override fields (not required fields)
-            if key in {
-                "protect_host",
-                "protect_port",
-                "protect_verify_ssl",
-                "latitude",
-                "longitude",
-                "tz",
-            }:
+            # Explicit None in the payload — only clear known nullable override fields
+            if key in _nullable_overrides:
                 set_parts.append(f"{key} = NULL")
 
     if set_parts:
@@ -97,8 +95,8 @@ async def update_settings(payload: SettingsUpdate) -> dict:
             conn.commit()
 
     # Reconnect NVR if any NVR override fields were touched
-    nvr_touched = any(k in _NVR_FIELDS for k in data if data[k] is not None)
-    if nvr_touched or any(k in _NVR_FIELDS and data[k] is None for k in _NVR_FIELDS):
+    nvr_touched = any(k in _NVR_FIELDS for k in sent)
+    if nvr_touched:
         from app.protect import protect_manager
 
         with contextlib.suppress(Exception):
@@ -106,7 +104,7 @@ async def update_settings(payload: SettingsUpdate) -> dict:
 
     # Invalidate LocationInfo cache if geolocation fields changed
     _GEO_FIELDS = {"latitude", "longitude", "tz"}
-    if any(k in _GEO_FIELDS for k in data):
+    if any(k in _GEO_FIELDS for k in sent):
         with contextlib.suppress(Exception):
             from app.capture import invalidate_location_cache
 
@@ -114,7 +112,7 @@ async def update_settings(payload: SettingsUpdate) -> dict:
 
     # Re-register maintenance job if schedule changed
     _MAINT_FIELDS = {"maintenance_hour", "maintenance_minute"}
-    if any(k in _MAINT_FIELDS and data.get(k) is not None for k in _MAINT_FIELDS):
+    if any(k in _MAINT_FIELDS and sent.get(k) is not None for k in _MAINT_FIELDS):
         with contextlib.suppress(Exception):
             from app.capture import scheduler
             from app.maintenance import register_maintenance_job
