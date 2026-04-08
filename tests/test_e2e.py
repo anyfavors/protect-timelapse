@@ -275,7 +275,9 @@ def test_toggle_dark_does_not_clear_protect_host(e2e_server: str) -> None:
     requests.put(f"{e2e_server}/api/settings", json={"dark_mode": True})
 
     r2 = requests.get(f"{e2e_server}/api/settings")
-    assert r2.json()["protect_host"] == "192.168.1.1", "protect_host must not be wiped by dark mode toggle"
+    assert r2.json()["protect_host"] == "192.168.1.1", (
+        "protect_host must not be wiped by dark mode toggle"
+    )
 
     # Restore
     requests.put(f"{e2e_server}/api/settings", json={"dark_mode": False})

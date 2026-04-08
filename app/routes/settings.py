@@ -60,7 +60,6 @@ async def update_settings(payload: SettingsUpdate) -> dict:
     # This prevents partial updates (e.g. toggleDark sending only dark_mode) from
     # inadvertently NULLing out other fields like protect_host.
     sent = payload.model_dump(exclude_unset=True)
-    data = payload.model_dump()
 
     # Build SET clause — include explicit None values so fields can be cleared
     # (NULL = "use env default" for override fields).
@@ -70,7 +69,14 @@ async def update_settings(payload: SettingsUpdate) -> dict:
 
     _bool_as_int = {"timestamp_burn_in", "protect_verify_ssl", "dark_mode"}
     _json_fields = {"muted_project_ids"}
-    _nullable_overrides = {"protect_host", "protect_port", "protect_verify_ssl", "latitude", "longitude", "tz"}
+    _nullable_overrides = {
+        "protect_host",
+        "protect_port",
+        "protect_verify_ssl",
+        "latitude",
+        "longitude",
+        "tz",
+    }
     for key, val in sent.items():
         if key in _bool_as_int and val is not None:
             set_parts.append(f"{key} = ?")
