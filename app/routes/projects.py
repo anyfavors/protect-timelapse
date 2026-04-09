@@ -8,7 +8,6 @@ import contextlib
 import logging
 import os
 import shutil
-import unittest.mock as _mock
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -471,16 +470,12 @@ def schedule_test(
     else:
         test_time = datetime.now(UTC)
 
-    # _check_capture_mode uses datetime.now() internally — patch it temporarily
-    with _mock.patch("app.capture.datetime") as mock_dt:
-        mock_dt.now.return_value = test_time
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        error_msg: str | None = None
-        try:
-            would_capture: bool | None = _check_capture_mode(project)
-        except Exception as exc:
-            would_capture = None
-            error_msg = str(exc)
+    error_msg: str | None = None
+    try:
+        would_capture: bool | None = _check_capture_mode(project, now=test_time)
+    except Exception as exc:
+        would_capture = None
+        error_msg = str(exc)
 
     return {
         "project_id": project_id,

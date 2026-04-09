@@ -301,8 +301,9 @@ def test_get_frame_paths_rollup(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -
             conn.commit()
 
         render = {"project_id": pid, "render_type": "auto_weekly"}
-        paths = render_mod._get_frame_paths(render)
+        paths, truncated = render_mod._get_frame_paths(render)
         assert mp4_path in paths
+        assert truncated == 0
     finally:
         os.unlink(mp4_path)
 
@@ -383,8 +384,14 @@ def test_estimate_render_with_frames(tmp_db: Path, monkeypatch: pytest.MonkeyPat
         pid = cur.lastrowid
         for _i in range(90):
             conn.execute(
-                "INSERT INTO frames (project_id, file_path, thumbnail_path, file_size, is_dark) VALUES (?,?,?,?,0)",
-                (pid, "", "", 200000),
+                "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size, is_dark) VALUES (?,?,?,?,?,0)",
+                (
+                    pid,
+                    f"2024-01-01T{_i // 3600:02d}:{(_i % 3600) // 60:02d}:{_i % 60:02d}",
+                    "",
+                    "",
+                    200000,
+                ),
             )
         conn.commit()
 
@@ -441,9 +448,10 @@ def test_get_frame_paths_range(
         "range_start": "2024-01-01T00:00:00",
         "range_end": "2024-03-01T00:00:00",
     }
-    paths = render_mod._get_frame_paths(render)
+    paths, truncated = render_mod._get_frame_paths(render)
     assert str(f1) in paths
     assert str(f2) not in paths  # outside range
+    assert truncated == 0
 
 
 def test_build_ffmpeg_cmd_lut_traversal_rejected(

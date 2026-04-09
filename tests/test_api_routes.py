@@ -69,21 +69,28 @@ def _insert_project(tmp_path: Path) -> int:
     return cur.lastrowid  # type: ignore[return-value]
 
 
+_frame_counter = 0
+
+
 def _insert_frame(project_id: int, tmp_path: Path, is_blurry: int = 0) -> int:
+    global _frame_counter
+    _frame_counter += 1
     frames_dir = tmp_path / "frames" / str(project_id)
     thumbs_dir = tmp_path / "thumbs" / str(project_id)
     frames_dir.mkdir(parents=True, exist_ok=True)
     thumbs_dir.mkdir(parents=True, exist_ok=True)
     jpeg = _make_jpeg()
-    frame_file = frames_dir / "20240101120000.jpg"
-    thumb_file = thumbs_dir / "20240101120000.jpg"
+    ts = f"2024010112{_frame_counter:04d}00"
+    captured_at = f"2024-01-01T12:{_frame_counter // 100:02d}:{_frame_counter % 60:02d}"
+    frame_file = frames_dir / f"{ts}.jpg"
+    thumb_file = thumbs_dir / f"{ts}.jpg"
     frame_file.write_bytes(jpeg)
     thumb_file.write_bytes(jpeg)
     with get_connection() as conn:
         cur = conn.execute(
-            "INSERT INTO frames (project_id, file_path, thumbnail_path, file_size, is_blurry)"
-            " VALUES (?,?,?,?,?)",
-            (project_id, str(frame_file), str(thumb_file), len(jpeg), is_blurry),
+            "INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size, is_blurry)"
+            " VALUES (?,?,?,?,?,?)",
+            (project_id, captured_at, str(frame_file), str(thumb_file), len(jpeg), is_blurry),
         )
         conn.execute(
             "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?", (project_id,)

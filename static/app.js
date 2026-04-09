@@ -108,8 +108,8 @@ document.addEventListener('alpine:init', () => {
       const s = await this.api('/api/settings');
       if (s) {
         this.loadTheme(s.dark_mode);
-        if (s.muted_project_ids) {
-          try { this.mutedProjectIds = JSON.parse(s.muted_project_ids); } catch(e) { this.mutedProjectIds = []; }
+        if (Array.isArray(s.muted_project_ids)) {
+          this.mutedProjectIds = s.muted_project_ids;
         }
       } else this.loadTheme(true);
       this.initKeyboardShortcuts();
@@ -869,6 +869,8 @@ document.addEventListener('alpine:init', () => {
       if (!await this.confirm('Delete this render file?', 'Delete Render')) return;
       await this.api(`/api/renders/${renderId}`, 'DELETE');
       this.allRenders = this.allRenders.filter(r => r.id !== renderId);
+      // Keep per-project list in sync regardless of which view initiated the delete
+      this.activeProjectRenders = this.activeProjectRenders.filter(r => r.id !== renderId);
       if (this.view === 'project_detail') await this.loadDetailTab('renders');
       this.toast('Render deleted');
     },
@@ -901,7 +903,13 @@ document.addEventListener('alpine:init', () => {
     },
 
     // ── Video player ──────────────────────────────────────────────────────
-    openVideoPlayer(renderId) {
+    async openVideoPlayer(renderId) {
+      // Check file still exists before opening player
+      const head = await fetch(`/api/renders/${renderId}/download`, { method: 'HEAD' });
+      if (!head.ok) {
+        this.toast('Video file not found on disk — it may have been deleted manually.', 'error');
+        return;
+      }
       const url = `/api/renders/${renderId}/download`;
       const overlay = document.createElement('div');
       overlay.id = 'video-overlay';
@@ -1326,20 +1334,25 @@ document.addEventListener('alpine:init', () => {
     },
 
     async saveSettings() {
-      const SETTINGS_FIELDS = [
+      // Always-sent fields (non-nullable in DB)
+      const REQUIRED_FIELDS = [
         'webhook_url','disk_warning_threshold_gb','timestamp_burn_in','default_framerate',
-        'render_poll_interval_seconds','protect_host','protect_port','protect_verify_ssl',
-        'latitude','longitude','tz','dark_mode','maintenance_hour','maintenance_minute',
+        'render_poll_interval_seconds','dark_mode','maintenance_hour','maintenance_minute',
         'nvr_reconnect_backoff_seconds',
       ];
+      // Nullable override fields — only include if the user has set a value
+      // Omitting them entirely means the backend leaves the DB untouched (exclude_unset=True)
+      const NULLABLE_OVERRIDE_FIELDS = ['protect_host','protect_port','protect_verify_ssl','latitude','longitude','tz'];
       const payload = Object.fromEntries(
-        SETTINGS_FIELDS.map(k => [k, this.settingsData[k] !== undefined ? this.settingsData[k] : null])
+        REQUIRED_FIELDS.map(k => [k, this.settingsData[k] !== undefined ? this.settingsData[k] : null])
       );
-      // muted_project_ids is stored as a JSON string in the DB — parse before sending
+      for (const k of NULLABLE_OVERRIDE_FIELDS) {
+        const v = this.settingsData[k];
+        if (v !== null && v !== undefined && v !== '') payload[k] = v;
+      }
+      // muted_project_ids — API now returns it as a real array
       const rawMuted = this.settingsData['muted_project_ids'];
-      payload['muted_project_ids'] = rawMuted
-        ? (Array.isArray(rawMuted) ? rawMuted : JSON.parse(rawMuted))
-        : [];
+      payload['muted_project_ids'] = Array.isArray(rawMuted) ? rawMuted : [];
       const data = await this.api('/api/settings', 'PUT', payload);
       if (data) {
         this.settingsData = data;

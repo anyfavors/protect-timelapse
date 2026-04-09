@@ -110,10 +110,11 @@ async def test_prune_old_frames_recalculates_frame_count(tmp_db: Path) -> None:
     old_ts = (datetime.now(UTC) - timedelta(days=10)).isoformat()
     now_ts = datetime.now(UTC).isoformat()
 
+    old_ts2 = (datetime.now(UTC) - timedelta(days=9)).isoformat()
     with get_connection() as conn:
         pid = _insert_project(conn, retention_days=5)
         _insert_frame(conn, pid, old_ts)
-        _insert_frame(conn, pid, old_ts)
+        _insert_frame(conn, pid, old_ts2)
         _insert_frame(conn, pid, now_ts)
         # Set frame_count to incorrect value to verify recalculation
         conn.execute("UPDATE projects SET frame_count = 99 WHERE id = ?", (pid,))

@@ -46,7 +46,13 @@ class SettingsUpdate(BaseModel):
 def _get_settings_row() -> dict[str, Any]:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM settings WHERE id = 1").fetchone()
-    return dict(row) if row else {}
+    data = dict(row) if row else {}
+    # Deserialise muted_project_ids so clients receive a proper list, not a JSON string
+    raw = data.get("muted_project_ids")
+    if isinstance(raw, str):
+        with contextlib.suppress(Exception):
+            data["muted_project_ids"] = json.loads(raw)
+    return data
 
 
 @router.get("/settings")

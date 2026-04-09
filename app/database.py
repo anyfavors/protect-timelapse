@@ -353,6 +353,26 @@ def _migrate_v10(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+_SCHEMA_V11 = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_frames_project_captured_at_unique
+    ON frames(project_id, captured_at);
+"""
+
+
+def _migrate_v11(conn: sqlite3.Connection) -> None:
+    # Remove any duplicate (project_id, captured_at) rows before adding unique index.
+    # Keep the row with the lowest id (earliest insert).
+    conn.execute(
+        """
+        DELETE FROM frames WHERE id NOT IN (
+            SELECT MIN(id) FROM frames GROUP BY project_id, captured_at
+        )
+        """
+    )
+    conn.executescript(_SCHEMA_V11)
+    conn.commit()
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
@@ -365,6 +385,7 @@ MIGRATIONS: dict[int, object] = {
     8: _migrate_v8,
     9: _migrate_v9,
     10: _migrate_v10,
+    11: _migrate_v11,
 }
 
 

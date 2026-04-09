@@ -553,11 +553,12 @@ def invalidate_location_cache() -> None:
     _location_info_cache = None
 
 
-def _is_daylight() -> bool:
+def _is_daylight(now: datetime | None = None) -> bool:
     from astral.sun import sun
 
     tz, city = _get_location_info()
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
     try:
         s = sun(city.observer, date=now.date(), tzinfo=tz)  # type: ignore[union-attr,attr-defined]
         return s["sunrise"] <= now <= s["sunset"]
@@ -576,7 +577,7 @@ def _get_location() -> tuple[str, float, float]:
     return tz, lat, lon
 
 
-def _is_solar_noon_window(project: dict) -> bool:
+def _is_solar_noon_window(project: dict, now: datetime | None = None) -> bool:
     """Return True if now is within ±window minutes of today's solar noon.
 
     Solar noon mode is designed to capture exactly one frame per day at the
@@ -590,7 +591,8 @@ def _is_solar_noon_window(project: dict) -> bool:
     window = int(project.get("solar_noon_window_minutes") or 30)
 
     try:
-        now = datetime.now(UTC)
+        if now is None:
+            now = datetime.now(UTC)
         s = sun(city.observer, date=now.date(), tzinfo=tz_name)  # type: ignore[union-attr,attr-defined]
         noon = s["noon"]
         diff_minutes = abs((now - noon).total_seconds()) / 60
@@ -599,9 +601,9 @@ def _is_solar_noon_window(project: dict) -> bool:
         return False
 
 
-def _is_in_schedule(project: dict, tz_name: str) -> bool:
+def _is_in_schedule(project: dict, tz_name: str, now: datetime | None = None) -> bool:
     tz = zoneinfo.ZoneInfo(tz_name)
-    local_now = datetime.now(tz)
+    local_now = now.astimezone(tz) if now is not None else datetime.now(tz)
     weekday = local_now.isoweekday()  # 1=Mon … 7=Sun
 
     allowed_days = {
@@ -635,19 +637,20 @@ def _is_in_schedule(project: dict, tz_name: str) -> bool:
     return start_minutes <= current_minutes <= end_minutes
 
 
-def _check_capture_mode(project: dict) -> bool:
+def _check_capture_mode(project: dict, now: datetime | None = None) -> bool:
     """Return True if the project's capture mode would allow a capture right now.
 
     Used by the schedule-test endpoint (F8) to preview capture behaviour.
+    Pass `now` to test a specific point in time without patching datetime.
     """
     mode = project.get("capture_mode", "continuous")
     if mode == "daylight_only":
-        return _is_daylight()
+        return _is_daylight(now=now)
     if mode == "solar_noon":
-        return _is_solar_noon_window(project)
+        return _is_solar_noon_window(project, now=now)
     if mode == "schedule":
         tz_name, _, _ = _get_location()
-        return _is_in_schedule(project, tz_name)
+        return _is_in_schedule(project, tz_name, now=now)
     # continuous or unknown — always capture
     return True
 

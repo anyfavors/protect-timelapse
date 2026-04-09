@@ -160,15 +160,15 @@
     <!-- Dark mode toggle -->
     <button @click="toggleDark()" title="Toggle dark/light mode"
             class="p-1 text-slate-400 hover:text-slate-100 transition">
-      <!-- Moon (shown in dark mode) -->
+      <!-- Sun (shown in dark mode — click to switch to light) -->
       <svg x-show="darkMode" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-              d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
+              d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707M17.657 17.657l-.707-.707M6.343 6.343l-.707-.707M12 8a4 4 0 100 8 4 4 0 000-8z"/>
       </svg>
-      <!-- Sun (shown in light mode) -->
+      <!-- Moon (shown in light mode — click to switch to dark) -->
       <svg x-show="!darkMode" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-              d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707M17.657 17.657l-.707-.707M6.343 6.343l-.707-.707M12 8a4 4 0 100 8 4 4 0 000-8z"/>
+              d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
       </svg>
     </button>
 
@@ -254,10 +254,25 @@
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <main class="max-w-7xl mx-auto px-4 py-6 pb-20 sm:pb-6">
 
+  <!-- ── DISK WARNING BANNER ──────────────────────────────────────────────── -->
+  <div x-show="diskCritical" x-cloak
+       class="mb-4 flex items-center gap-3 bg-yellow-900/40 border border-yellow-700/60 text-yellow-200 rounded-xl px-4 py-3 text-sm">
+    <svg class="w-5 h-5 flex-shrink-0 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+    </svg>
+    <span>
+      <strong>Low disk space:</strong>
+      <span x-text="diskSpace.free_gb !== null ? diskSpace.free_gb.toFixed(1) + ' GB' : '—'"></span>
+      free — active projects may have been paused.
+      <button @click="openSettings()" class="underline ml-1 hover:text-yellow-100">Check settings</button>
+    </span>
+  </div>
+
   <!-- ── GLOBAL RENDERS QUEUE ─────────────────────────────────────────────── -->
   <div x-show="view === 'renders_queue'">
-    <div class="flex items-center justify-between mb-6">
-      <h1 class="text-2xl font-bold text-slate-100">Render Queue</h1>
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-2xl font-bold text-slate-100">Renders</h1>
       <div class="flex items-center gap-2">
         <button @click="toggleRenderAutoRefresh()"
                 :class="renderAutoRefresh ? 'bg-blue-700 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'"
@@ -278,104 +293,156 @@
       <div class="text-center py-20 text-slate-500">No renders yet.</div>
     </template>
 
-    <!-- Render cards -->
-    <div class="space-y-3">
+    <!-- YouTube-style grid -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
       <template x-for="r in allRenders" :key="r.id">
-        <div class="bg-slate-800 border border-slate-700 rounded-xl p-4 hover:border-slate-600 transition"
-             :class="r.status === 'rendering' ? 'border-blue-700/60' : ''">
-          <div class="flex items-start justify-between gap-4">
 
-            <!-- Left: info -->
-            <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-2 flex-wrap">
-                <span class="font-medium text-slate-100 truncate"
-                      x-text="r.project_name || ('#' + r.project_id)"></span>
-                <span class="text-xs text-slate-500" x-text="'#' + r.id"></span>
-                <!-- Status badge -->
-                <span class="px-2 py-0.5 rounded-full text-xs font-medium"
-                      :class="{
-                        'bg-yellow-700/50 text-yellow-300': r.status === 'pending',
-                        'bg-blue-700/50 text-blue-300 animate-pulse': r.status === 'rendering',
-                        'bg-emerald-700/50 text-emerald-300': r.status === 'done',
-                        'bg-red-700/50 text-red-300': r.status === 'error',
-                      }"
+        <!-- Card -->
+        <div class="group bg-slate-800 rounded-xl overflow-hidden border border-slate-700 hover:border-slate-500 transition flex flex-col"
+             :class="r.status === 'rendering' ? 'border-blue-700/60' : ''">
+
+          <!-- Thumbnail / video preview area -->
+          <div class="relative bg-black aspect-video cursor-pointer overflow-hidden"
+               @click="r.status === 'done' && openVideoPlayer(r.id)">
+
+            <!-- Done: show video element (browser renders first frame as thumbnail) -->
+            <template x-if="r.status === 'done'">
+              <video :src="`/api/renders/${r.id}/download`"
+                     preload="metadata"
+                     muted playsinline
+                     class="w-full h-full object-contain"
+                     @mouseenter="$el.muted = true; $el.play().catch(() => {})"
+                     @mouseleave="$el.pause(); $el.currentTime = 0"
+                     @error="$el.closest('.group').querySelector('[data-missing]')?.classList.remove('hidden')">
+              </video>
+            </template>
+
+            <!-- Not done: placeholder with status icon -->
+            <template x-if="r.status !== 'done'">
+              <div class="w-full h-full flex flex-col items-center justify-center gap-2">
+                <template x-if="r.status === 'rendering'">
+                  <svg class="w-10 h-10 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                </template>
+                <template x-if="r.status === 'pending'">
+                  <svg class="w-10 h-10 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                          d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                  </svg>
+                </template>
+                <template x-if="r.status === 'error'">
+                  <svg class="w-10 h-10 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                          d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                  </svg>
+                </template>
+                <span class="text-xs capitalize"
+                      :class="{'text-blue-300': r.status==='rendering','text-slate-500': r.status==='pending','text-red-400': r.status==='error'}"
                       x-text="r.status"></span>
               </div>
+            </template>
 
-              <!-- Metadata row -->
-              <div class="flex items-center gap-3 mt-1 text-xs text-slate-400 flex-wrap">
-                <span class="capitalize" x-text="r.render_type?.replace('_', ' ')"></span>
-                <span x-show="r.resolution" x-text="r.resolution"></span>
-                <span x-show="r.framerate" x-text="r.framerate + ' fps'"></span>
-                <span x-show="r.quality" class="capitalize" x-text="r.quality"></span>
-                <span x-show="r.file_size" x-text="(r.file_size / 1048576).toFixed(1) + ' MB'"></span>
-                <span x-show="r.estimated_duration_seconds && r.status !== 'done'" class="text-slate-500"
-                      x-text="'~' + Math.round(r.estimated_duration_seconds) + 's video'"></span>
-                <span class="text-slate-600" x-text="formatDate(r.created_at)"></span>
+            <!-- Play overlay on hover (done only) -->
+            <template x-if="r.status === 'done'">
+              <div class="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition bg-black/30 pointer-events-none">
+                <div class="w-12 h-12 rounded-full bg-black/60 flex items-center justify-center">
+                  <svg class="w-6 h-6 text-white ml-0.5" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M6.3 2.84A1.5 1.5 0 004 4.11v11.78a1.5 1.5 0 002.3 1.27l9.344-5.891a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                  </svg>
+                </div>
               </div>
+            </template>
 
-              <!-- Error message -->
-              <div x-show="r.status === 'error' && r.error_msg"
-                   class="mt-2 text-xs text-red-400 bg-red-900/20 rounded px-2 py-1 font-mono break-all"
-                   x-text="r.error_msg"></div>
+            <!-- Encoding progress bar along bottom edge -->
+            <template x-if="r.status === 'rendering'">
+              <div class="absolute bottom-0 left-0 right-0 h-1 bg-slate-700">
+                <div class="h-full bg-blue-500 transition-all duration-500"
+                     :style="`width:${r.progress_pct || 0}%`"></div>
+              </div>
+            </template>
 
-              <!-- Progress bar (rendering or done) -->
-              <template x-if="r.status === 'rendering' || (r.status === 'done' && r.progress_pct > 0)">
-                <div class="mt-3">
-                  <div class="flex items-center justify-between text-xs text-slate-400 mb-1">
-                    <span x-text="r.status === 'done' ? 'Complete' : 'Encoding…'"></span>
-                    <span x-text="(r.progress_pct || 0) + '%'"></span>
-                  </div>
-                  <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
-                    <div class="h-full rounded-full transition-all duration-500"
-                         :class="r.status === 'done' ? 'bg-emerald-500' : 'bg-blue-500'"
-                         :style="`width:${r.progress_pct || 0}%`"></div>
-                  </div>
-                </div>
-              </template>
+            <!-- Duration / file size badge (top-right) -->
+            <template x-if="r.status === 'done' && r.file_size">
+              <span class="absolute top-1.5 right-1.5 bg-black/70 text-white text-xs px-1.5 py-0.5 rounded font-mono"
+                    x-text="(r.file_size / 1048576).toFixed(0) + ' MB'"></span>
+            </template>
+          </div>
 
-              <!-- Pending queue position -->
-              <template x-if="r.status === 'pending'">
-                <div class="mt-2 text-xs text-slate-500">
-                  Waiting in queue
-                  <span x-show="r.priority && r.priority !== 5"
-                        x-text="' · priority ' + r.priority"></span>
-                </div>
+          <!-- Card body -->
+          <div class="p-3 flex flex-col gap-1 flex-1">
+
+            <!-- Title row -->
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <p class="text-sm font-medium text-slate-100 truncate leading-tight"
+                   x-text="r.label || (r.project_name || ('#' + r.project_id))"></p>
+                <p class="text-xs text-slate-400 truncate mt-0.5">
+                  <span class="capitalize" x-text="r.render_type?.replace('_',' ')"></span>
+                  <template x-if="r.resolution"><span x-text="' · ' + r.resolution"></span></template>
+                  <template x-if="r.framerate"><span x-text="' · ' + r.framerate + ' fps'"></span></template>
+                </p>
+              </div>
+              <!-- Status badge (non-done) -->
+              <template x-if="r.status !== 'done'">
+                <span class="shrink-0 px-1.5 py-0.5 rounded text-xs font-medium"
+                      :class="{
+                        'bg-yellow-700/40 text-yellow-300': r.status === 'pending',
+                        'bg-blue-700/40 text-blue-300': r.status === 'rendering',
+                        'bg-red-700/40 text-red-300': r.status === 'error',
+                      }"
+                      x-text="r.status"></span>
               </template>
             </div>
 
-            <!-- Right: actions -->
-            <div class="flex flex-col gap-2 items-end shrink-0">
-              <!-- Play -->
+            <!-- Date -->
+            <p class="text-xs text-slate-600" x-text="formatDate(r.created_at)"></p>
+
+            <!-- Error -->
+            <div x-show="r.status === 'error' && r.error_msg"
+                 class="text-xs text-red-400 bg-red-900/20 rounded px-2 py-1 font-mono break-all mt-1"
+                 x-text="r.error_msg"></div>
+
+            <!-- Pending hint -->
+            <template x-if="r.status === 'pending'">
+              <p class="text-xs text-slate-500 mt-0.5">Waiting in queue</p>
+            </template>
+
+            <!-- Action row -->
+            <div class="flex items-center gap-2 mt-auto pt-2">
               <template x-if="r.status === 'done'">
                 <button @click="openVideoPlayer(r.id)"
-                        class="flex items-center gap-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 text-emerald-100 px-3 py-1.5 rounded-lg transition font-medium">
+                        class="flex-1 flex items-center justify-center gap-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 text-emerald-100 py-1.5 rounded-lg transition font-medium">
                   <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
                     <path d="M6.3 2.84A1.5 1.5 0 004 4.11v11.78a1.5 1.5 0 002.3 1.27l9.344-5.891a1.5 1.5 0 000-2.538L6.3 2.84z"/>
                   </svg>
                   Play
                 </button>
               </template>
-              <!-- Download -->
               <template x-if="r.status === 'done'">
                 <a :href="`/api/renders/${r.id}/download`"
-                   class="flex items-center gap-1.5 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-3 py-1.5 rounded-lg transition">
+                   class="flex items-center justify-center gap-1 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2.5 py-1.5 rounded-lg transition"
+                   title="Download">
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                           d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
                   </svg>
-                  Download
                 </a>
               </template>
-              <!-- Delete -->
               <button @click="deleteRender(r.id)"
-                      class="text-xs text-slate-500 hover:text-red-400 hover:bg-red-900/20 px-2 py-1 rounded transition">
-                Delete
+                      class="ml-auto text-xs text-slate-600 hover:text-red-400 hover:bg-red-900/20 px-2 py-1.5 rounded transition"
+                      title="Delete">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                </svg>
               </button>
             </div>
 
           </div>
         </div>
+
       </template>
     </div>
   </div>
@@ -533,9 +600,17 @@
                               :stroke-dashoffset="`${2 * Math.PI * 8 * (1 - Math.min(1, proj.frame_count / proj.max_frames))}`"/>
                     </svg>
                   </template>
-                  <span class="w-2.5 h-2.5 rounded-full"
+                  <span class="w-2.5 h-2.5 rounded-full cursor-help"
                         :class="statusDot(proj.status)"
-                        :aria-label="'Status: ' + proj.status.replace('_',' ')"
+                        :title="{
+                          active: 'Active — capturing frames on schedule',
+                          paused: 'Paused — manually stopped, no captures',
+                          paused_error: 'Paused (error) — auto-paused due to NVR failure or low disk',
+                          completed: 'Completed — max frames reached or manually finished',
+                          error: 'Error — check logs for details',
+                          extracting: 'Extracting — fetching historical frames from NVR',
+                          historical: 'Historical — extraction done, read-only',
+                        }[proj.status] || proj.status.replace('_',' ')"
                         role="img"></span>
                 </div>
               </div>
@@ -544,12 +619,22 @@
                   <span x-text="proj.frame_count.toLocaleString()"></span> frames ·
                   <span x-text="proj.interval_seconds + 's interval'"></span>
                 </div>
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 flex-wrap">
                   <span class="capitalize" x-text="proj.status.replace('_', ' ')"></span>
                   <template x-if="proj.last_captured_at && proj.status === 'active'">
                     <span class="text-xs px-1.5 py-0.5 rounded-full"
                           :class="timeSinceBadgeClass(proj)"
                           x-text="timeSince(proj.last_captured_at)"></span>
+                  </template>
+                  <!-- Capture mode badge (only show non-continuous) -->
+                  <template x-if="proj.capture_mode && proj.capture_mode !== 'continuous'">
+                    <span class="text-xs bg-slate-700 text-slate-400 px-1.5 py-0.5 rounded capitalize"
+                          :title="{
+                            daylight_only: 'Only captures between sunrise and sunset',
+                            solar_noon: 'Captures once per day near solar noon',
+                            schedule: 'Captures only within a configured time window',
+                          }[proj.capture_mode] || proj.capture_mode"
+                          x-text="proj.capture_mode.replace('_',' ')"></span>
                   </template>
                 </div>
                 <!-- Extraction progress bar -->
@@ -774,6 +859,27 @@
       <div class="bg-slate-800 rounded-xl p-4 space-y-3">
         <h3 class="text-sm font-semibold text-slate-400 uppercase tracking-wide">Render</h3>
 
+        <!-- Saved presets dropdown -->
+        <template x-if="renderPresets.length > 0">
+          <div>
+            <label class="block text-xs text-slate-500 mb-1.5">Load Preset</label>
+            <div class="flex flex-wrap gap-1.5">
+              <template x-for="preset in renderPresets" :key="preset.id">
+                <div class="flex items-center gap-0.5">
+                  <button @click="applyPreset(preset)"
+                          class="px-3 py-1.5 rounded-l-lg text-xs bg-slate-700 hover:bg-blue-700 text-slate-300 hover:text-white transition">
+                    <span x-text="preset.name"></span>
+                    <span class="text-slate-500 ml-1" x-text="preset.framerate + 'fps · ' + preset.resolution"></span>
+                  </button>
+                  <button @click="deletePreset(preset.id)"
+                          class="px-2 py-1.5 rounded-r-lg text-xs bg-slate-700 hover:bg-red-700 text-slate-500 hover:text-red-200 transition border-l border-slate-600"
+                          title="Delete preset">×</button>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+
         <!-- Framerate presets -->
         <div>
           <label class="block text-xs text-slate-500 mb-1.5">Framerate</label>
@@ -866,6 +972,24 @@
           </label>
         </div>
 
+        <!-- Duration calculator -->
+        <div class="bg-slate-700/50 rounded-lg px-3 py-2 text-xs text-slate-400 flex items-center gap-2">
+          <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+          </svg>
+          <span>
+            <span x-text="activeProject ? activeProject.frame_count.toLocaleString() : '—'"></span> frames
+            at <span x-text="renderFramerate"></span> fps =
+            <strong class="text-slate-200"
+                    x-text="activeProject && renderFramerate
+                      ? (() => { const s = Math.round(activeProject.frame_count / renderFramerate); const m = Math.floor(s/60); const sec = s%60; return m > 0 ? m+'m '+sec+'s' : sec+'s'; })()
+                      : '—'">
+            </strong>
+            video
+          </span>
+        </div>
+
         <!-- Action buttons -->
         <div class="flex flex-wrap gap-2 pt-1">
           <button @click="triggerRender(activeProject.id, renderFramerate, renderResolution); updateRenderEstimate(renderFramerate)"
@@ -877,6 +1001,11 @@
                   class="bg-slate-600 hover:bg-slate-500 text-slate-200 px-4 py-2 rounded-lg text-sm transition"
                   title="Fast 480p proxy render — check settings before full render">
             ⚡ Preview
+          </button>
+          <button @click="saveRenderPreset()"
+                  class="bg-slate-700 hover:bg-slate-600 text-slate-400 hover:text-slate-200 px-3 py-2 rounded-lg text-sm transition"
+                  title="Save current settings as a reusable preset">
+            ☆ Save preset
           </button>
           <!-- GIF export -->
           <template x-if="!gifJobStatus || gifJobStatus === 'error'">
@@ -1163,19 +1292,34 @@
 
         <!-- Interval (hidden for solar_noon — internally fixed at 60 s) -->
         <div x-show="form.capture_mode !== 'solar_noon'">
-          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Capture Interval</label>
-          <div class="flex flex-wrap gap-1.5 mb-2">
-            <button @click="setIntervalPreset(2)"    :class="form.interval_seconds==2    ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Fast-moving clouds, traffic">2 s</button>
-            <button @click="setIntervalPreset(5)"    :class="form.interval_seconds==5    ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Storms, fast weather">5 s</button>
-            <button @click="setIntervalPreset(15)"   :class="form.interval_seconds==15   ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Busy streets, market">15 s</button>
-            <button @click="setIntervalPreset(30)"   :class="form.interval_seconds==30   ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Normal weather, activity">30 s</button>
-            <button @click="setIntervalPreset(60)"   :class="form.interval_seconds==60   ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Construction site, garden">1 min</button>
-            <button @click="setIntervalPreset(300)"  :class="form.interval_seconds==300  ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Slow construction, seasons">5 min</button>
-            <button @click="setIntervalPreset(900)"  :class="form.interval_seconds==900  ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Plant growth, renovation">15 min</button>
-            <button @click="setIntervalPreset(3600)" :class="form.interval_seconds==3600 ? 'bg-blue-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'" class="text-xs px-2 py-1 rounded transition" title="Long-term: months or years">1 hr</button>
+          <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Capture Interval</label>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-1.5 mb-2">
+            <template x-for="p in [
+              {s:2,   label:'2 sec',   use:'Clouds, traffic'},
+              {s:5,   label:'5 sec',   use:'Storms, fast weather'},
+              {s:15,  label:'15 sec',  use:'Busy streets, markets'},
+              {s:30,  label:'30 sec',  use:'Weather, general activity'},
+              {s:60,  label:'1 min',   use:'Construction, gardens'},
+              {s:300, label:'5 min',   use:'Slow builds, seasons'},
+              {s:900, label:'15 min',  use:'Plant growth, renovation'},
+              {s:3600,label:'1 hour',  use:'Long-term: months–years'},
+            ]" :key="p.s">
+              <button @click="setIntervalPreset(p.s)"
+                      :class="form.interval_seconds == p.s
+                        ? 'bg-blue-600 border-blue-500 text-white'
+                        : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600 hover:border-slate-500'"
+                      class="flex flex-col items-start px-2.5 py-2 rounded-lg border transition text-left w-full">
+                <span class="font-semibold text-sm leading-tight" x-text="p.label"></span>
+                <span class="text-xs leading-tight mt-0.5 opacity-70" x-text="p.use"></span>
+              </button>
+            </template>
           </div>
-          <input x-model.number="form.interval_seconds" type="number" min="1"
-                 class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100" />
+          <div class="flex items-center gap-2 mt-1">
+            <label class="text-xs text-slate-500 shrink-0">Custom:</label>
+            <input x-model.number="form.interval_seconds" type="number" min="1"
+                   class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-100" />
+            <span class="text-xs text-slate-500">seconds</span>
+          </div>
         </div>
 
         <!-- Capture mode (live only) -->

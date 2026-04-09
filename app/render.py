@@ -155,9 +155,21 @@ async def _process_next_render() -> None:
 
     try:
         # Build frame list
-        frame_paths = _get_frame_paths(render)
+        frame_paths, truncated_from = _get_frame_paths(render)
         if not frame_paths:
             raise ValueError("No frames found for render")
+
+        if truncated_from:
+            warn_msg = (
+                f"WARNING: project has {truncated_from:,} frames but only the first "
+                f"{len(frame_paths):,} were rendered (50 000 frame limit)."
+            )
+            with get_connection() as _conn:
+                _conn.execute(
+                    "UPDATE renders SET error_msg = ? WHERE id = ?",
+                    (warn_msg, render_id),
+                )
+                _conn.commit()
 
         total_frames = len(frame_paths)
 
@@ -329,7 +341,7 @@ async def _process_next_render() -> None:
                 os.remove(transforms_file)
 
 
-def _get_frame_paths(render: dict) -> list[str]:
+def _get_frame_paths(render: dict) -> tuple[list[str], int]:
     project_id = render["project_id"]
     render_type = render["render_type"]
 
@@ -345,7 +357,7 @@ def _get_frame_paths(render: dict) -> list[str]:
                 """,
                 (project_id,),
             ).fetchall()
-        return [r["output_path"] for r in rows if os.path.exists(r["output_path"])]
+        return [r["output_path"] for r in rows if os.path.exists(r["output_path"])], 0
 
     # Standard / range / manual — JPEG frames
     if render_type == "range" and render.get("range_start") and render.get("range_end"):
@@ -374,7 +386,9 @@ def _get_frame_paths(render: dict) -> list[str]:
 
     # Cap frame list to prevent memory exhaustion on huge projects (#21)
     _MAX_FRAMES_PER_RENDER = 50_000
+    truncated_from = 0
     if len(paths) > _MAX_FRAMES_PER_RENDER:
+        truncated_from = len(paths)
         log.warning(
             "Render project=%d: truncating frame list from %d to %d",
             render["project_id"],
@@ -383,7 +397,7 @@ def _get_frame_paths(render: dict) -> list[str]:
         )
         paths = paths[:_MAX_FRAMES_PER_RENDER]
 
-    return paths
+    return paths, truncated_from
 
 
 _QUALITY_MAP = {
