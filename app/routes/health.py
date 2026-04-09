@@ -1,4 +1,6 @@
+import asyncio
 import collections
+import contextlib
 import os
 import shutil
 import time
@@ -184,17 +186,40 @@ def get_logs(
     return {"lines": [], "source": "unavailable", "error": "No log source configured"}
 
 
+_disk_refresh_task: "asyncio.Task[None] | None" = None
+
+
 @router.get("/api/disk")
 def disk_breakdown() -> dict:
-    """Per-project disk usage breakdown across frames, renders, and thumbs."""
-    global _disk_cache, _disk_cache_ts
+    """Per-project disk usage breakdown across frames, renders, and thumbs.
+
+    Returns cached result immediately; triggers a background refresh if stale.
+    This avoids blocking the event loop on O(n) dir walks.
+    """
+    import asyncio
+
+    global _disk_cache, _disk_cache_ts, _disk_refresh_task
     now = time.monotonic()
-    if _disk_cache is not None and (now - _disk_cache_ts) < _DISK_CACHE_TTL:
-        return _disk_cache
+
+    # Schedule a background refresh if cache is stale and no refresh in flight
+    if (_disk_cache is None or (now - _disk_cache_ts) >= _DISK_CACHE_TTL) and (
+        _disk_refresh_task is None or _disk_refresh_task.done()
+    ):
+        with contextlib.suppress(RuntimeError):  # no running loop (e.g. during tests)
+            _disk_refresh_task = asyncio.get_running_loop().create_task(_refresh_disk_cache())
+
+    # Return cached result (may be slightly stale on first call)
+    return _disk_cache or {"total_gb": 0, "used_gb": 0, "free_gb": 0, "projects": []}
+
+
+async def _refresh_disk_cache() -> None:
+    global _disk_cache, _disk_cache_ts
 
     cfg = get_settings()
+    loop = asyncio.get_running_loop()
+
     try:
-        usage = shutil.disk_usage("/data")
+        usage = await loop.run_in_executor(None, shutil.disk_usage, "/data")
         total_gb = round(usage.total / 1024**3, 2)
         used_gb = round((usage.total - usage.free) / 1024**3, 2)
         free_gb = round(usage.free / 1024**3, 2)
@@ -207,9 +232,15 @@ def disk_breakdown() -> dict:
     breakdown = []
     for proj in projects:
         pid = proj["id"]
-        frames_gb = _dir_size_gb(os.path.join(cfg.frames_path, str(pid)))
-        renders_gb = _dir_size_gb(os.path.join(cfg.renders_path, str(pid)))
-        thumbs_gb = _dir_size_gb(os.path.join(cfg.thumbnails_path, str(pid)))
+        frames_gb = await loop.run_in_executor(
+            None, _dir_size_gb, os.path.join(cfg.frames_path, str(pid))
+        )
+        renders_gb = await loop.run_in_executor(
+            None, _dir_size_gb, os.path.join(cfg.renders_path, str(pid))
+        )
+        thumbs_gb = await loop.run_in_executor(
+            None, _dir_size_gb, os.path.join(cfg.thumbnails_path, str(pid))
+        )
         breakdown.append(
             {
                 "id": pid,
@@ -222,12 +253,10 @@ def disk_breakdown() -> dict:
         )
 
     breakdown.sort(key=lambda x: x["total_gb"], reverse=True)
-    result = {
+    _disk_cache = {
         "total_gb": total_gb,
         "used_gb": used_gb,
         "free_gb": free_gb,
         "projects": breakdown,
     }
-    _disk_cache = result
-    _disk_cache_ts = now
-    return result
+    _disk_cache_ts = time.monotonic()

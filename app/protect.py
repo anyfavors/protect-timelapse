@@ -5,6 +5,7 @@ All NVR access must go through ProtectClientManager.get_client().
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 
 from uiprotect import ProtectApiClient
@@ -44,6 +45,7 @@ class ProtectClientManager:
         self._last_health_check: datetime | None = None
         self._last_error: str | None = None
         self._last_error_type: str | None = None
+        self._last_reconnect_attempt: float = 0.0  # monotonic time
 
     async def setup(self) -> None:
         """Authenticate with the NVR and load the bootstrap data."""
@@ -105,11 +107,24 @@ class ProtectClientManager:
         """
         Return the authenticated client, attempting reconnect if stale.
         Raises RuntimeError if the NVR is unreachable.
+        Reconnect attempts are rate-limited by nvr_reconnect_backoff_seconds.
         """
         async with self._lock:
             if self._client is None:
                 raise RuntimeError("NVR client not initialised — call setup() first")
             if not self._connected:
+                # Enforce reconnect backoff — don't hammer the NVR on every frame capture
+                from app.database import get_db_overrides
+
+                overrides = get_db_overrides()
+                backoff = int(overrides.get("nvr_reconnect_backoff_seconds") or 30)
+                now = time.monotonic()
+                if now - self._last_reconnect_attempt < backoff:
+                    raise RuntimeError(
+                        f"NVR offline (backoff {backoff}s, retry in "
+                        f"{int(backoff - (now - self._last_reconnect_attempt))}s)"
+                    )
+                self._last_reconnect_attempt = now
                 # Attempt reconnect
                 try:
                     await self._client.update()
@@ -131,6 +146,8 @@ class ProtectClientManager:
         """
         if self._connected:
             log.warning("NVR marked disconnected: %s", reason or "unknown")
+            # Reset backoff timer so the first reconnect after a new disconnect isn't blocked
+            self._last_reconnect_attempt = 0.0
         self._connected = False
         self._last_error = reason or self._last_error
 

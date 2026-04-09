@@ -16,14 +16,6 @@ from app.config import get_settings
 # Connection factory
 # ---------------------------------------------------------------------------
 
-_PRAGMAS = """
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA cache_size = -65536;
-PRAGMA temp_store = MEMORY;
-"""
-
 _POOL_SIZE = 4
 # Queue with maxsize enforces the cap without a racy qsize() check.
 _pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=_POOL_SIZE)
@@ -33,7 +25,13 @@ _pool_db_path: str | None = None
 def _make_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.executescript(_PRAGMAS)
+    # Use individual execute() calls — executescript() issues an implicit COMMIT
+    # before running, which would silently commit any open transaction (#42).
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -65536")
+    conn.execute("PRAGMA temp_store = MEMORY")
     return conn
 
 
@@ -51,7 +49,15 @@ def _get_pool_connection() -> sqlite3.Connection:
                 _pool.get_nowait().close()
 
     try:
-        return _pool.get_nowait()
+        conn = _pool.get_nowait()
+        # Health check: discard and replace broken connections (#37)
+        try:
+            conn.execute("SELECT 1")
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.close()
+            return _make_connection(db_path)
+        return conn
     except queue.Empty:
         return _make_connection(db_path)
 
@@ -253,10 +259,13 @@ def _migrate_v0(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_alter(conn: sqlite3.Connection, schema: str) -> None:
-    """Apply ALTER TABLE statements, ignoring already-existing columns."""
+    """Apply ALTER TABLE statements, ignoring duplicate-column errors only."""
     for stmt in [s.strip() for s in schema.strip().split(";") if s.strip()]:
-        with contextlib.suppress(sqlite3.OperationalError):
+        try:
             conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.commit()
 
 
@@ -382,6 +391,57 @@ def _migrate_v12(conn: sqlite3.Connection) -> None:
     _migrate_alter(conn, _SCHEMA_V12)
 
 
+_SCHEMA_V13 = """
+CREATE INDEX IF NOT EXISTS idx_renders_pending_priority
+    ON renders(status, priority DESC, created_at ASC)
+    WHERE status = 'pending';
+"""
+
+
+def _migrate_v13(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_V13)
+    conn.commit()
+
+
+# Migration 14: enforce project_type and capture_mode via triggers.
+# SQLite does not support ALTER TABLE ADD CONSTRAINT on existing tables, so
+# we use BEFORE INSERT/UPDATE triggers to raise an error on invalid values (#49, #50).
+_SCHEMA_V14 = """
+CREATE TRIGGER IF NOT EXISTS trg_projects_project_type_insert
+BEFORE INSERT ON projects
+WHEN NEW.project_type NOT IN ('live', 'historical')
+BEGIN
+    SELECT RAISE(ABORT, 'Invalid project_type: must be live or historical');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_project_type_update
+BEFORE UPDATE OF project_type ON projects
+WHEN NEW.project_type NOT IN ('live', 'historical')
+BEGIN
+    SELECT RAISE(ABORT, 'Invalid project_type: must be live or historical');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_capture_mode_insert
+BEFORE INSERT ON projects
+WHEN NEW.capture_mode NOT IN ('continuous', 'daylight_only', 'schedule', 'solar_noon')
+BEGIN
+    SELECT RAISE(ABORT, 'Invalid capture_mode: must be continuous, daylight_only, schedule, or solar_noon');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_projects_capture_mode_update
+BEFORE UPDATE OF capture_mode ON projects
+WHEN NEW.capture_mode NOT IN ('continuous', 'daylight_only', 'schedule', 'solar_noon')
+BEGIN
+    SELECT RAISE(ABORT, 'Invalid capture_mode: must be continuous, daylight_only, schedule, or solar_noon');
+END;
+"""
+
+
+def _migrate_v14(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_V14)
+    conn.commit()
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
@@ -396,6 +456,8 @@ MIGRATIONS: dict[int, object] = {
     10: _migrate_v10,
     11: _migrate_v11,
     12: _migrate_v12,
+    13: _migrate_v13,
+    14: _migrate_v14,
 }
 
 
@@ -464,6 +526,16 @@ def get_db_overrides() -> dict:
         return {k: v for k, v in dict(row).items() if v is not None}
     except Exception:
         return {}
+
+
+# Reusable SQL fragment for "quality" frames — exclude dark and blurry frames.
+# Used in render frame selection and GIF export queries.
+VALID_FRAME_SQL = "is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)"
+
+
+def row_to_dict(row: "sqlite3.Row") -> dict:
+    """Convert a sqlite3.Row to a plain dict. Shared utility for all route modules."""
+    return dict(row)
 
 
 def get_wal_size_bytes() -> int:

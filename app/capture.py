@@ -12,6 +12,7 @@ import io
 import logging
 import os
 import shutil
+import time
 import zoneinfo
 from datetime import UTC, datetime, timedelta
 
@@ -42,10 +43,10 @@ _CIRCUIT_BREAKER_THRESHOLD = 10
 # Per-camera semaphore: at most 2 concurrent snapshots per camera to avoid NVR overload.
 _camera_semaphores: dict[str, asyncio.Semaphore] = {}
 
-# Disk check interval: every N captures we run a full disk check.
-# APScheduler calls snapshot_worker per project; disk check is cheap so we
-# run it every time rather than tracking a separate timer.
-_DISK_CHECK_EVERY_N = 1  # check every capture (matches spec: every 5-min loop)
+# Disk check throttle: at most one shutil.disk_usage() call per minute across all projects.
+_DISK_CHECK_INTERVAL = 60.0  # seconds
+_disk_last_checked: float = 0.0
+_disk_last_result: tuple[float, float] | None = None  # (free_gb, threshold_gb as floats)
 
 # -------------------------------------------------------------------------
 # Scheduler lifecycle
@@ -170,11 +171,21 @@ async def snapshot_worker(project_id: int) -> None:
     """
     settings = get_settings()
 
-    # --- 1. Disk failsafe ---------------------------------------------------
+    # --- 1. Disk failsafe (throttled: at most once per minute) ---------------
     try:
-        usage = shutil.disk_usage(settings.frames_path)
-        free_gb = usage.free / 1024**3
-        threshold_gb = _get_disk_threshold()
+        global _disk_last_checked, _disk_last_result
+        now_mono = time.monotonic()
+        if now_mono - _disk_last_checked >= _DISK_CHECK_INTERVAL:
+            loop = asyncio.get_running_loop()
+            usage = await loop.run_in_executor(None, shutil.disk_usage, settings.frames_path)
+            free_gb = usage.free / 1024**3
+            threshold_gb = float(_get_disk_threshold())
+            _disk_last_checked = now_mono
+            _disk_last_result = (free_gb, threshold_gb)
+        elif _disk_last_result is not None:
+            free_gb, threshold_gb = _disk_last_result
+        else:
+            free_gb, threshold_gb = float("inf"), 0.0  # no reading yet — allow capture
         if free_gb < threshold_gb:
             await _handle_disk_breach(free_gb, threshold_gb)
             return
@@ -251,7 +262,38 @@ async def snapshot_worker(project_id: int) -> None:
         snapshot_bytes: bytes = raw
         _reset_failures(project_id)
 
-    except (httpx.ReadTimeout, httpx.ConnectError, Exception) as exc:
+    except httpx.ReadTimeout as exc:
+        # Retry once after a short delay for transient timeouts
+        log.debug("Project %d: transient timeout, retrying once in 2s", project_id)
+        try:
+            await asyncio.sleep(2)
+            client_retry = await protect_manager.get_client()
+            cam_retry = client_retry.bootstrap.cameras.get(project["camera_id"])
+            if cam_retry is None:
+                raise RuntimeError("Camera not found on retry") from exc
+            async with _camera_semaphores.get(project["camera_id"], asyncio.Semaphore(2)):
+                raw_retry = await cam_retry.get_snapshot(**kwargs)
+            if not raw_retry:
+                raise RuntimeError("Empty snapshot on retry") from exc
+            snapshot_bytes = raw_retry
+            _reset_failures(project_id)
+        except Exception as retry_exc:
+            log.warning("Project %d: NVR snapshot failed after retry — %s", project_id, retry_exc)
+            protect_manager.mark_disconnected(str(retry_exc))
+            failures = _increment_failures(project_id)
+            if failures >= 3:
+                await _notify_nvr_offline(project_id, project["name"], failures)
+            if failures >= _CIRCUIT_BREAKER_THRESHOLD:
+                log.error(
+                    "Project %d: circuit breaker tripped after %d failures — pausing",
+                    project_id,
+                    failures,
+                )
+                _set_project_status(project_id, "paused_error")
+                await remove_project_job(project_id)
+            return
+
+    except (httpx.ConnectError, Exception) as exc:
         log.warning("Project %d: NVR snapshot failed — %s", project_id, exc)
         # Signal NVR disconnect so next get_client() attempts reconnect
         if isinstance(exc, httpx.ReadTimeout | httpx.ConnectError | RuntimeError):
@@ -295,6 +337,7 @@ async def snapshot_worker(project_id: int) -> None:
 
     if project["use_luminance_check"]:
         pil_img = Image.open(io.BytesIO(snapshot_bytes))
+        pil_img.load()  # force decode so BytesIO can be released
         gray = pil_img.convert("L")
         brightness = ImageStat.Stat(gray).mean[0]
         if brightness < project["luminance_threshold"]:
@@ -319,7 +362,8 @@ async def snapshot_worker(project_id: int) -> None:
             try:
                 # No existence pre-check: handle FileNotFoundError directly to avoid TOCTOU
                 # (maintenance worker may delete the file between check and open) (#6)
-                last_img = Image.open(last_row["file_path"]).convert("L").resize((64, 64))
+                with Image.open(last_row["file_path"]) as _last_raw:
+                    last_img = _last_raw.convert("L").resize((64, 64))
                 curr_gray = pil_img.convert("L").resize((64, 64))
                 diff = (
                     sum(
@@ -358,16 +402,8 @@ async def snapshot_worker(project_id: int) -> None:
     frame_path = os.path.join(frame_dir, f"{timestamp}.jpg")
     thumb_path = os.path.join(thumb_dir, f"{timestamp}.jpg")
 
-    # Frame deduplication: skip if an identical frame (by hash) already exists
+    # Frame deduplication: check hash in same connection as insert to avoid TOCTOU race
     frame_hash = hashlib.sha256(snapshot_bytes).hexdigest()
-    with get_connection() as conn:
-        dup = conn.execute(
-            "SELECT id FROM frames WHERE project_id = ? AND file_hash = ? LIMIT 1",
-            (project_id, frame_hash),
-        ).fetchone()
-    if dup:
-        log.debug("Project %d: duplicate frame skipped (hash=%s)", project_id, frame_hash[:16])
-        return
 
     # Atomic frame write: write to .tmp then rename (crash-safe)
     # Abort early if frame file can't be written — don't insert orphaned DB record (#7)
@@ -385,7 +421,7 @@ async def snapshot_worker(project_id: int) -> None:
     # Reuse the already-decoded PIL image if available, otherwise decode now
     if pil_img is None:
         pil_img = Image.open(io.BytesIO(snapshot_bytes))
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     thumb_bytes = await loop.run_in_executor(None, generate_thumbnail_from_pillow, pil_img)
     tmp_thumb_path = thumb_path + ".tmp"
     try:
@@ -399,13 +435,19 @@ async def snapshot_worker(project_id: int) -> None:
 
     file_size = len(snapshot_bytes)
 
-    # --- 8. DB insert + frame_count -----------------------------------------
+    # --- 8. DB insert + frame_count (single atomic transaction) --------------
     now_utc = datetime.now(UTC).isoformat()
+    frame_date = now_utc[:10]  # YYYY-MM-DD
+    frame_hour = int(now_utc[11:13])
     with get_connection() as conn:
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE")
+        # INSERT OR IGNORE handles dedup atomically — if file_hash already exists for this
+        # project, the insert is skipped and rowcount == 0 (no separate SELECT needed).
+        cur = conn.execute(
             """
-            INSERT INTO frames (project_id, captured_at, file_path, thumbnail_path, file_size,
-                                is_dark, sharpness_score, is_blurry, file_hash)
+            INSERT OR IGNORE INTO frames
+                (project_id, captured_at, file_path, thumbnail_path, file_size,
+                 is_dark, sharpness_score, is_blurry, file_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -420,13 +462,15 @@ async def snapshot_worker(project_id: int) -> None:
                 frame_hash,
             ),
         )
+        if cur.rowcount == 0:
+            conn.rollback()
+            log.debug("Project %d: duplicate frame skipped (hash=%s)", project_id, frame_hash[:16])
+            return
         conn.execute(
             "UPDATE projects SET frame_count = frame_count + 1 WHERE id = ?",
             (project_id,),
         )
         # Upsert into pre-aggregated frame_stats
-        frame_date = now_utc[:10]  # YYYY-MM-DD
-        frame_hour = int(now_utc[11:13])
         conn.execute(
             """
             INSERT INTO frame_stats (project_id, date, hour, captured, dark)
@@ -506,8 +550,19 @@ async def _nvr_health_check_job() -> None:
 
 
 async def _nvr_bootstrap_refresh_job() -> None:
-    """Periodic bootstrap refresh — picks up added/removed cameras."""
+    """Periodic bootstrap refresh — picks up added/removed cameras.
+    Also prunes semaphores for cameras no longer in the NVR bootstrap."""
     await protect_manager.refresh_bootstrap()
+    # Remove semaphores for cameras that no longer exist to prevent unbounded growth
+    try:
+        client = await protect_manager.get_client()
+        known_ids = set(client.bootstrap.cameras.keys())
+        for stale_id in list(_camera_semaphores.keys()):
+            if stale_id not in known_ids:
+                del _camera_semaphores[stale_id]
+                log.debug("Pruned semaphore for removed camera %s", stale_id)
+    except Exception:
+        pass  # Non-fatal — semaphores will be pruned on next successful refresh
 
 
 def get_scheduler_status() -> dict:
@@ -674,7 +729,7 @@ def _reset_failures(project_id: int) -> None:
         conn.commit()
 
 
-async def _handle_disk_breach(free_gb: float, threshold_gb: int) -> None:
+async def _handle_disk_breach(free_gb: float, threshold_gb: float) -> None:
     log.error(
         "Disk space critical: %.2f GB free (threshold: %d GB) — pausing all projects",
         free_gb,

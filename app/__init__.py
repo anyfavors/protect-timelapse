@@ -10,6 +10,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
 
 from app.config import get_settings
 from app.database import init_database
@@ -30,6 +33,31 @@ from app.routes import (
 from app.websocket import router as ws_router
 
 log = logging.getLogger("app")
+
+_CSP = (
+    "default-src 'self'; "
+    # Alpine.js requires 'unsafe-eval' for its expression parser
+    "script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; "
+    "style-src 'self' https://cdn.jsdelivr.net; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self' wss:; "
+    "font-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'"
+)
+
+
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[override]
+        response: StarletteResponse = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Content-Security-Policy"] = _CSP
+        # Add Vary for all compressible responses so caches key correctly (CS2)
+        ct = response.headers.get("Content-Type", "")
+        if any(ct.startswith(t) for t in ("text/", "application/json", "application/javascript")):
+            response.headers.setdefault("Vary", "Accept-Encoding")
+        return response
 
 
 @asynccontextmanager
@@ -96,6 +124,9 @@ def create_app() -> FastAPI:
     application = FastAPI(title="Protect Timelapse", lifespan=lifespan)
     application.add_middleware(GZipMiddleware, minimum_size=500)
 
+    # Security headers on every response (SH1, CSP)
+    application.add_middleware(_SecurityHeadersMiddleware)
+
     # Attach rate limiter state (slowapi)
     from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
@@ -146,8 +177,12 @@ def create_app() -> FastAPI:
 
         @application.get("/", include_in_schema=False)
         async def serve_spa(request: Request):  # type: ignore[return]
+            # no-cache: always revalidate so fresh asset hashes are picked up after deploys (CS1)
             return _jinja.TemplateResponse(
-                request, "index.html", {"js_hash": _js_hash, "css_hash": _css_hash}
+                request,
+                "index.html",
+                {"js_hash": _js_hash, "css_hash": _css_hash},
+                headers={"Cache-Control": "no-cache"},
             )
 
     return application

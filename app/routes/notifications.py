@@ -1,17 +1,11 @@
 """In-app notification routes."""
 
-from typing import Any
-
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from app.database import get_connection
+from app.database import get_connection, row_to_dict
 
 router = APIRouter(prefix="/api", tags=["notifications"])
-
-
-def _row_to_dict(row: Any) -> dict:
-    return dict(row)
 
 
 @router.get("/notifications")
@@ -30,7 +24,7 @@ def list_notifications(
                 "SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 class MarkReadPayload(BaseModel):

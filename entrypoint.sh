@@ -6,5 +6,14 @@ chown appuser:appuser /data 2>/dev/null || true
 # uiprotect writes config to $HOME/.config/ufp/
 chown -R appuser:appuser /home/appuser/.config 2>/dev/null || true
 export HOME=/home/appuser
+
+# Single worker: APScheduler and the render queue run inside the process.
+# Multiple workers would spawn duplicate background workers and concurrent renders.
+# Concurrency is handled by asyncio within the single process. (D5)
 exec setpriv --reuid=appuser --regid=appuser --init-groups \
-    uvicorn app:app --host 0.0.0.0 --port 8080 "$@"
+    uvicorn app:app \
+        --host 0.0.0.0 \
+        --port 8080 \
+        --loop uvloop \
+        --timeout-graceful-shutdown 30 \
+        "$@"

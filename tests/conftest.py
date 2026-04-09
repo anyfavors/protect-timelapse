@@ -22,6 +22,18 @@ from fastapi.testclient import TestClient
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def reset_capture_disk_cache() -> Generator[None, None, None]:
+    """Reset the disk-check throttle cache between tests to prevent cross-test pollution."""
+    import app.capture as cap_mod
+
+    cap_mod._disk_last_checked = 0.0
+    cap_mod._disk_last_result = None
+    yield
+    cap_mod._disk_last_checked = 0.0
+    cap_mod._disk_last_result = None
+
+
 @pytest.fixture()
 def tmp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """
@@ -43,11 +55,9 @@ def tmp_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     def _get_connection() -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.executescript("""
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-        """)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         try:
             yield conn
         finally:

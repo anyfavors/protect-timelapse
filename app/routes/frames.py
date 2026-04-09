@@ -9,13 +9,12 @@ import os
 import shutil
 import tempfile
 import zipfile
-from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from app.database import get_connection
+from app.database import VALID_FRAME_SQL, get_connection, row_to_dict
 from app.limiter import limiter
 
 router = APIRouter(prefix="/api", tags=["frames"])
@@ -37,10 +36,6 @@ def _get_frame_or_404(project_id: int, frame_id: int) -> dict:
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"Frame {frame_id} not found")
-    return dict(row)
-
-
-def _row_to_dict(row: Any) -> dict:
     return dict(row)
 
 
@@ -125,7 +120,7 @@ def list_frames(
                 f"SELECT {select_cols} FROM frames WHERE {where} ORDER BY captured_at {direction} LIMIT ? OFFSET ?",
                 params + [limit, offset],
             ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 # -------------------------------------------------------------------------
@@ -157,16 +152,21 @@ def serve_thumbnail(project_id: int, frame_id: int, request: Request) -> Respons
 
 
 @router.get("/projects/{project_id}/frames/{frame_id}/full")
-def serve_full(project_id: int, frame_id: int) -> Response:
+def serve_full(project_id: int, frame_id: int) -> FileResponse:
+    from pathlib import Path
+
     frame = _get_frame_or_404(project_id, frame_id)
     path = frame["file_path"]
-    # Avoid TOCTOU: skip existence check, handle FileNotFoundError on open (#20)
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Frame file not found on disk") from exc
-    return Response(content=data, media_type="image/jpeg")
+    # Path traversal guard: ensure resolved path is under the frames root
+    from app.config import get_settings as _gs
+
+    frames_root = Path(_gs().frames_path).resolve()
+    resolved = Path(path).resolve()
+    if not str(resolved).startswith(str(frames_root)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail="Frame file not found on disk")
+    return FileResponse(str(resolved), media_type="image/jpeg")
 
 
 # -------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def set_bookmark(project_id: int, frame_id: int, payload: BookmarkUpdate) -> dic
 
 
 @router.get("/projects/{project_id}/frames/bookmarks")
-def list_bookmarks(project_id: int) -> list[dict]:
+def list_bookmarks(project_id: int, limit: int = Query(default=500, ge=1, le=5000)) -> list[dict]:
     _get_project_or_404(project_id)
     with get_connection() as conn:
         rows = conn.execute(
@@ -200,10 +200,11 @@ def list_bookmarks(project_id: int) -> list[dict]:
             FROM frames
             WHERE project_id = ? AND bookmark_note IS NOT NULL
             ORDER BY captured_at ASC
+            LIMIT ?
             """,
-            (project_id,),
+            (project_id, limit),
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 # -------------------------------------------------------------------------
@@ -225,7 +226,7 @@ def list_dark_frames(project_id: int, limit: int = Query(default=100, ge=1, le=5
             """,
             (project_id, limit),
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 # -------------------------------------------------------------------------
@@ -330,12 +331,15 @@ def list_blurry_frames(
             """,
             (project_id, limit),
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 # -------------------------------------------------------------------------
 # ZIP export
 # -------------------------------------------------------------------------
+
+
+_EXPORT_FRAME_LIMIT = 50_000
 
 
 @router.get("/projects/{project_id}/frames/export")
@@ -344,8 +348,8 @@ def export_frames(request: Request, project_id: int) -> StreamingResponse:
     _get_project_or_404(project_id)
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT file_path, captured_at FROM frames WHERE project_id = ? ORDER BY captured_at ASC",
-            (project_id,),
+            "SELECT file_path, captured_at FROM frames WHERE project_id = ? ORDER BY captured_at ASC LIMIT ?",
+            (project_id, _EXPORT_FRAME_LIMIT),
         ).fetchall()
 
     from collections.abc import Iterator
@@ -377,7 +381,11 @@ def export_frames(request: Request, project_id: int) -> StreamingResponse:
     return StreamingResponse(
         _generate(),
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=project_{project_id}_frames.zip"},
+        headers={
+            "Content-Disposition": f'attachment; filename="project_{project_id}_frames.zip"',
+            "Content-Encoding": "identity",  # prevent GZipMiddleware double-compressing ZIP (CS4)
+            "Cache-Control": "private, no-store",
+        },
     )
 
 
@@ -394,9 +402,9 @@ def export_frames_csv(project_id: int) -> StreamingResponse:
         rows = conn.execute(
             """
             SELECT id, captured_at, file_size, is_dark, is_blurry, sharpness_score, bookmark_note
-            FROM frames WHERE project_id = ? ORDER BY captured_at ASC
+            FROM frames WHERE project_id = ? ORDER BY captured_at ASC LIMIT ?
             """,
-            (project_id,),
+            (project_id, _EXPORT_FRAME_LIMIT),
         ).fetchall()
 
     from collections.abc import Iterator
@@ -432,7 +440,10 @@ def export_frames_csv(project_id: int) -> StreamingResponse:
     return StreamingResponse(
         _generate_csv(),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=project_{project_id}_frames.csv"},
+        headers={
+            "Content-Disposition": f'attachment; filename="project_{project_id}_frames.csv"',
+            "Cache-Control": "private, no-store",
+        },
     )
 
 
@@ -556,9 +567,9 @@ async def _run_gif_export(project_id: int) -> None:
         # Pick up to 60 evenly-spaced non-dark non-blurry frames
         with get_connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)
+                WHERE project_id = ? AND {VALID_FRAME_SQL}
                 ORDER BY captured_at ASC
                 """,
                 (project_id,),
@@ -627,7 +638,7 @@ async def _run_gif_export(project_id: int) -> None:
 
             from app.notifications import notify
 
-            _asyncio.get_event_loop().create_task(
+            _asyncio.get_running_loop().create_task(
                 notify(
                     event="gif_export_failed",
                     level="error",
@@ -643,8 +654,9 @@ async def _run_gif_export(project_id: int) -> None:
 
 
 @router.get("/projects/{project_id}/stats/daily")
-def daily_stats(project_id: int) -> list[dict]:
-    """Returns daily frame counts for the capture heatmap (from pre-aggregated frame_stats)."""
+def daily_stats(project_id: int, limit: int = Query(default=730, ge=1, le=3650)) -> list[dict]:
+    """Returns daily frame counts for the capture heatmap (from pre-aggregated frame_stats).
+    Defaults to the last 730 days (2 years); pass limit= for more."""
     _get_project_or_404(project_id)
     with get_connection() as conn:
         rows = conn.execute(
@@ -653,9 +665,10 @@ def daily_stats(project_id: int) -> list[dict]:
             FROM frame_stats
             WHERE project_id = ?
             GROUP BY date
-            ORDER BY date ASC
+            ORDER BY date DESC
+            LIMIT ?
             """,
-            (project_id,),
+            (project_id, limit),
         ).fetchall()
     if not rows:
         # Fall back to live aggregation (pre-existing data before migration)
@@ -666,11 +679,13 @@ def daily_stats(project_id: int) -> list[dict]:
                 FROM frames
                 WHERE project_id = ?
                 GROUP BY DATE(captured_at)
-                ORDER BY date ASC
+                ORDER BY date DESC
+                LIMIT ?
                 """,
-                (project_id,),
+                (project_id, limit),
             ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    # Re-sort ascending for the frontend heatmap
+    return sorted([row_to_dict(r) for r in rows], key=lambda r: r["date"])
 
 
 @router.get("/projects/{project_id}/stats/timeline")
@@ -706,4 +721,4 @@ def timeline_stats(project_id: int) -> list[dict]:
                 """,
                 (project_id,),
             ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]

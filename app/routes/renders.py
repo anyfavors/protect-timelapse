@@ -4,13 +4,12 @@ import contextlib
 import logging
 import os
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from app.database import get_connection
+from app.database import get_connection, row_to_dict
 from app.limiter import limiter
 from app.render import cancel_active_render, estimate_render, pause_active_render
 
@@ -36,16 +35,12 @@ class RenderCreate(BaseModel):
     priority: int = Field(default=5, ge=1, le=10, description="Queue priority 1 (low) to 10 (high)")
 
 
-def _row_to_dict(row: Any) -> dict:
-    return dict(row)
-
-
 def _get_render_or_404(render_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM renders WHERE id = ?", (render_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"Render {render_id} not found")
-    return _row_to_dict(row)
+    return row_to_dict(row)
 
 
 @router.post("/renders", status_code=201)
@@ -144,7 +139,10 @@ def _enrich_render(r: dict) -> dict:
 
 
 @router.get("/renders")
-def list_all_renders() -> list[dict]:
+def list_all_renders(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict]:
     """Global render queue — all projects, newest first, with project name joined."""
     with get_connection() as conn:
         rows = conn.execute(
@@ -153,10 +151,11 @@ def list_all_renders() -> list[dict]:
             FROM renders r
             LEFT JOIN projects p ON p.id = r.project_id
             ORDER BY r.created_at DESC
-            LIMIT 200
+            LIMIT ? OFFSET ?
             """,
+            (limit, offset),
         ).fetchall()
-    return [_enrich_render(_row_to_dict(r)) for r in rows]
+    return [_enrich_render(row_to_dict(r)) for r in rows]
 
 
 @router.get("/projects/{project_id}/renders")
@@ -166,7 +165,7 @@ def list_renders(project_id: int) -> list[dict]:
             "SELECT * FROM renders WHERE project_id = ? ORDER BY created_at DESC",
             (project_id,),
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 @router.get("/renders/{render_id}/download")
@@ -181,6 +180,10 @@ def download_render(render_id: int) -> FileResponse:
         render["output_path"],
         media_type="video/mp4",
         filename=filename,
+        headers={
+            "Accept-Ranges": "bytes",  # enable resumable downloads (CS3)
+            "Cache-Control": "private, max-age=86400",
+        },
     )
 
 

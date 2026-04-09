@@ -13,6 +13,9 @@ node_modules
 .env.*
 tests/
 requirements-dev.txt
+*.db
+*.db-wal
+*.db-shm
 *.md
 project-design.md
 CLAUDE.md

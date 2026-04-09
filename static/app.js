@@ -119,6 +119,7 @@ document.addEventListener('alpine:init', () => {
       // Real-time render estimate: update whenever framerate or resolution changes (UX5)
       this.$watch('renderFramerate', () => this.updateRenderEstimate(this.renderFramerate));
       this.$watch('renderResolution', () => this.updateRenderEstimate(this.renderFramerate));
+      this.$watch('view', v => { if (v !== 'create_project') this.stopPreviewPolling(); });
     },
 
     loadTheme(darkMode) {
@@ -143,7 +144,8 @@ document.addEventListener('alpine:init', () => {
     },
 
     async loadAll() {
-      await Promise.all([
+      // allSettled: one slow endpoint (e.g. disk stats) won't abort the rest (FP3)
+      await Promise.allSettled([
         this.loadProjects(),
         this.loadCameras(),
         this.loadTemplates(),
@@ -152,9 +154,11 @@ document.addEventListener('alpine:init', () => {
         this.loadSystemStatus(),
         this.loadPresets(),
       ]);
-      // Poll system status every 30s
+      // Poll system status every 30s, but pause when the tab is hidden (FP4)
       if (this._systemStatusTimer) clearInterval(this._systemStatusTimer);
-      this._systemStatusTimer = setInterval(() => this.loadSystemStatus(), 30000);
+      this._systemStatusTimer = setInterval(() => {
+        if (!document.hidden) this.loadSystemStatus();
+      }, 30000);
     },
 
     // ── Data loaders ──────────────────────────────────────────────────────
@@ -332,7 +336,7 @@ document.addEventListener('alpine:init', () => {
 
     async bulkPause() {
       const ids = [...this.selectedProjectIds];
-      await this._runBatch(ids, 'Pausing', id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'paused' }));
+      await this._runBatch(ids, 'Pausing', id => this.api(`/api/projects/${id}`, 'PUT', { status: 'paused' }));
       await this.loadProjects();
       this.toast(`Paused ${ids.length} project(s)`);
       this.selectedProjectIds = [];
@@ -340,7 +344,7 @@ document.addEventListener('alpine:init', () => {
 
     async bulkResume() {
       const ids = [...this.selectedProjectIds];
-      await this._runBatch(ids, 'Resuming', id => this.api(`/api/projects/${id}`, 'PATCH', { status: 'active' }));
+      await this._runBatch(ids, 'Resuming', id => this.api(`/api/projects/${id}`, 'PUT', { status: 'active' }));
       await this.loadProjects();
       this.toast(`Resumed ${ids.length} project(s)`);
       this.selectedProjectIds = [];
@@ -381,6 +385,7 @@ document.addEventListener('alpine:init', () => {
       this.rangeStart = null;
       this.rangeEnd = null;
       this.gifJobStatus = null;
+      this.compareRenders = [];
       if (this.gifPollTimer) { clearInterval(this.gifPollTimer); this.gifPollTimer = null; }
       await this.loadProjectDetail();
     },
@@ -390,11 +395,13 @@ document.addEventListener('alpine:init', () => {
       const id = this.activeProject.id;
       // Use allSettled so one failing request doesn't abort the rest (FE2)
       const [framesR, rendersR, dailyR, timelineR] = await Promise.allSettled([
-        this.api(`/api/projects/${id}/frames?fields=id,captured_at&limit=500`),
+        this.api(`/api/projects/${id}/frames?fields=id,captured_at&limit=5000`),
         this.api(`/api/projects/${id}/renders`),
         this.api(`/api/projects/${id}/stats/daily`),
         this.api(`/api/projects/${id}/stats/timeline`),
       ]);
+      // Guard against stale response landing after the user navigated to a different project (P10)
+      if (this.activeProject?.id !== id) return;
       const frames = framesR.status === 'fulfilled' ? framesR.value : null;
       const renders = rendersR.status === 'fulfilled' ? rendersR.value : null;
       const daily = dailyR.status === 'fulfilled' ? dailyR.value : null;
@@ -473,7 +480,7 @@ document.addEventListener('alpine:init', () => {
       this.activeProjectBookmarks = this.activeProjectBookmarks.filter(f => f.id !== frameId);
       this.activeProjectDarkFrames = this.activeProjectDarkFrames.filter(f => f.id !== frameId);
       this.activeProjectBlurryFrames = this.activeProjectBlurryFrames.filter(f => f.id !== frameId);
-      if (this.activeProject) this.activeProject.frame_count = Math.max(0, (this.activeProject.frame_count || 1) - 1);
+      if (this.activeProject) this.activeProject.frame_count = Math.max(0, (this.activeProject.frame_count || 0) - 1);
       if (this.scrubberIndex >= this.activeProjectFrames.length) {
         this.scrubberIndex = Math.max(0, this.activeProjectFrames.length - 1);
       }
@@ -647,7 +654,8 @@ document.addEventListener('alpine:init', () => {
       this.scrubberQualityFilter = filter;
       const id = this.activeProject?.id;
       if (!id) return;
-      let url = `/api/projects/${id}/frames?fields=id,captured_at&limit=500`;
+      const limit = 5000;
+      let url = `/api/projects/${id}/frames?fields=id,captured_at&limit=${limit}`;
       if (filter === 'dark') url += '&is_dark=true';
       else if (filter === 'blurry') url += '&is_blurry=true';
       else if (filter === 'bookmarked') url += '&bookmarked=true';
@@ -656,6 +664,7 @@ document.addEventListener('alpine:init', () => {
         this.activeProjectFrames = data;
         this.scrubberIndex = 0;
         this.updateScrubberFrame();
+        if (data.length >= limit) this.toast(`Scrubber showing first ${limit.toLocaleString()} frames`, 'info');
       }
     },
 
@@ -836,6 +845,7 @@ document.addEventListener('alpine:init', () => {
         const dur = data.estimated_duration_seconds || 0;
         const fc  = data.frame_count || 0;
         this.lastRenderEstimate = `~${dur}s video · ${fc} frames`;
+        this.renderLabel = '';
         this.toast(`Render queued — est. ${dur}s video`);
         await this.loadDetailTab('renders');
       }
@@ -1088,10 +1098,41 @@ document.addEventListener('alpine:init', () => {
     renderAutoRefresh: false,
     _renderAutoRefreshTimer: null,
 
+    // ── Render grid filter / sort ─────────────────────────────────────────
+    renderFilterStatus: 'all',   // all | done | rendering | pending | error | paused
+    renderFilterProject: '',     // '' = all, or project name substring
+    renderSortBy: 'newest',      // newest | oldest | name
+
+    get filteredRenders() {
+      let list = this.allRenders;
+      if (this.renderFilterStatus !== 'all')
+        list = list.filter(r => r.status === this.renderFilterStatus);
+      if (this.renderFilterProject.trim())
+        list = list.filter(r => (r.project_name || '').toLowerCase().includes(this.renderFilterProject.trim().toLowerCase()) || String(r.project_id).includes(this.renderFilterProject.trim()));
+      if (this.renderSortBy === 'oldest')
+        list = [...list].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      else if (this.renderSortBy === 'name')
+        list = [...list].sort((a, b) => (a.project_name || '').localeCompare(b.project_name || ''));
+      // 'newest' is already the default API order
+      return list;
+    },
+
+    _renderAutoRefreshStartedAt: 0,
+
     toggleRenderAutoRefresh() {
       this.renderAutoRefresh = !this.renderAutoRefresh;
       if (this.renderAutoRefresh) {
-        this._renderAutoRefreshTimer = setInterval(() => this.loadRendersQueue(), 7000);
+        this._renderAutoRefreshStartedAt = Date.now();
+        this._renderAutoRefreshTimer = setInterval(() => {
+          // Auto-stop after 30 min to avoid forgotten tabs polling forever (FP5)
+          if (Date.now() - this._renderAutoRefreshStartedAt > 30 * 60 * 1000) {
+            this.renderAutoRefresh = false;
+            clearInterval(this._renderAutoRefreshTimer);
+            this._renderAutoRefreshTimer = null;
+            return;
+          }
+          if (!document.hidden) this.loadRendersQueue();
+        }, 7000);
       } else {
         clearInterval(this._renderAutoRefreshTimer);
         this._renderAutoRefreshTimer = null;
@@ -1297,6 +1338,19 @@ document.addEventListener('alpine:init', () => {
       if (!interval || interval < 1) {
         this.toast('Interval must be at least 1 second', 'error'); return false;
       }
+      if (this.form.capture_mode === 'schedule') {
+        const start = this.form.schedule_start_time;
+        const end   = this.form.schedule_end_time;
+        if (!start || !end) {
+          this.toast('Schedule start and end times are required', 'error'); return false;
+        }
+        if (start >= end) {
+          this.toast('Schedule end time must be after start time', 'error'); return false;
+        }
+        if (!this.form.schedule_days) {
+          this.toast('At least one schedule day is required', 'error'); return false;
+        }
+      }
       return true;
     },
 
@@ -1400,22 +1454,33 @@ document.addEventListener('alpine:init', () => {
       if (!file) return;
       const form = new FormData();
       form.append('file', file);
-      const resp = await fetch('/api/settings/watermark', { method: 'POST', body: form });
-      if (resp.ok) {
-        const data = await resp.json();
-        this.settingsData = { ...this.settingsData, watermark_path: data.watermark_path };
-        this.toast('Watermark uploaded');
-      } else {
-        this.toast('Upload failed', 'error');
+      try {
+        const resp = await fetch('/api/settings/watermark', { method: 'POST', body: form });
+        if (resp.ok) {
+          const data = await resp.json();
+          this.settingsData = { ...this.settingsData, watermark_path: data.watermark_path };
+          this.toast('Watermark uploaded');
+        } else {
+          const err = await resp.json().catch(() => ({}));
+          this.toast(err.detail || `Upload failed (${resp.status})`, 'error');
+        }
+      } catch {
+        this.toast('Upload failed — network error', 'error');
       }
     },
 
     async clearWatermark() {
       if (!confirm('Remove watermark?')) return;
-      const resp = await fetch('/api/settings/watermark', { method: 'DELETE' });
-      if (resp.ok || resp.status === 204) {
-        this.settingsData = { ...this.settingsData, watermark_path: null };
-        this.toast('Watermark removed');
+      try {
+        const resp = await fetch('/api/settings/watermark', { method: 'DELETE' });
+        if (resp.ok || resp.status === 204) {
+          this.settingsData = { ...this.settingsData, watermark_path: null };
+          this.toast('Watermark removed');
+        } else {
+          this.toast('Failed to remove watermark', 'error');
+        }
+      } catch {
+        this.toast('Network error removing watermark', 'error');
       }
     },
 
@@ -1510,12 +1575,24 @@ document.addEventListener('alpine:init', () => {
           break;
         }
         case 'render_complete': {
+          // Update in-place — avoid replacing the whole array which destroys DOM nodes (FP10)
           const r = this.activeProjectRenders.find(r => r.id === msg.render_id);
-          if (r) { r.status = msg.status; r.progress_pct = msg.status === 'done' ? 100 : r.progress_pct; }
+          if (r) {
+            r.status = msg.status;
+            r.progress_pct = msg.status === 'done' ? 100 : r.progress_pct;
+            if (msg.output_path) r.output_path = msg.output_path;
+            if (msg.file_size) r.file_size = msg.file_size;
+            if (msg.completed_at) r.completed_at = msg.completed_at;
+          }
           const rq = this.allRenders.find(r => r.id === msg.render_id);
-          if (rq) { rq.status = msg.status; if (msg.status === 'done') rq.progress_pct = 100; }
-          if (this.view === 'project_detail') this.loadDetailTab('renders');
-          if (this.view === 'renders_queue') this.loadRendersQueue();
+          if (rq) {
+            rq.status = msg.status;
+            if (msg.status === 'done') rq.progress_pct = 100;
+            if (msg.file_size) rq.file_size = msg.file_size;
+          }
+          // Only do a full reload if the render wasn't already in our local list
+          if (!r && this.view === 'project_detail') this.loadDetailTab('renders');
+          if (!rq && this.view === 'renders_queue') this.loadRendersQueue();
           const projId = r?.project_id ?? rq?.project_id ?? msg.project_id;
           const pName = this.projects.find(p => p.id === projId)?.name || 'project';
           const label = msg.status === 'done' ? `Render done: ${pName}` : `Render failed: ${pName}`;
@@ -1550,12 +1627,22 @@ document.addEventListener('alpine:init', () => {
           break;
         }
         case 'notification': {
-          this.notifications.unshift({
-            event: msg.event, level: msg.level, message: msg.message,
-            is_read: false, created_at: msg.timestamp,
-          });
-          this.unreadCount++;
           this.toast(msg.message, msg.level === 'error' ? 'error' : 'info');
+          // Prepend to local list instead of reloading the full list (FP9)
+          if (msg.id) {
+            this.notifications.unshift({
+              id: msg.id, event: msg.event, level: msg.level,
+              message: msg.message, is_read: false,
+              created_at: msg.created_at || new Date().toISOString(),
+              project_id: msg.project_id ?? null,
+            });
+            // Keep list bounded to 50 to match loadNotifications limit
+            if (this.notifications.length > 50) this.notifications.pop();
+            this.unreadCount = this.notifications.filter(n => !n.is_read).length;
+          } else {
+            // Fallback: id not included in payload, do a full reload
+            this.loadNotifications();
+          }
           break;
         }
         case 'nvr_status': {
@@ -1620,6 +1707,13 @@ document.addEventListener('alpine:init', () => {
     _toastCounter: 0,
 
     toast(message, type = 'success', projectId = null, undoId = null) {
+      // Deduplicate: skip if same message+type already visible (FP6)
+      if (this.toasts.some(t => t.message === message && t.type === type)) return;
+      // Cap at 10 toasts — discard oldest non-undo toast to stay bounded (FP6)
+      if (this.toasts.length >= 10) {
+        const oldest = this.toasts.findIndex(t => !t.undoId);
+        if (oldest >= 0) this.toasts.splice(oldest, 1);
+      }
       const id = ++this._toastCounter;  // monotonic counter avoids Date.now() collisions (FE7)
       this.toasts.push({ id, message, type, projectId, undoId });
       setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, undoId ? 5500 : 4000);

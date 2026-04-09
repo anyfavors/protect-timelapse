@@ -3,12 +3,10 @@ Project template CRUD routes.
 Templates store reusable project configurations.
 """
 
-from typing import Any
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.database import get_connection
+from app.database import get_connection, row_to_dict
 
 router = APIRouter(prefix="/api", tags=["templates"])
 
@@ -39,10 +37,6 @@ class TemplateApply(BaseModel):
     camera_id: str
 
 
-def _row_to_dict(row: Any) -> dict:
-    return dict(row)
-
-
 def _get_template_or_404(template_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute(
@@ -50,14 +44,14 @@ def _get_template_or_404(template_id: int) -> dict:
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
-    return _row_to_dict(row)
+    return row_to_dict(row)
 
 
 @router.get("/templates")
 def list_templates() -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM project_templates ORDER BY name ASC").fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 @router.post("/templates", status_code=201)

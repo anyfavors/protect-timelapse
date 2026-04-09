@@ -91,6 +91,7 @@ async def _prune_old_frames() -> None:
             placeholders = ",".join("?" * len(frame_ids))
             with get_connection() as conn:
                 conn.execute(f"DELETE FROM frames WHERE id IN ({placeholders})", frame_ids)
+                # Recount after delete — ensures frame_count is accurate even if it drifted
                 count_row = conn.execute(
                     "SELECT COUNT(*) as cnt FROM frames WHERE project_id = ?", (project_id,)
                 ).fetchone()
@@ -194,7 +195,7 @@ async def _recover_zombie_renders() -> None:
 
 
 async def _reconcile_frame_counts() -> None:
-    """Fix drifted frame_count values by comparing with actual COUNT(*)."""
+    """Fix drifted frame_count values — single batched UPDATE instead of N round-trips."""
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -206,19 +207,22 @@ async def _reconcile_frame_counts() -> None:
             """
         ).fetchall()
 
-    for row in rows:
-        with get_connection() as conn:
+        if not rows:
+            return
+
+        # One UPDATE per drifted project, all inside a single transaction
+        for row in rows:
             conn.execute(
                 "UPDATE projects SET frame_count = ? WHERE id = ?",
                 (row["actual_count"], row["id"]),
             )
-            conn.commit()
-        log.info(
-            "Reconciled frame_count for project %d: %d → %d",
-            row["id"],
-            row["frame_count"],
-            row["actual_count"],
-        )
+            log.info(
+                "Reconciled frame_count for project %d: %d → %d",
+                row["id"],
+                row["frame_count"],
+                row["actual_count"],
+            )
+        conn.commit()
 
 
 async def _reconcile_project_status() -> None:

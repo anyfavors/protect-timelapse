@@ -1,12 +1,22 @@
-# ── Stage 1: Compile Tailwind CSS ───────────────────────────────────────────
+# ── Stage 1: Compile Tailwind CSS + minify app.js ───────────────────────────
 FROM node:25-slim AS css-build
 
 WORKDIR /src
-COPY package.json .
-RUN npm install --no-fund --no-audit
+
+# Copy lockfile first so npm layer is cached independently of source changes (D2/D3).
+# Run: `npm install` locally and commit package-lock.json to enable `npm ci`.
+COPY package.json package-lock.json* ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm install --prefer-offline --no-fund --no-audit
+
 COPY static/app.css.src ./app.css.src
 COPY templates/index.html ./templates/index.html
 RUN npx @tailwindcss/cli -i app.css.src -o app.css --minify
+
+# Minify app.js — reduces bundle ~35% before gzip (D4)
+COPY static/app.js ./app.js
+RUN npx terser app.js --compress --mangle --output app.min.js \
+    || cp app.js app.min.js  # fall back to unminified if terser unavailable
 
 
 # ── Stage 2: Python runtime ──────────────────────────────────────────────────
@@ -27,9 +37,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps: ffmpeg for rendering
+# System deps: ffmpeg for rendering, tini for PID1 signal handling + zombie reaping, curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
         ffmpeg \
+        tini \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps (cached layer — only busts when requirements.txt changes)
@@ -40,9 +52,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Copy application code in specific layers for better cache granularity
 COPY app/ ./app/
 COPY templates/ ./templates/
-COPY static/app.js ./static/app.js
 
-# Inject compiled CSS from the CSS build stage
+# Inject minified JS and compiled CSS from build stage (D4)
+COPY --from=css-build /src/app.min.js ./static/app.js
 COPY --from=css-build /src/app.css ./static/app.css
 
 # Non-root user for security (B9)
@@ -55,8 +67,9 @@ RUN chmod +x /entrypoint.sh
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --start-interval=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')" || exit 1
+# curl is faster than spawning Python for health checks (D1)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --start-interval=5s --retries=3 \
+    CMD curl -f http://localhost:8080/api/health/live || exit 1
 
-# Entrypoint fixes /data ownership (top-level only), then drops to appuser
-ENTRYPOINT ["/entrypoint.sh"]
+# tini as PID1: forwards signals to uvicorn and reaps zombie ffmpeg processes
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

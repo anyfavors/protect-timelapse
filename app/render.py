@@ -15,7 +15,7 @@ import time
 from datetime import UTC, datetime
 
 from app.config import get_settings
-from app.database import get_connection
+from app.database import VALID_FRAME_SQL, get_connection
 
 log = logging.getLogger("app.render")
 
@@ -25,6 +25,7 @@ _worker_task: asyncio.Task | None = None  # type: ignore[type-arg]
 # Track the currently-running render so it can be cancelled (F1)
 _active_render_id: int | None = None
 _active_proc: asyncio.subprocess.Process | None = None  # type: ignore[type-arg]
+_active_render_lock: asyncio.Lock | None = None  # initialised in start_render_worker()
 
 # Pre-compiled regex for ffmpeg progress lines — avoids re-compiling on every stderr line
 _FRAME_RE = re.compile(r"frame=\s*(\d+)")
@@ -40,32 +41,37 @@ def get_active_render_id() -> int | None:
 async def cancel_active_render(render_id: int) -> bool:
     """Kill the ffmpeg process if render_id is currently rendering. Returns True if killed."""
     global _active_proc, _active_render_id
-    if _active_render_id != render_id or _active_proc is None:
-        return False
-    try:
-        _active_proc.kill()
-        log.info("Render id=%d cancelled by user request", render_id)
-        return True
-    except (ProcessLookupError, OSError):
-        return False
+    lock = _active_render_lock
+    async with lock if lock else asyncio.Lock():
+        if _active_render_id != render_id or _active_proc is None:
+            return False
+        try:
+            _active_proc.kill()
+            log.info("Render id=%d cancelled by user request", render_id)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
 
 
 async def pause_active_render(render_id: int) -> bool:
     """Pause a rendering job: kill ffmpeg and set status to 'paused'. Returns True if paused."""
     global _active_proc, _active_render_id
-    if _active_render_id != render_id or _active_proc is None:
-        return False
-    try:
-        _active_proc.kill()
-        log.info("Render id=%d paused by user request", render_id)
-        return True
-    except (ProcessLookupError, OSError):
-        return False
+    lock = _active_render_lock
+    async with lock if lock else asyncio.Lock():
+        if _active_render_id != render_id or _active_proc is None:
+            return False
+        try:
+            _active_proc.kill()
+            log.info("Render id=%d paused by user request", render_id)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
 
 
 async def start_render_worker() -> "asyncio.Task[None]":
-    global _stop_event, _worker_task
+    global _stop_event, _worker_task, _active_render_lock
     _stop_event = asyncio.Event()
+    _active_render_lock = asyncio.Lock()
     _worker_task = asyncio.create_task(_render_loop(_stop_event))
     log.info("Render worker started")
     return _worker_task
@@ -87,48 +93,46 @@ async def stop_render_worker(task: "asyncio.Task[None]") -> None:
 
 
 async def _render_loop(stop: asyncio.Event) -> None:
+    _error_backoff = 0  # exponential backoff on repeated errors (seconds)
     while not stop.is_set():
         try:
             # Update heartbeat so liveness probe knows worker is alive (B2)
             from app.routes.health import update_render_worker_heartbeat
 
             update_render_worker_heartbeat()
-            await _process_next_render()
+            poll = await _process_next_render()
+            _error_backoff = 0  # reset on success
         except Exception as exc:
-            log.error("Render loop error: %s", exc)
-        # Poll interval from settings
-        try:
-            with get_connection() as conn:
-                row = conn.execute(
-                    "SELECT render_poll_interval_seconds FROM settings WHERE id = 1"
-                ).fetchone()
-            poll = row["render_poll_interval_seconds"] if row else 5
-        except Exception:
-            poll = 5
-        await asyncio.sleep(poll)
+            _error_backoff = min(_error_backoff * 2 + 5, 120)  # cap at 2 minutes
+            log.error("Render loop error (backoff=%ds): %s", _error_backoff, exc)
+            await asyncio.sleep(_error_backoff)
+            continue
+        await asyncio.sleep(poll or 5)
 
 
-async def _process_next_render() -> None:
-    with get_connection() as conn:
-        row = conn.execute(
-            # Higher priority (larger number) runs first; ties broken by created_at (F5)
-            "SELECT * FROM renders WHERE status = 'pending' ORDER BY COALESCE(priority,5) DESC, created_at ASC LIMIT 1"
-        ).fetchone()
-    if row is None:
-        return
-
-    render = dict(row)
-    render_id = render["id"]
-    project_id = render["project_id"]
-    settings = get_settings()
-
-    # Snapshot DB settings at render-start so mid-render changes don't affect this job
+async def _process_next_render() -> int:
+    """Process the next pending render. Returns the poll interval (seconds) to sleep."""
+    # Read settings once — used both for render config and poll interval
     try:
         with get_connection() as conn:
             _settings_row = conn.execute("SELECT * FROM settings WHERE id = 1").fetchone()
         render_settings: dict = dict(_settings_row) if _settings_row else {}
     except Exception:
         render_settings = {}
+    poll: int = int(render_settings.get("render_poll_interval_seconds") or 5)
+
+    with get_connection() as conn:
+        row = conn.execute(
+            # Higher priority (larger number) runs first; ties broken by created_at (F5)
+            "SELECT * FROM renders WHERE status = 'pending' ORDER BY COALESCE(priority,5) DESC, created_at ASC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return poll
+
+    render = dict(row)
+    render_id = render["id"]
+    project_id = render["project_id"]
+    settings = get_settings()
 
     # Lock the row and stamp start time (for ETA calculation in UI)
     with get_connection() as conn:
@@ -138,8 +142,21 @@ async def _process_next_render() -> None:
         )
         conn.commit()
 
-    global _active_render_id
-    _active_render_id = render_id
+    # Disk space pre-check: abort early rather than failing mid-render
+    try:
+        import shutil as _shutil
+
+        usage = _shutil.disk_usage(settings.renders_path)
+        free_gb = usage.free / 1024**3
+        if free_gb < 0.5:  # require at least 500 MB free
+            raise RuntimeError(f"Insufficient disk space: only {free_gb:.2f} GB free")
+    except OSError as exc:
+        log.warning("Render id=%d: disk check failed: %s", render_id, exc)
+
+    lock = _active_render_lock
+    async with lock if lock else asyncio.Lock():
+        global _active_render_id
+        _active_render_id = render_id
 
     log.info(
         "Starting render id=%d project=%d type=%s", render_id, project_id, render["render_type"]
@@ -332,13 +349,22 @@ async def _process_next_render() -> None:
         )
 
     finally:
-        _active_render_id = None
-        _active_proc = None
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(concat_file)
-        if "transforms_file" in locals() and transforms_file:
+
+        async def _cleanup() -> None:
+            global _active_render_id, _active_proc
+            lock = _active_render_lock
+            async with lock if lock else asyncio.Lock():
+                _active_render_id = None
+                _active_proc = None
             with contextlib.suppress(FileNotFoundError):
-                os.remove(transforms_file)
+                os.remove(concat_file)
+            if "transforms_file" in locals() and transforms_file:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(transforms_file)
+
+        await asyncio.shield(_cleanup())
+
+    return poll
 
 
 def _get_frame_paths(render: dict) -> tuple[list[str], int]:
@@ -363,9 +389,9 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
     if render_type == "range" and render.get("range_start") and render.get("range_end"):
         with get_connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)
+                WHERE project_id = ? AND {VALID_FRAME_SQL}
                 AND captured_at BETWEEN ? AND ?
                 ORDER BY captured_at ASC
                 """,
@@ -374,9 +400,9 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
     else:
         with get_connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)
+                WHERE project_id = ? AND {VALID_FRAME_SQL}
                 ORDER BY captured_at ASC
                 """,
                 (project_id,),
@@ -692,17 +718,19 @@ async def _monitor_progress(  # pragma: no cover
                         conn.commit()
                     from app.notifications import notify
 
-                    with contextlib.suppress(Exception):
+                    try:
                         await notify(
                             event="render_stalled",
                             level="error",
                             message=f"Render #{render_id} stalled — no progress for {_STALL_TIMEOUT_SECONDS // 60} min.",
                         )
+                    except Exception as _ne:
+                        log.warning("render_stalled notify failed: %s", _ne)
                     with contextlib.suppress(ProcessLookupError, OSError):
                         proc.kill()
                     return
 
-                if now - last_update >= 1.0:
+                if now - last_update >= 5.0:  # throttle DB writes to every 5s
                     last_update = now
                     # Compute ETA from elapsed time and progress
                     eta_seconds: int | None = None
@@ -755,8 +783,8 @@ def estimate_render(project_id: int, framerate: int, render_type: str = "manual"
     """
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt, AVG(file_size) as avg_size FROM frames "
-            "WHERE project_id = ? AND is_dark = 0 AND (is_blurry IS NULL OR is_blurry = 0)",
+            f"SELECT COUNT(*) as cnt, AVG(file_size) as avg_size FROM frames "
+            f"WHERE project_id = ? AND {VALID_FRAME_SQL}",
             (project_id,),
         ).fetchone()
 

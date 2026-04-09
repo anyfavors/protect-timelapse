@@ -1,12 +1,11 @@
 """Render preset CRUD routes."""
 
 import logging
-from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.database import get_connection
+from app.database import get_connection, row_to_dict
 
 router = APIRouter(prefix="/api", tags=["presets"])
 log = logging.getLogger("app.routes.presets")
@@ -23,23 +22,19 @@ class PresetCreate(BaseModel):
     color_grade: str = Field(default="none", pattern="^(none|neutral|warm|cool|cinematic)$")
 
 
-def _row_to_dict(row: Any) -> dict:
-    return dict(row)
-
-
 def _get_preset_or_404(preset_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM render_presets WHERE id = ?", (preset_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"Preset {preset_id} not found")
-    return _row_to_dict(row)
+    return row_to_dict(row)
 
 
 @router.get("/presets")
 def list_presets() -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM render_presets ORDER BY name ASC").fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 @router.post("/presets", status_code=201)

@@ -84,13 +84,20 @@ async def broadcast(event: str, payload: dict[str, Any]) -> None:
     await manager.broadcast(event, payload)
 
 
+_PING_INTERVAL = 30.0  # seconds between server-side pings
+
+
 @router.websocket("/api/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await manager.connect(ws)
     try:
         while True:
-            # Keep the connection alive; clients send pings or we just wait
-            await ws.receive_text()
+            try:
+                # Wait for a message with a timeout; send ping on timeout to detect dead clients
+                await asyncio.wait_for(ws.receive_text(), timeout=_PING_INTERVAL)
+            except TimeoutError:
+                # Send a lightweight ping frame to detect stale connections
+                await ws.send_text('{"event":"ping"}')
     except WebSocketDisconnect:
         manager.disconnect(ws)
     except Exception:

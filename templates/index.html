@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Protect Timelapse</title>
 
+  <!-- Preload critical local assets so browser fetches them in parallel with HTML parse (CS5) -->
+  <link rel="preload" href="/static/app.css?v={{ css_hash }}" as="style" />
+  <link rel="preload" href="/static/app.js?v={{ js_hash }}" as="script" />
+  <!-- Warm up CDN connection for Alpine (CS5) -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+
   <!-- app.js MUST come before Alpine so alpine:init fires correctly -->
   <script src="/static/app.js?v={{ js_hash }}" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
@@ -273,7 +279,7 @@
 
   <!-- ── GLOBAL RENDERS QUEUE ─────────────────────────────────────────────── -->
   <div x-show="view === 'renders_queue'">
-    <div class="flex items-center justify-between mb-4">
+    <div class="flex items-center justify-between mb-3">
       <h1 class="text-2xl font-bold text-slate-100">Renders</h1>
       <div class="flex items-center gap-2">
         <button @click="toggleRenderAutoRefresh()"
@@ -291,13 +297,38 @@
       </div>
     </div>
 
+    <!-- Filter / sort bar -->
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <!-- Status filter chips -->
+      <div class="flex gap-1 flex-wrap">
+        <template x-for="s in ['all','done','rendering','pending','paused','error']" :key="s">
+          <button @click="renderFilterStatus = s"
+                  :class="renderFilterStatus === s ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'"
+                  class="text-xs px-2.5 py-1 rounded-full transition capitalize" x-text="s === 'all' ? 'All' : s"></button>
+        </template>
+      </div>
+      <!-- Project search -->
+      <input x-model="renderFilterProject" type="search" placeholder="Filter by project…"
+             class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1 text-xs text-slate-200 placeholder-slate-500 w-40" />
+      <!-- Sort -->
+      <select x-model="renderSortBy" class="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-300 ml-auto">
+        <option value="newest">Newest first</option>
+        <option value="oldest">Oldest first</option>
+        <option value="name">Project name</option>
+      </select>
+      <span class="text-xs text-slate-500" x-text="filteredRenders.length + ' / ' + allRenders.length + ' renders'"></span>
+    </div>
+
     <template x-if="allRenders.length === 0">
       <div class="text-center py-20 text-slate-500">No renders yet.</div>
+    </template>
+    <template x-if="allRenders.length > 0 && filteredRenders.length === 0">
+      <div class="text-center py-16 text-slate-500">No renders match the current filter.</div>
     </template>
 
     <!-- YouTube-style grid -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-      <template x-for="r in allRenders" :key="r.id">
+      <template x-for="r in filteredRenders" :key="r.id">
 
         <!-- Card (draggable when pending for queue reorder) -->
         <div class="group bg-slate-800 rounded-xl overflow-hidden border border-slate-700 hover:border-slate-500 transition flex flex-col"
@@ -311,13 +342,13 @@
           <div class="relative bg-black aspect-video cursor-pointer overflow-hidden"
                @click="r.status === 'done' && openVideoPlayer(r.id)">
 
-            <!-- Done: show video element (browser renders first frame as thumbnail) -->
+            <!-- Done: show video element — lazy load, fetch metadata only on hover -->
             <template x-if="r.status === 'done'">
               <video :src="`/api/renders/${r.id}/download`"
-                     preload="metadata"
+                     preload="none"
                      muted playsinline
                      class="w-full h-full object-contain"
-                     @mouseenter="$el.muted = true; $el.play().catch(() => {})"
+                     @mouseenter="$el.preload = 'metadata'; $el.muted = true; $el.play().catch(() => {})"
                      @mouseleave="$el.pause(); $el.currentTime = 0"
                      @error="$el.closest('.group').querySelector('[data-missing]')?.classList.remove('hidden')">
               </video>

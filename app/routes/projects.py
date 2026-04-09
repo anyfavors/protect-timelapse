@@ -23,7 +23,7 @@ from app.capture import (
     run_historical_extraction,
 )
 from app.config import get_settings
-from app.database import get_connection
+from app.database import get_connection, row_to_dict
 
 router = APIRouter(prefix="/api", tags=["projects"])
 log = logging.getLogger("app.routes.projects")
@@ -101,16 +101,12 @@ class ProjectUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _row_to_dict(row: Any) -> dict:
-    return dict(row)
-
-
 def _get_project_or_404(project_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-    return _row_to_dict(row)
+    return row_to_dict(row)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +132,7 @@ def list_projects() -> list[dict]:
             ORDER BY p.is_pinned DESC, p.created_at DESC
             """,
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [row_to_dict(r) for r in rows]
 
 
 @router.post("/projects", status_code=201)
@@ -555,12 +551,18 @@ def unpin_project(project_id: int) -> dict:
 async def delete_project(project_id: int) -> None:
     _get_project_or_404(project_id)
     settings = get_settings()
+    loop = asyncio.get_running_loop()
 
-    # Remove files BEFORE SQL delete so a failed DB delete is retryable
+    # Remove files BEFORE SQL delete so a failed DB delete is retryable.
+    # run_in_executor avoids blocking the event loop on large frame directories (#31).
     for base in (settings.frames_path, settings.thumbnails_path, settings.renders_path):
         path = f"{base}/{project_id}"
-        with contextlib.suppress(FileNotFoundError):
-            shutil.rmtree(path)
+
+        def _rmtree(p: str = path) -> None:
+            with contextlib.suppress(FileNotFoundError):
+                shutil.rmtree(p)
+
+        await loop.run_in_executor(None, _rmtree)
 
     # Remove APScheduler job
     await remove_project_job(project_id)
