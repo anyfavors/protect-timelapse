@@ -11,12 +11,13 @@
   <link rel="stylesheet" href="/static/app.css?v={{ css_hash }}" />
 </head>
 
-<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="timelapseApp()">
+<body class="bg-slate-950 text-slate-100 min-h-screen transition-colors duration-150" x-data="timelapseApp()">
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- TOP NAV                                                                 -->
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
-<nav class="bg-slate-900 border-b border-slate-800 px-4 py-3 flex items-center justify-between sticky top-0 z-50">
+<nav class="bg-slate-900 border-b border-slate-800 sticky top-0 z-50">
+  <div class="w-full max-w-[1600px] mx-auto px-4 sm:px-6 xl:px-10 py-3 flex items-center justify-between">
   <div class="flex items-center gap-4">
     <button @click="view = 'dashboard'" class="text-blue-400 font-bold text-lg tracking-tight hover:text-blue-300 transition">
       ▶ Protect Timelapse
@@ -181,6 +182,7 @@
       </svg>
     </button>
   </div>
+  </div><!-- /nav inner wrapper -->
 </nav>
 
 <!-- Mobile bottom nav bar (sm: hidden) -->
@@ -252,7 +254,7 @@
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- MAIN CONTENT                                                             -->
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
-<main class="max-w-7xl mx-auto px-4 py-6 pb-20 sm:pb-6">
+<main class="w-full max-w-[1600px] mx-auto px-4 sm:px-6 xl:px-10 py-6 pb-20 sm:pb-6">
 
   <!-- ── DISK WARNING BANNER ──────────────────────────────────────────────── -->
   <div x-show="diskCritical" x-cloak
@@ -297,9 +299,13 @@
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
       <template x-for="r in allRenders" :key="r.id">
 
-        <!-- Card -->
+        <!-- Card (draggable when pending for queue reorder) -->
         <div class="group bg-slate-800 rounded-xl overflow-hidden border border-slate-700 hover:border-slate-500 transition flex flex-col"
-             :class="r.status === 'rendering' ? 'border-blue-700/60' : ''">
+             :class="r.status === 'rendering' ? 'border-blue-700/60' : (r.status === 'pending' ? 'cursor-grab active:cursor-grabbing' : '')"
+             :draggable="r.status === 'pending'"
+             @dragstart="r.status === 'pending' && onRenderDragStart(r.id)"
+             @dragover.prevent
+             @drop.prevent="r.status === 'pending' && onRenderDrop(r.id)">
 
           <!-- Thumbnail / video preview area -->
           <div class="relative bg-black aspect-video cursor-pointer overflow-hidden"
@@ -338,8 +344,13 @@
                           d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
                   </svg>
                 </template>
+                <template x-if="r.status === 'paused'">
+                  <svg class="w-10 h-10 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10 9v6m4-6v6"/>
+                  </svg>
+                </template>
                 <span class="text-xs capitalize"
-                      :class="{'text-blue-300': r.status==='rendering','text-slate-500': r.status==='pending','text-red-400': r.status==='error'}"
+                      :class="{'text-blue-300': r.status==='rendering','text-slate-500': r.status==='pending','text-red-400': r.status==='error','text-yellow-400': r.status==='paused'}"
                       x-text="r.status"></span>
               </div>
             </template>
@@ -391,6 +402,7 @@
                         'bg-yellow-700/40 text-yellow-300': r.status === 'pending',
                         'bg-blue-700/40 text-blue-300': r.status === 'rendering',
                         'bg-red-700/40 text-red-300': r.status === 'error',
+                        'bg-orange-700/40 text-orange-300': r.status === 'paused',
                       }"
                       x-text="r.status"></span>
               </template>
@@ -429,6 +441,36 @@
                           d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
                   </svg>
                 </a>
+              </template>
+              <!-- Pause button (pending or rendering) -->
+              <template x-if="r.status === 'pending' || r.status === 'rendering'">
+                <button @click="pauseRender(r.id)"
+                        class="text-xs bg-slate-700 hover:bg-yellow-700/60 text-slate-300 hover:text-yellow-200 px-2.5 py-1.5 rounded-lg transition"
+                        title="Pause">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6"/>
+                  </svg>
+                </button>
+              </template>
+              <!-- Resume button (paused) -->
+              <template x-if="r.status === 'paused'">
+                <button @click="resumeRender(r.id)"
+                        class="text-xs bg-blue-700/60 hover:bg-blue-600 text-blue-200 px-2.5 py-1.5 rounded-lg transition"
+                        title="Resume">
+                  <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M6.3 2.84A1.5 1.5 0 004 4.11v11.78a1.5 1.5 0 002.3 1.27l9.344-5.891a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                  </svg>
+                </button>
+              </template>
+              <!-- Cancel button (pending, rendering, or paused) -->
+              <template x-if="r.status === 'pending' || r.status === 'rendering' || r.status === 'paused'">
+                <button @click="cancelRender(r.id)"
+                        class="text-xs bg-slate-700 hover:bg-red-700/60 text-slate-400 hover:text-red-200 px-2.5 py-1.5 rounded-lg transition"
+                        title="Cancel render">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
               </template>
               <button @click="deleteRender(r.id)"
                       class="ml-auto text-xs text-slate-600 hover:text-red-400 hover:bg-red-900/20 px-2 py-1.5 rounded transition"
@@ -990,9 +1032,16 @@
           </span>
         </div>
 
+        <!-- Render label -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">Label <span class="text-slate-600">(optional)</span></label>
+          <input x-model="renderLabel" type="text" placeholder="e.g. final cut, before storm…"
+                 class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-slate-100 placeholder-slate-500" />
+        </div>
+
         <!-- Action buttons -->
         <div class="flex flex-wrap gap-2 pt-1">
-          <button @click="triggerRender(activeProject.id, renderFramerate, renderResolution); updateRenderEstimate(renderFramerate)"
+          <button @click="triggerRender(activeProject.id, renderFramerate, renderResolution, renderLabel || null); updateRenderEstimate(renderFramerate)"
                   class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm transition">
             Render <span x-text="renderFramerate + 'fps · ' + renderResolution"></span>
             <span class="text-xs text-blue-300 ml-1">[R]</span>
@@ -1202,7 +1251,7 @@
       <h1 class="text-2xl font-bold text-slate-100" x-text="formMode === 'create' ? 'New Project' : 'Edit Project'"></h1>
     </div>
 
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-4xl">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
       <!-- Form -->
       <div class="space-y-5">
         <!-- Template picker -->
@@ -1556,7 +1605,7 @@
       <h1 class="text-2xl font-bold text-slate-100">Settings</h1>
     </div>
 
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-4xl">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl">
 
       <!-- NVR Connection -->
       <div class="bg-slate-800 border border-slate-700 rounded-xl p-5 space-y-4">
@@ -1615,6 +1664,20 @@
           <label class="block text-xs text-slate-400 mb-1">Webhook URL</label>
           <input x-model="settingsData.webhook_url" type="url" placeholder="https://..."
                  class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100" />
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Render poll interval (s)</label>
+            <input x-model.number="settingsData.render_poll_interval_seconds" type="number" min="1" max="60"
+                   class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100" />
+            <p class="text-xs text-slate-500 mt-1">How often the render worker checks for new jobs.</p>
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">NVR reconnect backoff (s)</label>
+            <input x-model.number="settingsData.nvr_reconnect_backoff_seconds" type="number" min="5" max="300"
+                   class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100" />
+            <p class="text-xs text-slate-500 mt-1">Seconds to wait before retrying NVR connection.</p>
+          </div>
         </div>
         <label class="flex items-center gap-2 cursor-pointer">
           <input type="checkbox" x-model="settingsData.timestamp_burn_in" class="accent-blue-500" />
@@ -1700,7 +1763,7 @@
     </div>
 
     <!-- Save button -->
-    <div class="mt-6 max-w-4xl">
+    <div class="mt-6 max-w-5xl">
       <button @click="saveSettings()"
               class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg text-sm font-medium transition">
         Save Settings
@@ -1708,7 +1771,7 @@
     </div>
 
     <!-- Templates management -->
-    <div class="mt-6 max-w-4xl">
+    <div class="mt-6 max-w-5xl">
       <div class="bg-slate-800 border border-slate-700 rounded-xl p-5">
         <h2 class="font-semibold text-slate-200 mb-4">Templates</h2>
         <template x-if="templates.length === 0">
@@ -1730,7 +1793,7 @@
     </div>
 
     <!-- Notification history -->
-    <div class="mt-6 max-w-4xl">
+    <div class="mt-6 max-w-5xl">
       <div class="flex items-center justify-between mb-3">
         <h2 class="font-semibold text-slate-200">Notification History</h2>
         <div class="flex gap-2">

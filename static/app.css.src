@@ -2,25 +2,139 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* ── Dark mode CSS custom properties (UI10) ─────────────────────────────── */
-/* Base theme tokens — override in :root for light mode, .dark for dark */
+/* ── Theme: light is default, .dark overrides ───────────────────────────── */
 :root {
-  --color-bg-primary: theme(colors.slate.950);
-  --color-bg-surface: theme(colors.slate.800);
-  --color-bg-elevated: theme(colors.slate.700);
-  --color-text-primary: theme(colors.slate.100);
-  --color-text-secondary: theme(colors.slate.400);
-  --color-border: theme(colors.slate.700);
-  --color-accent: theme(colors.blue.500);
-  --color-danger: theme(colors.red.500);
-  --color-success: theme(colors.emerald.500);
+  /* Backgrounds */
+  --bg-page:    theme(colors.slate.100);
+  --bg-nav:     theme(colors.white);
+  --bg-surface: theme(colors.white);
+  --bg-raised:  theme(colors.slate.50);
+  --bg-input:   theme(colors.white);
+  --bg-muted:   theme(colors.slate.200);
+  --bg-hover:   theme(colors.slate.100);
+
+  /* Text */
+  --text-primary:   theme(colors.slate.900);
+  --text-secondary: theme(colors.slate.600);
+  --text-muted:     theme(colors.slate.400);
+
+  /* Borders */
+  --border:       theme(colors.slate.200);
+  --border-hover: theme(colors.slate.300);
+
+  /* Scrollbar */
+  --scrollbar-track: theme(colors.slate.200);
+  --scrollbar-thumb: theme(colors.slate.400);
 }
 
-html:not(.dark) {
-  --color-bg-primary: theme(colors.slate.100);
-  --color-bg-surface: theme(colors.white);
-  --color-bg-elevated: theme(colors.slate.200);
-  --color-text-primary: theme(colors.slate.900);
-  --color-text-secondary: theme(colors.slate.600);
-  --color-border: theme(colors.slate.300);
+.dark {
+  --bg-page:    theme(colors.slate.950);
+  --bg-nav:     theme(colors.slate.900);
+  --bg-surface: theme(colors.slate.800);
+  --bg-raised:  theme(colors.slate.700);
+  --bg-input:   theme(colors.slate.800);
+  --bg-muted:   theme(colors.slate.700);
+  --bg-hover:   theme(colors.slate.700);
+
+  --text-primary:   theme(colors.slate.100);
+  --text-secondary: theme(colors.slate.400);
+  --text-muted:     theme(colors.slate.500);
+
+  --border:       theme(colors.slate.700);
+  --border-hover: theme(colors.slate.600);
+
+  --scrollbar-track: theme(colors.slate.800);
+  --scrollbar-thumb: theme(colors.slate.600);
+}
+
+/* ── Global base ─────────────────────────────────────────────────────────── */
+html {
+  background-color: var(--bg-page);
+  color: var(--text-primary);
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+/* Nav bar */
+nav,
+header {
+  background-color: var(--bg-nav);
+  border-color: var(--border);
+}
+
+/* Utility classes that read from CSS vars — use these in HTML */
+.t-page    { background-color: var(--bg-page); }
+.t-surface { background-color: var(--bg-surface); color: var(--text-primary); }
+.t-raised  { background-color: var(--bg-raised); }
+.t-input   { background-color: var(--bg-input); color: var(--text-primary); border-color: var(--border); }
+.t-muted   { background-color: var(--bg-muted); }
+.t-border  { border-color: var(--border); }
+.t-text    { color: var(--text-primary); }
+.t-text-2  { color: var(--text-secondary); }
+.t-text-m  { color: var(--text-muted); }
+
+/* ── Scrollbar ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+
+/* ── Tailwind dark: overrides for hardcoded slate classes ────────────────── */
+/*
+   The HTML uses hardcoded "bg-slate-800 bg-slate-900 bg-slate-950" etc.
+   These overrides flip them to light-mode equivalents when .dark is NOT set.
+   Since the app was built dark-first, we invert: without .dark = light mode.
+*/
+
+/* Page background */
+html:not(.dark) body,
+html:not(.dark) main  { background-color: var(--bg-page) !important; }
+
+/* Nav */
+html:not(.dark) nav   { background-color: var(--bg-nav) !important; border-color: var(--border) !important; }
+
+/* Card surfaces — slate-800 → white, slate-900 → slate-50, slate-950 → slate-100 */
+html:not(.dark) .bg-slate-950 { background-color: theme(colors.slate.100) !important; }
+html:not(.dark) .bg-slate-900 { background-color: theme(colors.slate.100) !important; }
+html:not(.dark) .bg-slate-800 { background-color: theme(colors.white) !important; }
+html:not(.dark) .bg-slate-700 { background-color: theme(colors.slate.100) !important; }
+html:not(.dark) .bg-slate-600 { background-color: theme(colors.slate.200) !important; }
+
+/* Hover backgrounds */
+html:not(.dark) .hover\:bg-slate-700:hover { background-color: theme(colors.slate.200) !important; }
+html:not(.dark) .hover\:bg-slate-600:hover { background-color: theme(colors.slate.200) !important; }
+html:not(.dark) .hover\:bg-slate-500:hover { background-color: theme(colors.slate.300) !important; }
+
+/* Text colours */
+html:not(.dark) .text-slate-100 { color: theme(colors.slate.900) !important; }
+html:not(.dark) .text-slate-200 { color: theme(colors.slate.800) !important; }
+html:not(.dark) .text-slate-300 { color: theme(colors.slate.700) !important; }
+html:not(.dark) .text-slate-400 { color: theme(colors.slate.500) !important; }
+html:not(.dark) .text-slate-500 { color: theme(colors.slate.400) !important; }
+html:not(.dark) .text-slate-600 { color: theme(colors.slate.500) !important; }
+
+/* Borders */
+html:not(.dark) .border-slate-700 { border-color: theme(colors.slate.200) !important; }
+html:not(.dark) .border-slate-600 { border-color: theme(colors.slate.300) !important; }
+
+/* Inputs */
+html:not(.dark) input,
+html:not(.dark) select,
+html:not(.dark) textarea {
+  background-color: theme(colors.white) !important;
+  color: theme(colors.slate.900) !important;
+  border-color: theme(colors.slate.300) !important;
+}
+
+/* Placeholder text */
+html:not(.dark) ::placeholder { color: theme(colors.slate.400) !important; }
+
+/* Ring / focus */
+html:not(.dark) .ring-slate-700 { --tw-ring-color: theme(colors.slate.300) !important; }
+
+/* Opacity helpers that should stay readable */
+html:not(.dark) .bg-slate-800\/50 { background-color: rgb(248 250 252 / 0.8) !important; }
+html:not(.dark) .bg-black\/90      { background-color: rgb(15 23 42 / 0.95) !important; }
+
+/* ── Tailwind v4 width config ────────────────────────────────────────────── */
+@theme {
+  --width-screen: 100vw;
 }

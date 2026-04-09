@@ -78,6 +78,7 @@ document.addEventListener('alpine:init', () => {
     renderQuality: 'standard',
     renderFlicker: 'standard',
     renderFrameBlend: false,
+    renderLabel: '',
     renderStabilize: false,
     renderColorGrade: 'none',
     renderPresets: [],
@@ -201,7 +202,10 @@ document.addEventListener('alpine:init', () => {
 
     createProjectFromCamera(cameraId) {
       this.openCreateForm();
-      this.$nextTick(() => { this.form.camera_id = cameraId; });
+      this.$nextTick(() => {
+        this.form.camera_id = cameraId;
+        this.startPreviewPolling();
+      });
     },
 
     async loadTemplates() {
@@ -873,6 +877,34 @@ document.addEventListener('alpine:init', () => {
       this.activeProjectRenders = this.activeProjectRenders.filter(r => r.id !== renderId);
       if (this.view === 'project_detail') await this.loadDetailTab('renders');
       this.toast('Render deleted');
+    },
+
+    async cancelRender(renderId) {
+      const result = await this.api(`/api/renders/${renderId}/cancel`, 'POST');
+      if (!result) return;
+      this._updateRenderStatus(renderId, 'error');
+      this.toast('Render cancelled');
+    },
+
+    async pauseRender(renderId) {
+      const result = await this.api(`/api/renders/${renderId}/pause`, 'POST');
+      if (!result) return;
+      this._updateRenderStatus(renderId, 'paused');
+      this.toast('Render paused');
+    },
+
+    async resumeRender(renderId) {
+      const result = await this.api(`/api/renders/${renderId}/resume`, 'POST');
+      if (!result) return;
+      this._updateRenderStatus(renderId, 'pending');
+      this.toast('Render resumed');
+    },
+
+    _updateRenderStatus(renderId, status) {
+      const r = this.allRenders.find(r => r.id === renderId);
+      if (r) r.status = status;
+      const rp = this.activeProjectRenders.find(r => r.id === renderId);
+      if (rp) rp.status = status;
     },
 
     async openRendersQueue() {

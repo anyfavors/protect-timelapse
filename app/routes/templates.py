@@ -19,7 +19,9 @@ class TemplateCreate(BaseModel):
     width: int | None = None
     height: int | None = None
     max_frames: int | None = None
-    capture_mode: str = Field(default="continuous", pattern="^(continuous|daylight_only|schedule)$")
+    capture_mode: str = Field(
+        default="continuous", pattern="^(continuous|daylight_only|schedule|solar_noon)$"
+    )
     use_luminance_check: bool = False
     luminance_threshold: int = Field(default=15, ge=0, le=255)
     schedule_start_time: str | None = None
@@ -29,6 +31,7 @@ class TemplateCreate(BaseModel):
     auto_render_weekly: bool = False
     auto_render_monthly: bool = False
     retention_days: int = 0
+    solar_noon_window_minutes: int = Field(default=30, ge=5, le=120)
 
 
 class TemplateApply(BaseModel):
@@ -68,8 +71,8 @@ def create_template(payload: TemplateCreate) -> dict:
                     capture_mode, use_luminance_check, luminance_threshold,
                     schedule_start_time, schedule_end_time, schedule_days,
                     auto_render_daily, auto_render_weekly, auto_render_monthly,
-                    retention_days
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    retention_days, solar_noon_window_minutes
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     payload.name,
@@ -87,6 +90,7 @@ def create_template(payload: TemplateCreate) -> dict:
                     int(payload.auto_render_weekly),
                     int(payload.auto_render_monthly),
                     payload.retention_days,
+                    payload.solar_noon_window_minutes,
                 ),
             )
             conn.commit()
@@ -134,6 +138,7 @@ async def apply_template(template_id: int, payload: TemplateApply) -> dict:
         auto_render_weekly=bool(tmpl["auto_render_weekly"]),
         auto_render_monthly=bool(tmpl["auto_render_monthly"]),
         retention_days=tmpl["retention_days"],
+        solar_noon_window_minutes=tmpl.get("solar_noon_window_minutes") or 30,
         template_id=template_id,
     )
     return await create_project(project_payload)

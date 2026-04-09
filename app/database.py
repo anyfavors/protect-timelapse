@@ -373,6 +373,15 @@ def _migrate_v11(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+_SCHEMA_V12 = """
+ALTER TABLE project_templates ADD COLUMN solar_noon_window_minutes INTEGER DEFAULT 30;
+"""
+
+
+def _migrate_v12(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, _SCHEMA_V12)
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
@@ -386,6 +395,7 @@ MIGRATIONS: dict[int, object] = {
     9: _migrate_v9,
     10: _migrate_v10,
     11: _migrate_v11,
+    12: _migrate_v12,
 }
 
 
