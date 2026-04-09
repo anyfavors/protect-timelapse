@@ -181,8 +181,10 @@ def download_render(render_id: int) -> FileResponse:
         media_type="video/mp4",
         filename=filename,
         headers={
-            "Accept-Ranges": "bytes",  # enable resumable downloads (CS3)
             "Cache-Control": "private, max-age=86400",
+            # Prevent GZipMiddleware from re-encoding the video stream.
+            # MP4 is already compressed; gzip encoding breaks browser playback.
+            "Content-Encoding": "identity",
         },
     )
 

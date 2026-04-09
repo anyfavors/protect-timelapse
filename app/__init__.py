@@ -36,16 +36,16 @@ log = logging.getLogger("app")
 
 _CSP = (
     "default-src 'self'; "
-    # Alpine.js requires 'unsafe-eval' for its expression parser
-    "script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; "
-    "style-src 'self' https://cdn.jsdelivr.net; "
+    # Alpine.js requires 'unsafe-eval' (expression parser) and 'unsafe-inline'
+    # (inline event handlers and x-show style injection)
+    "script-src 'self' 'unsafe-eval' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
     "img-src 'self' data: blob:; "
     "connect-src 'self' wss:; "
     "font-src 'self'; "
     "object-src 'none'; "
     "base-uri 'self'"
 )
-
 
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[override]
