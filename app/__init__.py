@@ -47,6 +47,7 @@ _CSP = (
     "base-uri 'self'"
 )
 
+
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[override]
         response: StarletteResponse = await call_next(request)
