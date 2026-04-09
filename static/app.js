@@ -936,12 +936,6 @@ document.addEventListener('alpine:init', () => {
 
     // ── Video player ──────────────────────────────────────────────────────
     async openVideoPlayer(renderId) {
-      // Check file still exists before opening player
-      const head = await fetch(`/api/renders/${renderId}/download`, { method: 'HEAD' });
-      if (!head.ok) {
-        this.toast('Video file not found on disk — it may have been deleted manually.', 'error');
-        return;
-      }
       const url = `/api/renders/${renderId}/download`;
       const overlay = document.createElement('div');
       overlay.id = 'video-overlay';
