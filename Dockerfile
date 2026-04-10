@@ -20,7 +20,7 @@ RUN npx terser app.js --compress --mangle --output app.min.js \
 
 
 # ── Stage 2: Python runtime ──────────────────────────────────────────────────
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ARG BUILD_DATE
 ARG VERSION=dev
