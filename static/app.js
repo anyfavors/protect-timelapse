@@ -1645,10 +1645,18 @@ document.addEventListener('alpine:init', () => {
         }
         case 'render_progress': {
           // Update both the per-project tab and the global queue view
-          const r = this.activeProjectRenders.find(r => r.id === msg.render_id);
-          if (r) { r.progress_pct = msg.progress_pct; r.status = 'rendering'; }
-          const rq = this.allRenders.find(r => r.id === msg.render_id);
-          if (rq) { rq.progress_pct = msg.progress_pct; rq.status = 'rendering'; }
+          const update = (r) => {
+            if (!r) return;
+            r.progress_pct = msg.progress_pct;
+            r.status = 'rendering';
+            r._current_frame = msg.current_frame;
+            r._total_frames = msg.total_frames;
+            r._speed = msg.speed;
+            r._eta_seconds = msg.eta_seconds;
+            r._elapsed_seconds = msg.elapsed_seconds;
+          };
+          update(this.activeProjectRenders.find(r => r.id === msg.render_id));
+          update(this.allRenders.find(r => r.id === msg.render_id));
           break;
         }
         case 'render_complete': {

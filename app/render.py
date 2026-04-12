@@ -262,7 +262,7 @@ async def _process_next_render() -> int:
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,  # -progress pipe:1 writes here
             stderr=asyncio.subprocess.PIPE,
         )
 
@@ -470,6 +470,8 @@ def _build_ffmpeg_cmd(
             "-y",
             "-threads",
             str(ffmpeg_threads),
+            "-progress",
+            "pipe:1",
             "-f",
             "concat",
             "-safe",
@@ -621,6 +623,10 @@ def _build_ffmpeg_cmd(
         "-y",
         "-threads",
         str(ffmpeg_threads),
+        # Machine-readable progress to stdout (newline-delimited key=value).
+        # Without this, ffmpeg uses \r on stderr which is unreadable from a pipe.
+        "-progress",
+        "pipe:1",
         # Increase demuxer queue to avoid SIGABRT on large frame counts with filters
         "-thread_queue_size",
         "512",
@@ -694,25 +700,59 @@ async def _monitor_progress(  # pragma: no cover
     timeout_seconds: int,
     started_at: float | None = None,
 ) -> None:
-    """Read stderr line by line, update progress_pct at most once per second.
+    """Read ffmpeg ``-progress pipe:1`` output from stdout for reliable progress.
+
+    ffmpeg writes ``\\r``-delimited lines to stderr (unreadable from a pipe), but
+    ``-progress pipe:1`` emits clean ``\\n``-delimited key=value pairs to stdout.
 
     Also detects stalls (no progress for _STALL_TIMEOUT_SECONDS) and kills ffmpeg.
     """
     last_update = 0.0
     last_pct = -1
+    current_frame = 0
+    current_speed = ""
     last_progress_change = time.monotonic()
     stalled = False
 
-    async def _read_stderr() -> None:
-        nonlocal last_update, last_pct, last_progress_change, stalled
+    async def _drain_stderr() -> None:
+        """Consume stderr in chunks so the pipe buffer doesn't block ffmpeg.
+
+        Cannot use ``async for line in proc.stderr`` because ffmpeg writes
+        \\r-delimited progress (no \\n) which creates a single "line" that
+        exceeds asyncio's 64 KB readline buffer on long renders.
+        """
         if proc.stderr is None:
             return
-        async for line in proc.stderr:
-            decoded = line.decode(errors="replace")
-            m = _FRAME_RE.search(decoded)
-            if m and total_frames > 0:
-                current = int(m.group(1))
-                pct = min(100, int(current / total_frames * 100))
+        while True:
+            chunk = await proc.stderr.read(65536)
+            if not chunk:
+                break
+
+    async def _read_progress() -> None:
+        nonlocal last_update, last_pct, current_frame, current_speed
+        nonlocal last_progress_change, stalled
+        if proc.stdout is None:
+            return
+        async for line in proc.stdout:
+            decoded = line.decode(errors="replace").strip()
+            if not decoded:
+                continue
+
+            # Parse key=value pairs from -progress output
+            if "=" not in decoded:
+                continue
+            key, _, value = decoded.partition("=")
+
+            if key == "frame":
+                with contextlib.suppress(ValueError):
+                    current_frame = int(value)
+            elif key == "speed":
+                current_speed = value.strip()
+            elif key == "progress":
+                # "progress=continue" or "progress=end" marks end of a block
+                if total_frames <= 0:
+                    continue
+                pct = min(99, int(current_frame / total_frames * 100))
                 now = time.monotonic()
 
                 # Stall detection
@@ -746,12 +786,11 @@ async def _monitor_progress(  # pragma: no cover
                         proc.kill()
                     return
 
-                if now - last_update >= 5.0:  # throttle DB writes to every 5s
+                if now - last_update >= 2.0:  # broadcast every 2s for responsive UI
                     last_update = now
-                    # Compute ETA from elapsed time and progress
+                    elapsed = (now - started_at) if started_at else 0
                     eta_seconds: int | None = None
                     if started_at is not None and pct > 0:
-                        elapsed = now - started_at
                         eta_seconds = int(elapsed / (pct / 100) * (1 - pct / 100))
                     with contextlib.suppress(Exception), get_connection() as conn:
                         conn.execute(
@@ -767,13 +806,17 @@ async def _monitor_progress(  # pragma: no cover
                             {
                                 "render_id": render_id,
                                 "progress_pct": pct,
+                                "current_frame": current_frame,
+                                "total_frames": total_frames,
+                                "speed": current_speed,
                                 "eta_seconds": eta_seconds,
+                                "elapsed_seconds": int(elapsed),
                             },
                         )
 
     try:
         await asyncio.wait_for(
-            asyncio.gather(_read_stderr(), proc.wait()),
+            asyncio.gather(_read_progress(), _drain_stderr(), proc.wait()),
             timeout=timeout_seconds,
         )
     except TimeoutError:

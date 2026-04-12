@@ -781,16 +781,16 @@ class TestWebSocket:
     """WebSocket connectivity."""
 
     def test_websocket_connect(self, e2e_server: str) -> None:
-        """Connect to WS endpoint and receive a ping within timeout."""
+        """Connect to WS endpoint and receive a valid JSON event."""
         import websocket
 
         ws_url = e2e_server.replace("http://", "ws://") + "/api/ws"
         ws = websocket.create_connection(ws_url, timeout=35)
         try:
-            # The server sends a ping every 30s — wait for it
+            # Server may send nvr_status, capture_batch, or ping — any valid event is fine
             msg = ws.recv()
             data = json.loads(msg)
-            assert data["event"] == "ping"
+            assert "event" in data
         finally:
             ws.close()
 

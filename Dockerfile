@@ -40,7 +40,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # System deps: ffmpeg for rendering, tini for PID1 signal handling + zombie reaping, curl for healthcheck
-RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
+# apt-get upgrade pulls in security patches for base image packages (Trivy scan)
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends --no-install-suggests \
         ffmpeg \
         tini \
         curl \

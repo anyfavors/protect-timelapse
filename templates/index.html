@@ -374,12 +374,28 @@
 
             <!-- Not done: placeholder with status icon -->
             <template x-if="r.status !== 'done'">
-              <div class="w-full h-full flex flex-col items-center justify-center gap-2">
+              <div class="w-full h-full flex flex-col items-center justify-center gap-2 px-3">
+                <!-- Rendering: rich progress display -->
                 <template x-if="r.status === 'rendering'">
-                  <svg class="w-10 h-10 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-                  </svg>
+                  <div class="w-full flex flex-col items-center gap-1.5">
+                    <svg class="w-8 h-8 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                      <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                    </svg>
+                    <!-- Percentage -->
+                    <span class="text-lg font-bold text-blue-300 tabular-nums"
+                          x-text="(r.progress_pct || 0) + '%'"></span>
+                    <!-- Frame count -->
+                    <span class="text-xs text-slate-400 tabular-nums"
+                          x-show="r._current_frame"
+                          x-text="(r._current_frame || 0).toLocaleString() + ' / ' + (r._total_frames || 0).toLocaleString() + ' frames'"></span>
+                    <!-- Speed + ETA row -->
+                    <div class="flex items-center gap-2 text-xs text-slate-500">
+                      <span x-show="r._speed && r._speed !== 'N/A'" x-text="r._speed"></span>
+                      <span x-show="r._eta_seconds > 0"
+                            x-text="'~' + formatEta(r._eta_seconds) + ' left'"></span>
+                    </div>
+                  </div>
                 </template>
                 <template x-if="r.status === 'pending'">
                   <svg class="w-10 h-10 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -398,8 +414,8 @@
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10 9v6m4-6v6"/>
                   </svg>
                 </template>
-                <span class="text-xs capitalize"
-                      :class="{'text-blue-300': r.status==='rendering','text-slate-500': r.status==='pending','text-red-400': r.status==='error','text-yellow-400': r.status==='paused'}"
+                <span class="text-xs capitalize" x-show="r.status !== 'rendering'"
+                      :class="{'text-slate-500': r.status==='pending','text-red-400': r.status==='error','text-yellow-400': r.status==='paused'}"
                       x-text="r.status"></span>
               </div>
             </template>
@@ -1168,15 +1184,23 @@
             </div>
             <template x-if="r.status === 'rendering'">
               <div class="mt-2">
-                <div class="w-full bg-slate-700 rounded-full h-1.5">
-                  <div class="bg-blue-500 h-1.5 rounded-full transition-all" :style="`width:${r.progress_pct}%`"></div>
+                <div class="w-full bg-slate-700 rounded-full h-2">
+                  <div class="bg-blue-500 h-2 rounded-full transition-all duration-500"
+                       :style="`width:${r.progress_pct || 0}%`"></div>
                 </div>
-                <div class="flex justify-between text-xs text-slate-400 mt-1">
-                  <span x-text="r.progress_pct + '%'"></span>
-                  <!-- ETA estimate based on elapsed time and progress (UI2) -->
-                  <span x-text="r.progress_pct > 5 && r.started_at
-                    ? (Math.round((Date.now() - new Date(r.started_at).getTime()) / r.progress_pct * (100 - r.progress_pct) / 1000) + 's remaining')
-                    : ''"></span>
+                <div class="flex justify-between items-center text-xs text-slate-400 mt-1.5">
+                  <div class="flex items-center gap-2">
+                    <span class="font-medium text-blue-300 tabular-nums" x-text="(r.progress_pct || 0) + '%'"></span>
+                    <span class="text-slate-500 tabular-nums" x-show="r._current_frame"
+                          x-text="(r._current_frame || 0).toLocaleString() + '/' + (r._total_frames || 0).toLocaleString() + ' frames'"></span>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <span class="tabular-nums" x-show="r._speed && r._speed !== 'N/A'" x-text="r._speed"></span>
+                    <span class="tabular-nums" x-show="r._eta_seconds > 0"
+                          x-text="'~' + formatEta(r._eta_seconds) + ' left'"></span>
+                    <span x-show="!r._eta_seconds && r._elapsed_seconds > 0"
+                          x-text="formatEta(r._elapsed_seconds) + ' elapsed'"></span>
+                  </div>
                 </div>
               </div>
             </template>
