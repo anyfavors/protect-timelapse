@@ -185,7 +185,15 @@ async def snapshot_worker(project_id: int) -> None:
         elif _disk_last_result is not None:
             free_gb, threshold_gb = _disk_last_result
         else:
-            free_gb, threshold_gb = float("inf"), 0.0  # no reading yet — allow capture
+            # First call ever — force a synchronous check rather than blindly allowing capture (B5)
+            try:
+                usage = shutil.disk_usage(settings.frames_path)
+                free_gb = usage.free / 1024**3
+                threshold_gb = float(_get_disk_threshold())
+                _disk_last_checked = time.monotonic()
+                _disk_last_result = (free_gb, threshold_gb)
+            except OSError:
+                free_gb, threshold_gb = float("inf"), 0.0
         if free_gb < threshold_gb:
             await _handle_disk_breach(free_gb, threshold_gb)
             return
@@ -239,7 +247,7 @@ async def snapshot_worker(project_id: int) -> None:
 
     # --- 5. NVR snapshot ----------------------------------------------------
     try:
-        client = await protect_manager.get_client()
+        client = await asyncio.wait_for(protect_manager.get_client(), timeout=30)
         cam = client.bootstrap.cameras.get(project["camera_id"])
         if cam is None:
             log.warning("Project %d: camera %s not found on NVR", project_id, project["camera_id"])
@@ -253,9 +261,8 @@ async def snapshot_worker(project_id: int) -> None:
             kwargs["height"] = project["height"]
 
         camera_id = project["camera_id"]
-        if camera_id not in _camera_semaphores:
-            _camera_semaphores[camera_id] = asyncio.Semaphore(2)
-        async with _camera_semaphores[camera_id]:
+        sem = _camera_semaphores.setdefault(camera_id, asyncio.Semaphore(2))
+        async with sem:
             raw = await cam.get_snapshot(**kwargs)
         if raw is None:
             raise RuntimeError("NVR returned empty snapshot")
@@ -368,7 +375,7 @@ async def snapshot_worker(project_id: int) -> None:
                 diff = (
                     sum(
                         abs(a - b)
-                        for a, b in zip(last_img.getdata(), curr_gray.getdata(), strict=False)
+                        for a, b in zip(last_img.tobytes(), curr_gray.tobytes(), strict=False)
                     )
                     / (64 * 64 * 255)
                     * 100
@@ -559,7 +566,7 @@ async def _nvr_bootstrap_refresh_job() -> None:
         known_ids = set(client.bootstrap.cameras.keys())
         for stale_id in list(_camera_semaphores.keys()):
             if stale_id not in known_ids:
-                del _camera_semaphores[stale_id]
+                _camera_semaphores.pop(stale_id, None)
                 log.debug("Pruned semaphore for removed camera %s", stale_id)
     except Exception:
         pass  # Non-fatal — semaphores will be pruned on next successful refresh
@@ -883,9 +890,13 @@ async def _run_historical_extraction_inner(project_id: int) -> None:  # pragma: 
         return
 
     # ── Resume support: skip timestamps that already have frames ──────
+    # Use bounded query to avoid full-table scan on large projects (B21)
+    range_start_iso = all_timestamps[0].isoformat()
+    range_end_iso = all_timestamps[-1].isoformat()
     with get_connection() as conn:
         existing_rows = conn.execute(
-            "SELECT captured_at FROM frames WHERE project_id = ?", (project_id,)
+            "SELECT captured_at FROM frames WHERE project_id = ? AND captured_at >= ? AND captured_at <= ?",
+            (project_id, range_start_iso, range_end_iso),
         ).fetchall()
     existing_ts = {row["captured_at"] for row in existing_rows}
 

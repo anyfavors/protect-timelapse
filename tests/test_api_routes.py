@@ -456,10 +456,14 @@ async def test_ws_manager_broadcast_sends_message() -> None:
 
     mgr = ConnectionManager()
 
+    class _FakeClient:
+        host = "127.0.0.1"
+
     class _FakeWS:
         def __init__(self):
             self.sent = []
             self.accepted = False
+            self.client = _FakeClient()
 
         async def accept(self):
             self.accepted = True
@@ -486,9 +490,13 @@ async def test_ws_manager_capture_batch_coalescing() -> None:
 
     mgr = ConnectionManager()
 
+    class _FakeClient:
+        host = "127.0.0.1"
+
     class _FakeWS:
         def __init__(self):
             self.sent = []
+            self.client = _FakeClient()
 
         async def accept(self): ...
 
@@ -519,7 +527,12 @@ async def test_ws_manager_dead_client_removed() -> None:
 
     mgr = ConnectionManager()
 
+    class _FakeClient:
+        host = "127.0.0.1"
+
     class _DeadWS:
+        client = _FakeClient()
+
         async def accept(self): ...
 
         async def send_text(self, msg: str) -> None:

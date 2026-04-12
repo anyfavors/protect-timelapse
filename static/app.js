@@ -29,6 +29,7 @@ document.addEventListener('alpine:init', () => {
     ws: null,
     wsRetries: 0,
     wsMaxRetries: 3,
+    wsStatus: 'connecting',  // 'connected' | 'connecting' | 'reconnecting' | 'polling'
     diskSpace: { free_gb: null, total_gb: null },
     systemStatus: null,
     _systemStatusTimer: null,
@@ -54,6 +55,7 @@ document.addEventListener('alpine:init', () => {
 
     // Detail view tabs
     detailTab: 'overview',    // overview | renders | bookmarks | dark_frames
+    detailTabLoading: false,
     scrubberIndex: 0,
     scrubberFrameUrl: null,
     scrubberTimestamp: null,
@@ -217,11 +219,18 @@ document.addEventListener('alpine:init', () => {
       if (data) this.templates = data;
     },
 
+    notificationsLoading: false,
+
     async loadNotifications() {
-      const data = await this.api('/api/notifications?limit=50');
-      if (data) {
-        this.notifications = data;
-        this.unreadCount = data.filter(n => !n.is_read).length;
+      this.notificationsLoading = true;
+      try {
+        const data = await this.api('/api/notifications?limit=50');
+        if (data) {
+          this.notifications = data;
+          this.unreadCount = data.filter(n => !n.is_read).length;
+        }
+      } finally {
+        this.notificationsLoading = false;
       }
     },
 
@@ -420,19 +429,24 @@ document.addEventListener('alpine:init', () => {
       this.detailTab = tab;
       const id = this.activeProject?.id;
       if (!id) return;
-      if (tab === 'bookmarks') {
-        const data = await this.api(`/api/projects/${id}/frames/bookmarks`);
-        if (data) this.activeProjectBookmarks = data;
-      } else if (tab === 'quality') {
-        const [dark, blurry] = await Promise.all([
-          this.api(`/api/projects/${id}/frames/dark`),
-          this.api(`/api/projects/${id}/frames/blurry`),
-        ]);
-        if (dark) this.activeProjectDarkFrames = dark;
-        if (blurry) this.activeProjectBlurryFrames = blurry;
-      } else if (tab === 'renders') {
-        const data = await this.api(`/api/projects/${id}/renders`);
-        if (data) this.activeProjectRenders = data;
+      this.detailTabLoading = true;
+      try {
+        if (tab === 'bookmarks') {
+          const data = await this.api(`/api/projects/${id}/frames/bookmarks`);
+          if (data) this.activeProjectBookmarks = data;
+        } else if (tab === 'quality') {
+          const [dark, blurry] = await Promise.all([
+            this.api(`/api/projects/${id}/frames/dark`),
+            this.api(`/api/projects/${id}/frames/blurry`),
+          ]);
+          if (dark) this.activeProjectDarkFrames = dark;
+          if (blurry) this.activeProjectBlurryFrames = blurry;
+        } else if (tab === 'renders') {
+          const data = await this.api(`/api/projects/${id}/renders`);
+          if (data) this.activeProjectRenders = data;
+        }
+      } finally {
+        this.detailTabLoading = false;
       }
     },
 
@@ -451,8 +465,14 @@ document.addEventListener('alpine:init', () => {
       this.updateScrubberFrame();
     },
 
+    _lastScrubberHoverTime: 0,
+
     onScrubberHover(e) {
       if (!this.activeProjectFrames.length) return;
+      // Throttle to once per 50ms to avoid 60+ thumbnail requests/sec (F12)
+      const now = Date.now();
+      if (now - this._lastScrubberHoverTime < 50) return;
+      this._lastScrubberHoverTime = now;
       const rect = e.currentTarget.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const idx = Math.round(ratio * (this.activeProjectFrames.length - 1));
@@ -467,8 +487,10 @@ document.addEventListener('alpine:init', () => {
       if (!frame) return;
       if (!this.rangeStart) {
         this.rangeStart = frame.captured_at;
+        this.toast('Range start set — Shift+Click again to set end');
       } else {
         this.rangeEnd = frame.captured_at;
+        this.toast('Range end set — ready to render selection');
       }
     },
 
@@ -765,6 +787,10 @@ document.addEventListener('alpine:init', () => {
     async saveRenderPreset() {
       const name = prompt('Preset name:');
       if (!name) return;
+      if (this.renderPresets.some(p => p.name.toLowerCase() === name.trim().toLowerCase())) {
+        this.toast('A preset with that name already exists', 'warning');
+        return;
+      }
       const payload = {
         name,
         framerate: this.renderFramerate,
@@ -863,7 +889,7 @@ document.addEventListener('alpine:init', () => {
           clearInterval(this.gifPollTimer);
           this.gifPollTimer = null;
           this.gifJobStatus = 'error';
-          this.toast('GIF export timed out', 'error');
+          this.toast('GIF export timed out — check system logs for details', 'warning');
           return;
         }
         const data = await this.api(`/api/projects/${id}/gif/status`);
@@ -986,7 +1012,7 @@ document.addEventListener('alpine:init', () => {
       document.addEventListener('keydown', onEsc);
       document.getElementById('video-close-btn').onclick = cleanup;
       document.getElementById('video-close-btn2').onclick = cleanup;
-      document.getElementById('overlay-video').play();
+      document.getElementById('overlay-video').play().catch(() => {});
       setTimeout(() => {
         const hint = document.getElementById('video-esc-hint');
         if (hint) hint.style.opacity = '0';
@@ -1059,7 +1085,7 @@ document.addEventListener('alpine:init', () => {
       const sync = (src, dst) => src.addEventListener('seeked', () => { dst.currentTime = src.currentTime; });
       const va = document.getElementById('cmp-a'), vb = document.getElementById('cmp-b');
       sync(va, vb); sync(vb, va);
-      va.play(); vb.play();
+      va.play().catch(() => {}); vb.play().catch(() => {});
     },
 
     // ── Timeline bar chart helpers ────────────────────────────────────────
@@ -1160,6 +1186,33 @@ document.addEventListener('alpine:init', () => {
     _confirmNo() {
       this.showConfirmModal = false;
       if (this._confirmResolve) { this._confirmResolve(false); this._confirmResolve = null; }
+    },
+
+    // ── Focus trap for modal dialogs (F15) ─────────────────────────────────
+    _trapFocusHandler: null,
+
+    trapFocus(el) {
+      const focusables = el.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      first.focus();
+      this._trapFocusHandler = (e) => {
+        if (e.key !== 'Tab') return;
+        if (e.shiftKey) {
+          if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+        } else {
+          if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+      };
+      el.addEventListener('keydown', this._trapFocusHandler);
+    },
+
+    releaseFocus(el) {
+      if (this._trapFocusHandler) {
+        el.removeEventListener('keydown', this._trapFocusHandler);
+        this._trapFocusHandler = null;
+      }
     },
 
     // ── Undo delete (UX1) ─────────────────────────────────────────────────
@@ -1369,6 +1422,7 @@ document.addEventListener('alpine:init', () => {
         } else {
           const data = await this.api(`/api/projects/${this.form.id}`, 'PUT', this.form);
           if (data) {
+            this._formOriginal = { ...this.form };  // reset dirty state (F17)
             await this.loadProjects();
             this.toast('Project updated');
             this.view = 'dashboard';
@@ -1413,31 +1467,39 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    settingsSaving: false,
+
     async saveSettings() {
-      // Always-sent fields (non-nullable in DB)
-      const REQUIRED_FIELDS = [
-        'webhook_url','disk_warning_threshold_gb','timestamp_burn_in','default_framerate',
-        'render_poll_interval_seconds','dark_mode','maintenance_hour','maintenance_minute',
-        'nvr_reconnect_backoff_seconds',
-      ];
-      // Nullable override fields — only include if the user has set a value
-      // Omitting them entirely means the backend leaves the DB untouched (exclude_unset=True)
-      const NULLABLE_OVERRIDE_FIELDS = ['protect_host','protect_port','protect_verify_ssl','latitude','longitude','tz'];
-      const payload = Object.fromEntries(
-        REQUIRED_FIELDS.map(k => [k, this.settingsData[k] !== undefined ? this.settingsData[k] : null])
-      );
-      for (const k of NULLABLE_OVERRIDE_FIELDS) {
-        const v = this.settingsData[k];
-        if (v !== null && v !== undefined && v !== '') payload[k] = v;
-      }
-      // muted_project_ids — API now returns it as a real array
-      const rawMuted = this.settingsData['muted_project_ids'];
-      payload['muted_project_ids'] = Array.isArray(rawMuted) ? rawMuted : [];
-      const data = await this.api('/api/settings', 'PUT', payload);
-      if (data) {
-        this.settingsData = data;
-        this.loadTheme(data.dark_mode);
-        this.toast('Settings saved');
+      if (this.settingsSaving) return;
+      this.settingsSaving = true;
+      try {
+        // Always-sent fields (non-nullable in DB)
+        const REQUIRED_FIELDS = [
+          'webhook_url','disk_warning_threshold_gb','timestamp_burn_in','default_framerate',
+          'render_poll_interval_seconds','dark_mode','maintenance_hour','maintenance_minute',
+          'nvr_reconnect_backoff_seconds',
+        ];
+        // Nullable override fields — only include if the user has set a value
+        // Omitting them entirely means the backend leaves the DB untouched (exclude_unset=True)
+        const NULLABLE_OVERRIDE_FIELDS = ['protect_host','protect_port','protect_verify_ssl','latitude','longitude','tz'];
+        const payload = Object.fromEntries(
+          REQUIRED_FIELDS.map(k => [k, this.settingsData[k] !== undefined ? this.settingsData[k] : null])
+        );
+        for (const k of NULLABLE_OVERRIDE_FIELDS) {
+          const v = this.settingsData[k];
+          if (v !== null && v !== undefined && v !== '') payload[k] = v;
+        }
+        // muted_project_ids — API now returns it as a real array
+        const rawMuted = this.settingsData['muted_project_ids'];
+        payload['muted_project_ids'] = Array.isArray(rawMuted) ? rawMuted : [];
+        const data = await this.api('/api/settings', 'PUT', payload);
+        if (data) {
+          this.settingsData = data;
+          this.loadTheme(data.dark_mode);
+          this.toast('Settings saved');
+        }
+      } finally {
+        this.settingsSaving = false;
       }
     },
 
@@ -1524,6 +1586,7 @@ document.addEventListener('alpine:init', () => {
       this.ws.onopen = () => {
         this._wsConnecting = false;
         this.wsRetries = 0;
+        this.wsStatus = 'connected';
         console.log('[WS] connected');
       };
 
@@ -1536,12 +1599,26 @@ document.addEventListener('alpine:init', () => {
       this.ws.onclose = () => {
         this._wsConnecting = false;
         if (this.wsRetries < this.wsMaxRetries) {
+          this.wsStatus = 'reconnecting';
           const delay = Math.min(1000 * Math.pow(2, this.wsRetries), 30000);
           this.wsRetries++;
           setTimeout(() => this.connectWebSocket(), delay);
         } else {
+          this.wsStatus = 'polling';
           console.warn('[WS] fallback to polling');
           this.startPolling();
+          // Periodically re-attempt WS even after max retries (F16)
+          if (!this._wsRetryInterval) {
+            this._wsRetryInterval = setInterval(() => {
+              if (this.wsStatus === 'polling' && !this._wsConnecting) {
+                this.wsRetries = 0;
+                this.connectWebSocket();
+              } else if (this.wsStatus === 'connected' && this._wsRetryInterval) {
+                clearInterval(this._wsRetryInterval);
+                this._wsRetryInterval = null;
+              }
+            }, 60000);
+          }
         }
       };
     },
@@ -1731,7 +1808,9 @@ document.addEventListener('alpine:init', () => {
       }
       // Click-to-copy error text (UX6)
       if (t.type === 'error' && navigator.clipboard) {
-        navigator.clipboard.writeText(t.message).catch(() => {});
+        navigator.clipboard.writeText(t.message)
+          .then(() => this.toast('Copied to clipboard'))
+          .catch(() => this.toast('Could not copy to clipboard', 'warning'));
         this.dismissToast(t.id);
         return;
       }

@@ -6,7 +6,7 @@ Covers: batch frame delete, CSV export, analyze-interval, render cancel,
 
 import io
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -488,7 +488,11 @@ async def test_backup_database(
     monkeypatch.setattr(config_mod, "_settings", None)
 
     await maint._backup_database()
-    backup = Path(str(tmp_db) + ".backup")
+    # Backup files now include a date suffix: .backup.YYYYMMDD
+    from datetime import UTC, datetime
+
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    backup = Path(str(tmp_db) + f".backup.{today}")
     assert backup.exists()
 
 
@@ -727,17 +731,15 @@ def test_webhook_url_validation() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_thumbnail_zero_dimensions() -> None:
+def test_thumbnail_zero_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.thumbnails as thumb_mod
     from app.thumbnails import generate_thumbnail
 
-    # Patch Image.open to return a 0x0 image
     fake_img = MagicMock()
     fake_img.size = (0, 0)
+    monkeypatch.setattr(thumb_mod.Image, "open", lambda *a, **kw: fake_img)
 
-    with (
-        patch("app.thumbnails.Image.open", return_value=fake_img),
-        pytest.raises(ValueError, match="Invalid image dimensions"),
-    ):
+    with pytest.raises(ValueError, match="Invalid image dimensions"):
         generate_thumbnail(b"fake")
 
 

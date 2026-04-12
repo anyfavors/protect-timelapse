@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     ffmpeg_threads: int = 4
     ffmpeg_timeout_seconds: int = 7200  # 2 hours
 
+    # Database connection pool size
+    db_pool_size: int = 4
+
+    # Optional API key — if set, all endpoints require X-Api-Key header (S1)
+    api_key: str = ""
+
 
 _settings: Settings | None = None
 

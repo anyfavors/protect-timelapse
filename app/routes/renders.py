@@ -173,7 +173,15 @@ def download_render(render_id: int) -> FileResponse:
     render = _get_render_or_404(render_id)
     if render["status"] != "done" or not render["output_path"]:
         raise HTTPException(status_code=404, detail="Render output not available")
-    if not os.path.exists(render["output_path"]):
+    # Path traversal guard: ensure resolved path is inside renders directory (S10/B12)
+    from pathlib import Path
+
+    from app.config import get_settings as _cfg
+
+    resolved = str(Path(render["output_path"]).resolve())
+    if not resolved.startswith(os.path.realpath(_cfg().renders_path)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.exists(resolved):
         raise HTTPException(status_code=404, detail="Render file not found on disk")
     filename = f"render_{render_id}.mp4"
     return FileResponse(

@@ -11,8 +11,8 @@ import shutil
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
 
 from app.capture import (
     add_project_job,
@@ -24,6 +24,7 @@ from app.capture import (
 )
 from app.config import get_settings
 from app.database import get_connection, row_to_dict
+from app.limiter import limiter
 
 router = APIRouter(prefix="/api", tags=["projects"])
 log = logging.getLogger("app.routes.projects")
@@ -70,6 +71,16 @@ class ProjectCreate(BaseModel):
     solar_noon_window_minutes: int = Field(default=30, ge=5, le=120)
     # Template linkage
     template_id: int | None = None
+
+    @field_validator("schedule_start_time", "schedule_end_time")
+    @classmethod
+    def validate_time_format(cls, v: str | None) -> str | None:
+        if v is not None:
+            try:
+                datetime.strptime(v, "%H:%M")
+            except ValueError as exc:
+                raise ValueError("Time must be in HH:MM format") from exc
+        return v
 
 
 class ProjectUpdate(BaseModel):
@@ -136,7 +147,8 @@ def list_projects() -> list[dict]:
 
 
 @router.post("/projects", status_code=201)
-async def create_project(payload: ProjectCreate) -> dict:
+@limiter.limit("10/minute")
+async def create_project(request: Request, payload: ProjectCreate) -> dict:
     settings = get_settings()
 
     with get_connection() as conn:
@@ -548,8 +560,10 @@ def unpin_project(project_id: int) -> dict:
 
 
 @router.delete("/projects/{project_id}", status_code=204)
-async def delete_project(project_id: int) -> None:
-    _get_project_or_404(project_id)
+@limiter.limit("10/minute")
+async def delete_project(request: Request, project_id: int) -> None:
+    project = _get_project_or_404(project_id)
+    log.info("AUDIT: project deleted id=%d name=%r", project_id, project.get("name"))
     settings = get_settings()
     loop = asyncio.get_running_loop()
 

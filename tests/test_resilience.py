@@ -6,7 +6,7 @@ render recovery, reconciliation, system status endpoint.
 import io
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -586,12 +586,13 @@ async def test_notify_fires_webhook(tmp_db: Path, monkeypatch: pytest.MonkeyPatc
     mock_client.__aexit__ = AsyncMock(return_value=False)
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    with patch("app.notifications.httpx.AsyncClient", return_value=mock_client):
-        await notif_mod.notify(
-            event="webhook_test",
-            level="info",
-            message="Webhook test",
-        )
+    monkeypatch.setattr(notif_mod.httpx, "AsyncClient", lambda **kw: mock_client)
+
+    await notif_mod.notify(
+        event="webhook_test",
+        level="info",
+        message="Webhook test",
+    )
 
     mock_client.post.assert_called_once()
 
@@ -674,14 +675,15 @@ async def test_notify_webhook_with_details_and_project_id(
     mock_client.__aexit__ = AsyncMock(return_value=False)
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    with patch("app.notifications.httpx.AsyncClient", return_value=mock_client):
-        await notif_mod.notify(
-            event="test_details",
-            level="info",
-            message="Test with details",
-            project_id=pid,
-            details={"key": "value"},
-        )
+    monkeypatch.setattr(notif_mod.httpx, "AsyncClient", lambda **kw: mock_client)
+
+    await notif_mod.notify(
+        event="test_details",
+        level="info",
+        message="Test with details",
+        project_id=pid,
+        details={"key": "value"},
+    )
 
     payload = mock_client.post.call_args[1]["json"]
     assert payload["project_id"] == pid
@@ -713,12 +715,13 @@ async def test_notify_webhook_logs_warning_on_4xx(
     mock_client.__aexit__ = AsyncMock(return_value=False)
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    with patch("app.notifications.httpx.AsyncClient", return_value=mock_client):
-        await notif_mod.notify(
-            event="test_4xx",
-            level="info",
-            message="Should log warning",
-        )
+    monkeypatch.setattr(notif_mod.httpx, "AsyncClient", lambda **kw: mock_client)
+
+    await notif_mod.notify(
+        event="test_4xx",
+        level="info",
+        message="Should log warning",
+    )
 
     # No exception raised — just logged
     mock_client.post.assert_called_once()

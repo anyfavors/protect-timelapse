@@ -5,9 +5,11 @@ WORKDIR /src
 
 # Copy lockfile first so npm layer is cached independently of source changes (D2/D3).
 # Run: `npm install` locally and commit package-lock.json to enable `npm ci`.
+# Prefer npm ci for reproducible builds; fall back to npm install if no lockfile (H1)
 COPY package.json package-lock.json* ./
 RUN --mount=type=cache,target=/root/.npm \
-    npm install --prefer-offline --no-fund --no-audit
+    if [ -f package-lock.json ]; then npm ci --prefer-offline --no-fund --no-audit; \
+    else npm install --prefer-offline --no-fund --no-audit; fi
 
 COPY static/app.css.src ./app.css.src
 COPY templates/index.html ./templates/index.html
@@ -64,6 +66,9 @@ RUN useradd -m -u 1000 appuser && \
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Switch to non-root user (H6) — entrypoint runs as appuser directly
+USER appuser
 
 EXPOSE 8080
 

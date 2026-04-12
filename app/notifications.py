@@ -103,6 +103,8 @@ async def notify(
             resp = await client.post(webhook_url, json=payload)
             if resp.status_code >= 400:
                 log.warning("Webhook returned %d for event %s", resp.status_code, event)
+    except (httpx.TimeoutException, TimeoutError):
+        log.warning("Webhook timed out for event %s", event)
     except Exception as exc:
         log.warning("Webhook delivery failed for event %s: %s", event, exc)
 

@@ -3,7 +3,7 @@ Project template CRUD routes.
 Templates store reusable project configurations.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.database import get_connection, row_to_dict
@@ -108,7 +108,7 @@ def delete_template(template_id: int) -> None:
 
 
 @router.post("/templates/{template_id}/apply", status_code=201)
-async def apply_template(template_id: int, payload: TemplateApply) -> dict:
+async def apply_template(request: Request, template_id: int, payload: TemplateApply) -> dict:
     """Create a new project pre-filled from the template. Camera and name are required."""
     tmpl = _get_template_or_404(template_id)
 
@@ -135,4 +135,4 @@ async def apply_template(template_id: int, payload: TemplateApply) -> dict:
         solar_noon_window_minutes=tmpl.get("solar_noon_window_minutes") or 30,
         template_id=template_id,
     )
-    return await create_project(project_payload)
+    return await create_project(request, project_payload)

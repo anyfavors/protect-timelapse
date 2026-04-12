@@ -48,11 +48,34 @@ _CSP = (
 )
 
 
+# Paths exempt from API key authentication (health probes, static assets, SPA shell)
+_AUTH_EXEMPT = frozenset({"/", "/api/health", "/api/health/live", "/api/health/ready"})
+_AUTH_EXEMPT_PREFIXES = ("/static/",)
+
+
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[override]
+        # ── Optional API key gate (S1) ────────────────────────────────
+        api_key = get_settings().api_key
+        if api_key:
+            path = request.url.path
+            is_exempt = path in _AUTH_EXEMPT or path.startswith(_AUTH_EXEMPT_PREFIXES)
+            # WebSocket upgrades carry the key as a query param
+            if not is_exempt:
+                header_key = request.headers.get("x-api-key", "")
+                query_key = request.query_params.get("api_key", "")
+                if header_key != api_key and query_key != api_key:
+                    return StarletteResponse(
+                        content='{"detail":"Invalid or missing API key"}',
+                        status_code=401,
+                        media_type="application/json",
+                    )
         response: StarletteResponse = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         response.headers["Content-Security-Policy"] = _CSP
         # Add Vary for all compressible responses so caches key correctly (CS2)
         ct = response.headers.get("Content-Type", "")
@@ -150,10 +173,22 @@ def create_app() -> FastAPI:
     application.include_router(metrics.router)
     application.include_router(ws_router)
 
-    # Serve compiled CSS + app.js
+    # Serve compiled CSS + app.js with aggressive caching (assets are cache-busted via ?v=hash)
     static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
     if os.path.isdir(static_dir):
-        application.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+        class _CachedStaticFiles(StaticFiles):
+            async def __call__(self, scope, receive, send):  # type: ignore[override]
+                async def _send_with_cache(message):  # type: ignore[no-untyped-def]
+                    if message.get("type") == "http.response.start":
+                        headers = list(message.get("headers", []))
+                        headers.append((b"cache-control", b"public, max-age=31536000, immutable"))
+                        message["headers"] = headers
+                    await send(message)
+
+                await super().__call__(scope, receive, _send_with_cache)
+
+        application.mount("/static", _CachedStaticFiles(directory=static_dir), name="static")
 
     # Serve the SPA shell with cache-busting query strings on static assets
     templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")

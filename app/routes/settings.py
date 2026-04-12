@@ -2,15 +2,19 @@
 
 import contextlib
 import json
+import logging
 import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.config import get_settings as _get_app_settings
 from app.database import get_connection
+from app.limiter import limiter
+
+log = logging.getLogger("app.routes.settings")
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -71,11 +75,13 @@ def get_settings_route() -> dict:
 
 
 @router.put("/settings")
-async def update_settings(payload: SettingsUpdate) -> dict:
+@limiter.limit("10/minute")
+async def update_settings(request: Request, payload: SettingsUpdate) -> dict:
     # Use exclude_unset=True so fields absent from the request body are not touched.
     # This prevents partial updates (e.g. toggleDark sending only dark_mode) from
     # inadvertently NULLing out other fields like protect_host.
     sent = payload.model_dump(exclude_unset=True)
+    log.info("AUDIT: settings updated fields=%s", list(sent.keys()))
 
     # Build SET clause — include explicit None values so fields can be cleared
     # (NULL = "use env default" for override fields).
@@ -152,6 +158,7 @@ async def upload_watermark(file: UploadFile) -> dict:
     with get_connection() as conn:
         conn.execute("UPDATE settings SET watermark_path = ? WHERE id = 1", (watermark_path,))
         conn.commit()
+    log.info("AUDIT: watermark uploaded size=%d", len(content))
     return {"watermark_path": watermark_path}
 
 
@@ -174,6 +181,7 @@ def delete_watermark() -> None:
     with get_connection() as conn:
         conn.execute("UPDATE settings SET watermark_path = NULL WHERE id = 1")
         conn.commit()
+    log.info("AUDIT: watermark deleted")
 
 
 @router.get("/settings/nvr-test")
@@ -189,4 +197,7 @@ async def test_nvr_connection() -> dict:
         camera_count = len(client.bootstrap.cameras)
         return {"ok": True, "latency_ms": latency_ms, "camera_count": camera_count, "error": None}
     except Exception as exc:
-        return {"ok": False, "latency_ms": None, "camera_count": 0, "error": str(exc)[:300]}
+        import re
+
+        sanitized = re.sub(r"(/data|/tmp|/app|/home)\S+", "<path>", str(exc)[:300])
+        return {"ok": False, "latency_ms": None, "camera_count": 0, "error": sanitized}

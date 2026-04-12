@@ -479,24 +479,74 @@ async def _recover_stalled_renders() -> None:
         log.warning("Reset stalled render id=%d to pending", render["id"])
 
 
+_BACKUP_KEEP = 7  # number of daily backups to retain
+
+
 async def _backup_database() -> None:
-    """Create a daily SQLite backup alongside the main DB (B5)."""
+    """Create a daily SQLite backup alongside the main DB and rotate old copies (B5/H9)."""
     from app.config import get_settings
 
     settings = get_settings()
     src = settings.database_path
     if not os.path.exists(src):
         return
-    backup_path = src + ".backup"
+
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    backup_path = f"{src}.backup.{today}"
     try:
         _shutil.copy2(src, backup_path)
         log.info("Database backed up to %s", backup_path)
     except OSError as exc:
         log.error("Database backup failed: %s", exc)
+        return
+
+    # Validate backup integrity (H13)
+    try:
+        import sqlite3
+
+        _bak_conn = sqlite3.connect(backup_path)
+        try:
+            result = _bak_conn.execute("PRAGMA integrity_check").fetchone()
+            if result and result[0] != "ok":
+                log.error("Backup integrity check FAILED: %s", result[0])
+        finally:
+            _bak_conn.close()
+    except Exception as exc:
+        log.warning("Backup integrity check error: %s", exc)
+
+    # Rotate: keep only the most recent _BACKUP_KEEP backups
+    backup_dir = os.path.dirname(src) or "."
+    base = os.path.basename(src)
+    backups = sorted(
+        (
+            f
+            for f in os.listdir(backup_dir)
+            if f.startswith(f"{base}.backup.") and f != os.path.basename(backup_path)
+        ),
+        reverse=True,
+    )
+    for old in backups[_BACKUP_KEEP - 1 :]:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(backup_dir, old))
+            log.info("Removed old backup: %s", old)
+
+
+async def _checkpoint_wal() -> None:
+    """Checkpoint the WAL file to prevent unbounded growth between monthly VACUUMs (H12)."""
+    try:
+        with get_connection() as conn:
+            result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if result:
+                log.info("WAL checkpoint: busy=%d, log=%d, checkpointed=%d", *result)
+    except Exception as exc:
+        log.warning("WAL checkpoint failed: %s", exc)
 
 
 async def _maybe_vacuum_database() -> None:
     """Run VACUUM on the first day of each month to reclaim WAL space."""
+    # Always checkpoint WAL on every maintenance run
+    await _checkpoint_wal()
+
     if datetime.now(UTC).day != 1:
         return
     try:

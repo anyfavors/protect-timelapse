@@ -13,11 +13,14 @@
 
   <!-- app.js MUST come before Alpine so alpine:init fires correctly -->
   <script src="/static/app.js?v={{ js_hash }}" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js" defer
+          integrity="sha384-9Ax3MmS9AClxJyd5/zafcXXjxmwFhZCdsT6HJoJjarvCaAkJlk5QDzjLJm+Wdx5F"
+          crossorigin="anonymous"></script>
   <link rel="stylesheet" href="/static/app.css?v={{ css_hash }}" />
+  <style>[x-cloak] { display: none !important; }</style>
 </head>
 
-<body class="bg-slate-950 text-slate-100 min-h-screen transition-colors duration-150" x-data="timelapseApp()">
+<body class="bg-slate-950 text-slate-100 min-h-screen transition-colors duration-150" x-data="timelapseApp()" x-cloak>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <!-- TOP NAV                                                                 -->
@@ -61,8 +64,9 @@
     <!-- System status indicators -->
     <div class="hidden sm:flex items-center gap-3 text-xs">
       <!-- NVR status -->
-      <div class="flex items-center gap-1.5"
-           :title="systemStatus?.nvr?.connected ? 'NVR connected (' + (systemStatus?.nvr?.camera_count || 0) + ' cameras)' : 'NVR disconnected: ' + (systemStatus?.nvr?.last_error || 'unknown')">
+      <div class="flex items-center gap-1.5" role="status"
+           :title="systemStatus?.nvr?.connected ? 'NVR connected (' + (systemStatus?.nvr?.camera_count || 0) + ' cameras)' : 'NVR disconnected: ' + (systemStatus?.nvr?.last_error || 'unknown')"
+           :aria-label="systemStatus?.nvr?.connected ? 'NVR connected' : 'NVR disconnected'">
         <span class="w-2 h-2 rounded-full inline-block"
               :class="systemStatus?.nvr?.connected ? 'bg-green-400' : 'bg-red-500 animate-pulse'"></span>
         <span :class="systemStatus?.nvr?.connected ? 'text-slate-400' : 'text-red-400'"
@@ -79,11 +83,21 @@
       <!-- Render worker -->
       <div class="flex items-center gap-1.5"
            x-show="systemStatus?.render_worker"
-           :title="systemStatus?.render_worker?.alive ? 'Render worker alive' : 'Render worker stalled!'">
+           :title="systemStatus?.render_worker?.alive ? 'Render worker alive' : 'Render worker stalled!'"
+           :aria-label="systemStatus?.render_worker?.alive ? 'Render worker healthy' : 'Render worker stalled'">
         <span class="w-2 h-2 rounded-full inline-block"
               :class="systemStatus?.render_worker?.alive ? 'bg-green-400' : 'bg-red-500 animate-pulse'"></span>
         <span class="text-slate-400"
               x-text="(systemStatus?.pending_renders || 0) > 0 ? systemStatus.pending_renders + ' queued' : 'Render'"></span>
+      </div>
+      <!-- WebSocket status (F1) -->
+      <div class="flex items-center gap-1.5"
+           x-show="wsStatus !== 'connected'"
+           :aria-label="wsStatus === 'reconnecting' ? 'Reconnecting to server' : 'Using polling fallback'">
+        <span class="w-2 h-2 rounded-full inline-block"
+              :class="wsStatus === 'reconnecting' ? 'bg-yellow-500 animate-pulse' : 'bg-orange-500'"></span>
+        <span class="text-yellow-400 text-xs"
+              x-text="wsStatus === 'reconnecting' ? 'Reconnecting…' : 'Polling'"></span>
       </div>
     </div>
     <!-- Disk gauge (click to open breakdown modal, hover tooltip shows breakdown UI4) -->
@@ -121,13 +135,14 @@
     <!-- Notification bell -->
     <div class="relative">
       <button @click="showNotifDropdown = !showNotifDropdown; if(showNotifDropdown) loadNotifications()"
-              class="relative p-1 text-slate-400 hover:text-slate-100 transition">
+              aria-label="Notifications" class="relative p-1 text-slate-400 hover:text-slate-100 transition">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                 d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
         </svg>
         <span x-show="unreadCount > 0"
               x-text="unreadCount"
+              role="status" aria-live="polite"
               class="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center leading-none"></span>
       </button>
 
@@ -143,7 +158,10 @@
             <button @click="clearAllNotifications(false)" class="text-xs text-red-400 hover:text-red-300">Clear all</button>
           </div>
         </div>
-        <template x-if="notifications.length === 0">
+        <template x-if="notificationsLoading">
+          <p class="text-slate-500 text-sm text-center py-4 animate-pulse">Loading…</p>
+        </template>
+        <template x-if="!notificationsLoading && notifications.length === 0">
           <p class="text-slate-500 text-sm text-center py-4">No notifications</p>
         </template>
         <template x-for="n in notifications.slice(0,20)" :key="n.id">
@@ -165,7 +183,7 @@
     </div>
 
     <!-- Dark mode toggle -->
-    <button @click="toggleDark()" title="Toggle dark/light mode"
+    <button @click="toggleDark()" title="Toggle dark/light mode" aria-label="Toggle dark/light mode"
             class="p-1 text-slate-400 hover:text-slate-100 transition">
       <!-- Sun (shown in dark mode — click to switch to light) -->
       <svg x-show="darkMode" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -180,7 +198,7 @@
     </button>
 
     <!-- Settings gear -->
-    <button @click="openSettings()" class="p-1 text-slate-400 hover:text-slate-100 transition">
+    <button @click="openSettings()" aria-label="Settings" class="p-1 text-slate-400 hover:text-slate-100 transition">
       <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
               d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
@@ -342,13 +360,13 @@
           <div class="relative bg-black aspect-video cursor-pointer overflow-hidden"
                @click="r.status === 'done' && openVideoPlayer(r.id)">
 
-            <!-- Done: show video element — lazy load, fetch metadata only on hover -->
+            <!-- Done: show video element — preload metadata so first frame shows as thumbnail -->
             <template x-if="r.status === 'done'">
               <video :src="`/api/renders/${r.id}/download`"
-                     preload="none"
+                     preload="metadata"
                      muted playsinline
                      class="w-full h-full object-contain"
-                     @mouseenter="$el.preload = 'metadata'; $el.muted = true; $el.play().catch(() => {})"
+                     @mouseenter="$el.muted = true; $el.play().catch(() => {})"
                      @mouseleave="$el.pause(); $el.currentTime = 0"
                      @error="$el.closest('.group').querySelector('[data-missing]')?.classList.remove('hidden')">
               </video>
@@ -802,9 +820,10 @@
     </div>
 
     <!-- Tabs (horizontally scrollable on mobile) -->
-    <div class="flex gap-1 mb-6 border-b border-slate-800 overflow-x-auto scrollbar-none -mx-4 px-4 sm:mx-0 sm:px-0">
+    <div role="tablist" aria-label="Project detail tabs" class="flex gap-1 mb-6 border-b border-slate-800 overflow-x-auto scrollbar-none -mx-4 px-4 sm:mx-0 sm:px-0">
       <template x-for="tab in ['overview','renders','bookmarks','quality']" :key="tab">
-        <button @click="loadDetailTab(tab)"
+        <button role="tab" @click="loadDetailTab(tab)"
+                :aria-selected="detailTab === tab"
                 :class="detailTab === tab ? 'border-b-2 border-blue-500 text-blue-400' : 'text-slate-500 hover:text-slate-300'"
                 class="px-4 py-2 text-sm capitalize transition flex-shrink-0"
                 x-text="tab.replace('_',' ')"></button>
@@ -841,6 +860,8 @@
                    :value="scrubberIndex"
                    @input="onScrubberInput($event)"
                    @click="onScrubberShiftClick($event)"
+                   aria-label="Frame scrubber"
+                   :aria-valuetext="scrubberTimestamp || 'No frame'"
                    class="w-full accent-blue-500 mb-2" />
             <!-- Hover preview floating thumbnail -->
             <template x-if="scrubberHoverFrame">
@@ -1193,7 +1214,10 @@
 
     <!-- Tab: Bookmarks -->
     <div x-show="detailTab === 'bookmarks'">
-      <template x-if="activeProjectBookmarks.length === 0">
+      <template x-if="detailTabLoading">
+        <p class="text-slate-500 text-sm animate-pulse">Loading…</p>
+      </template>
+      <template x-if="!detailTabLoading && activeProjectBookmarks.length === 0">
         <p class="text-slate-500 text-sm">No bookmarks yet. Use [B] on the scrubber to add one.</p>
       </template>
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -1520,8 +1544,10 @@
         <!-- Actions -->
         <div class="flex gap-3 pt-2">
           <button @click="submitForm()"
-                  class="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg font-medium text-sm transition">
-            <span x-text="formMode === 'create' ? 'Create Project' : 'Save Changes'"></span>
+                  :disabled="_submitting"
+                  class="flex-1 bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg font-medium text-sm transition disabled:opacity-50 disabled:cursor-not-allowed">
+            <span x-show="!_submitting" x-text="formMode === 'create' ? 'Create Project' : 'Save Changes'"></span>
+            <span x-show="_submitting">Saving…</span>
           </button>
           <button x-show="formMode === 'create'" @click="saveAsTemplate()"
                   class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-lg text-sm transition">
@@ -1795,9 +1821,10 @@
 
     <!-- Save button -->
     <div class="mt-6 max-w-5xl">
-      <button @click="saveSettings()"
-              class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg text-sm font-medium transition">
-        Save Settings
+      <button @click="saveSettings()" :disabled="settingsSaving"
+              class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed">
+        <span x-show="!settingsSaving">Save Settings</span>
+        <span x-show="settingsSaving" class="animate-pulse">Saving…</span>
       </button>
     </div>
 
@@ -1940,7 +1967,8 @@
      x-transition:enter-start="opacity-0"
      x-transition:enter-end="opacity-100"
      class="fixed inset-0 bg-black/60 flex items-center justify-center z-[100]">
-  <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl" @click.stop>
+  <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl" @click.stop
+       x-effect="if (showConfirmModal) $nextTick(() => trapFocus($el)); else releaseFocus($el)">
     <h2 class="font-bold text-slate-100 text-lg mb-2" x-text="confirmTitle"></h2>
     <p class="text-sm text-slate-300 mb-6" x-text="confirmMessage"></p>
     <div class="flex gap-3">

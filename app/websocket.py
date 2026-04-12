@@ -22,20 +22,40 @@ router = APIRouter(tags=["websocket"])
 _COALESCE_WINDOW = 0.25  # seconds
 
 
+_MAX_WS_CONNECTIONS = 50  # total across all IPs
+_MAX_WS_PER_IP = 5
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         self._clients: set[WebSocket] = set()
+        self._ip_counts: dict[str, int] = {}
         # Coalescing buffer: event_type -> list of payloads
         self._pending: dict[str, list[dict[str, Any]]] = {}
         self._flush_task: asyncio.Task[None] | None = None
 
     async def connect(self, ws: WebSocket) -> None:
+        # Enforce connection limits to prevent DoS (S10)
+        if len(self._clients) >= _MAX_WS_CONNECTIONS:
+            await ws.close(code=1013)  # Try Again Later
+            return
+        client_ip = ws.client.host if ws.client else "unknown"
+        if self._ip_counts.get(client_ip, 0) >= _MAX_WS_PER_IP:
+            await ws.close(code=1008)  # Policy Violation
+            return
         await ws.accept()
         self._clients.add(ws)
+        self._ip_counts[client_ip] = self._ip_counts.get(client_ip, 0) + 1
         log.debug("WS client connected (%d total)", len(self._clients))
 
     def disconnect(self, ws: WebSocket) -> None:
         self._clients.discard(ws)
+        client_ip = ws.client.host if ws.client else "unknown"
+        cnt = self._ip_counts.get(client_ip, 1) - 1
+        if cnt <= 0:
+            self._ip_counts.pop(client_ip, None)
+        else:
+            self._ip_counts[client_ip] = cnt
         log.debug("WS client disconnected (%d total)", len(self._clients))
 
     async def broadcast(self, event: str, payload: dict[str, Any]) -> None:

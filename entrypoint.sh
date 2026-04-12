@@ -2,9 +2,9 @@
 set -e
 # Ensure /data top-level dir is owned by appuser. NOT recursive — recursive
 # chown on millions of frames would stall startup for minutes.
-chown appuser:appuser /data 2>/dev/null || true
+chown appuser:appuser /data 2>/dev/null || echo "[entrypoint] WARN: could not chown /data (may be read-only or wrong UID)"
 # uiprotect writes config to $HOME/.config/ufp/
-chown -R appuser:appuser /home/appuser/.config 2>/dev/null || true
+chown -R appuser:appuser /home/appuser/.config 2>/dev/null || echo "[entrypoint] WARN: could not chown .config"
 export HOME=/home/appuser
 
 # Single worker: APScheduler and the render queue run inside the process.

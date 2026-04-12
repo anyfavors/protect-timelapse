@@ -16,7 +16,7 @@ from app.config import get_settings
 # Connection factory
 # ---------------------------------------------------------------------------
 
-_POOL_SIZE = 4
+_POOL_SIZE = 4  # overridden by Settings.db_pool_size at init time
 # Queue with maxsize enforces the cap without a racy qsize() check.
 _pool: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=_POOL_SIZE)
 _pool_db_path: str | None = None
@@ -470,6 +470,14 @@ def init_database() -> None:
     import os
 
     log = logging.getLogger("app.database")
+
+    # Apply configured pool size (H14)
+    global _POOL_SIZE, _pool
+    cfg_pool_size = get_settings().db_pool_size
+    if cfg_pool_size != _POOL_SIZE:
+        _POOL_SIZE = cfg_pool_size
+        _pool = queue.Queue(maxsize=_POOL_SIZE)
+        log.info("DB pool size set to %d", _POOL_SIZE)
 
     with get_connection() as conn:
         current: int = conn.execute("PRAGMA user_version").fetchone()[0]

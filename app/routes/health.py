@@ -5,11 +5,12 @@ import os
 import shutil
 import time
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
 
 from app.config import get_settings
 from app.database import _POOL_SIZE, _pool, get_connection
+from app.limiter import limiter
 from app.protect import protect_manager
 
 router = APIRouter(tags=["health"])
@@ -156,19 +157,36 @@ def system_status() -> dict:
     }
 
 
+# Whitelist of directories the /api/logs endpoint may read from (S2)
+_ALLOWED_LOG_DIRS = ("/var/log", "/data/logs", "/tmp")
+
+
 @router.get("/api/logs")
+@limiter.limit("10/minute")
 def get_logs(
+    request: Request,
     lines: int = Query(default=500, ge=1, le=5000),
     log_file: str | None = Query(default=None, description="Path to log file (optional)"),
 ) -> dict:
     """Tail recent application log lines. Uses log_file if provided, otherwise returns empty."""
-    if log_file and os.path.isfile(log_file):
-        try:
-            with open(log_file) as f:
-                tail = list(collections.deque(f, maxlen=lines))
-            return {"lines": [line.rstrip("\n") for line in tail], "source": log_file}
-        except OSError as exc:
-            return {"lines": [], "source": log_file, "error": str(exc)}
+    if log_file:
+        from pathlib import Path
+
+        resolved = str(Path(log_file).resolve())
+        # Path traversal guard: only allow files inside whitelisted directories (S2)
+        if not any(resolved.startswith(d) for d in _ALLOWED_LOG_DIRS):
+            return {
+                "lines": [],
+                "source": log_file,
+                "error": "Access denied: path outside allowed directories",
+            }
+        if os.path.isfile(resolved):
+            try:
+                with open(resolved) as f:
+                    tail = list(collections.deque(f, maxlen=lines))
+                return {"lines": [line.rstrip("\n") for line in tail], "source": log_file}
+            except OSError as exc:
+                return {"lines": [], "source": log_file, "error": str(exc)}
     # Fall back to journalctl if available (Docker/systemd environments)
     import subprocess
 

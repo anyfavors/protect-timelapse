@@ -25,7 +25,7 @@ _worker_task: asyncio.Task | None = None  # type: ignore[type-arg]
 # Track the currently-running render so it can be cancelled (F1)
 _active_render_id: int | None = None
 _active_proc: asyncio.subprocess.Process | None = None  # type: ignore[type-arg]
-_active_render_lock: asyncio.Lock | None = None  # initialised in start_render_worker()
+_active_render_lock: asyncio.Lock | None = None  # lazily initialised on first use
 
 # Pre-compiled regex for ffmpeg progress lines — avoids re-compiling on every stderr line
 _FRAME_RE = re.compile(r"frame=\s*(\d+)")
@@ -133,6 +133,18 @@ async def _process_next_render() -> int:
     render_id = render["id"]
     project_id = render["project_id"]
     settings = get_settings()
+
+    # Validate resolution format before ffmpeg sees it (B7)
+    resolution = render.get("resolution") or "1920x1080"
+    if not re.fullmatch(r"\d{1,5}x\d{1,5}", resolution):
+        log.error("Render id=%d: invalid resolution %r — skipping", render_id, resolution)
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE renders SET status='error', error_msg='Invalid resolution format' WHERE id=?",
+                (render_id,),
+            )
+            conn.commit()
+        return poll
 
     # Lock the row and stamp start time (for ETA calculation in UI)
     with get_connection() as conn:
@@ -315,8 +327,10 @@ async def _process_next_render() -> int:
         )
 
     except Exception as exc:
-        error_msg = str(exc)[:1000]
-        log.error("Render id=%d failed: %s", render_id, error_msg)
+        raw_error = str(exc)[:1000]
+        log.error("Render id=%d failed: %s", render_id, raw_error)
+        # Sanitise error message: strip internal file paths before storing/broadcasting (S9/S17)
+        error_msg = re.sub(r"(/data|/tmp|/app|/home)\S+", "<path>", raw_error)
         # Clean up partial output file on failure
         with contextlib.suppress(FileNotFoundError):
             os.remove(output_path)
@@ -586,8 +600,10 @@ def _build_ffmpeg_cmd(
     vf: str | None = None
     if watermark_path:
         chain = ",".join(filters) if filters else "null"
+        # Escape watermark path for ffmpeg filter syntax to prevent injection (S4)
+        wm_escaped = watermark_path.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
         filter_complex = (
-            f"[0:v]{chain}[main];movie={watermark_path}[wm];[main][wm]overlay=W-w-10:H-h-10[out]"
+            f"[0:v]{chain}[main];movie='{wm_escaped}'[wm];[main][wm]overlay=W-w-10:H-h-10[out]"
         )
     elif filters:
         vf = ",".join(filters)

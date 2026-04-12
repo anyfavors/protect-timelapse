@@ -65,8 +65,8 @@ def list_frames(
 ) -> list[dict]:
     _get_project_or_404(project_id)
 
-    # Build SELECT — allow field projection for lightweight scrubber index
-    allowed_fields = {
+    # Build SELECT — allow field projection for lightweight scrubber index (B14)
+    _ALLOWED_FIELDS = {
         "id",
         "project_id",
         "captured_at",
@@ -74,11 +74,15 @@ def list_frames(
         "thumbnail_path",
         "file_size",
         "is_dark",
+        "is_blurry",
+        "sharpness_score",
         "bookmark_note",
+        "file_hash",
     }
     if fields:
         requested = {f.strip() for f in fields.split(",")}
-        select_cols = ", ".join(requested & allowed_fields) or "*"
+        validated = sorted(requested & _ALLOWED_FIELDS)  # sorted for deterministic SQL
+        select_cols = ", ".join(validated) if validated else "*"
     else:
         select_cols = "*"
 
@@ -93,9 +97,25 @@ def list_frames(
         conditions.append(f"id {op} ?")
         params.append(after_id)
     if after:
+        try:
+            from datetime import datetime
+
+            datetime.fromisoformat(after)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid 'after' timestamp: {after}"
+            ) from exc
         conditions.append("captured_at >= ?")
         params.append(after)
     if before:
+        try:
+            from datetime import datetime
+
+            datetime.fromisoformat(before)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Invalid 'before' timestamp: {before}"
+            ) from exc
         conditions.append("captured_at <= ?")
         params.append(before)
     if bookmarked is True:
@@ -617,7 +637,6 @@ async def _run_gif_export(project_id: int) -> None:
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-        import contextlib
 
         with contextlib.suppress(FileNotFoundError):
             os.remove(concat_file)
