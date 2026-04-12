@@ -413,17 +413,20 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
             ).fetchall()
         return [r["output_path"] for r in rows if os.path.exists(r["output_path"])], 0
 
-    # Frame quality filter: daylight_only excludes dark frames (default),
-    # otherwise only exclude blurry frames.
     daylight_only = bool(render.get("daylight_only", 1))
-    quality_filter = VALID_FRAME_SQL if daylight_only else "(is_blurry IS NULL OR is_blurry = 0)"
+
+    # Always exclude blurry frames; daylight filtering is done post-query via astral
+    quality_filter = "(is_blurry IS NULL OR is_blurry = 0)"
+
+    # Need captured_at when daylight filtering is on
+    select_cols = "file_path, captured_at" if daylight_only else "file_path"
 
     # Standard / range / manual — JPEG frames
     if render_type == "range" and render.get("range_start") and render.get("range_end"):
         with get_connection() as conn:
             rows = conn.execute(
                 f"""
-                SELECT file_path FROM frames
+                SELECT {select_cols} FROM frames
                 WHERE project_id = ? AND {quality_filter}
                 AND captured_at BETWEEN ? AND ?
                 ORDER BY captured_at ASC
@@ -434,14 +437,18 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
         with get_connection() as conn:
             rows = conn.execute(
                 f"""
-                SELECT file_path FROM frames
+                SELECT {select_cols} FROM frames
                 WHERE project_id = ? AND {quality_filter}
                 ORDER BY captured_at ASC
                 """,
                 (project_id,),
             ).fetchall()
 
-    paths = [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+    # Apply solar daylight filter using astral sunrise/sunset times
+    if daylight_only:
+        paths = _filter_daylight_frames(rows)
+    else:
+        paths = [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
 
     # Cap frame list to prevent memory exhaustion on huge projects (#21)
     _MAX_FRAMES_PER_RENDER = 50_000
@@ -457,6 +464,76 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
         paths = paths[:_MAX_FRAMES_PER_RENDER]
 
     return paths, truncated_from
+
+
+def _filter_daylight_frames(rows: list) -> list[str]:
+    """Filter frame rows to only include those captured during solar daylight.
+
+    Uses astral sunrise/sunset calculation based on configured lat/lon/tz.
+    Caches sunrise/sunset per date so the astral calculation is done at most
+    once per unique date in the frame set (not per frame).
+    """
+    from app.capture import _get_location
+
+    try:
+        from astral import LocationInfo
+        from astral.sun import sun
+    except ImportError:
+        log.warning("astral not installed — daylight filter falling back to is_dark column")
+        return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+
+    tz_name, lat, lon = _get_location()
+    if not lat or not lon:
+        log.warning("No lat/lon configured — daylight filter disabled")
+        return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+
+    city = LocationInfo(
+        name="custom", region="custom", timezone=tz_name, latitude=lat, longitude=lon
+    )
+
+    # Cache sunrise/sunset per date to avoid redundant astral calls
+    sun_cache: dict[str, tuple[datetime, datetime]] = {}
+    paths: list[str] = []
+
+    for row in rows:
+        file_path = row["file_path"]
+        if not os.path.exists(file_path):
+            continue
+
+        captured_at_str = row["captured_at"]
+        if not captured_at_str:
+            continue
+
+        try:
+            ts = datetime.fromisoformat(captured_at_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+        except (ValueError, TypeError):
+            continue
+
+        date_key = ts.strftime("%Y-%m-%d")
+        if date_key not in sun_cache:
+            try:
+                s = sun(city.observer, date=ts.date(), tzinfo=tz_name)
+                sun_cache[date_key] = (s["sunrise"], s["sunset"])
+            except Exception:
+                # Polar day/night — include frame by default
+                sun_cache[date_key] = (
+                    ts.replace(hour=0, minute=0),
+                    ts.replace(hour=23, minute=59),
+                )
+
+        sunrise, sunset = sun_cache[date_key]
+        if sunrise <= ts <= sunset:
+            paths.append(file_path)
+
+    log.info(
+        "Daylight filter: %d/%d frames are in daylight (%d unique dates)",
+        len(paths),
+        len(rows),
+        len(sun_cache),
+    )
+    return paths
 
 
 _QUALITY_MAP = {
