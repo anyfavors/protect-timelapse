@@ -83,6 +83,8 @@ document.addEventListener('alpine:init', () => {
     renderLabel: '',
     renderStabilize: false,
     renderColorGrade: 'none',
+    renderFrameStep: 1,
+    renderDaylightOnly: true,
     renderPresets: [],
 
     // Scrubber quality filter
@@ -121,6 +123,7 @@ document.addEventListener('alpine:init', () => {
       // Real-time render estimate: update whenever framerate or resolution changes (UX5)
       this.$watch('renderFramerate', () => this.updateRenderEstimate(this.renderFramerate));
       this.$watch('renderResolution', () => this.updateRenderEstimate(this.renderFramerate));
+      this.$watch('renderFrameStep', () => this.updateRenderEstimate(this.renderFramerate));
       this.$watch('view', v => { if (v !== 'create_project') this.stopPreviewPolling(); });
     },
 
@@ -781,6 +784,8 @@ document.addEventListener('alpine:init', () => {
       this.renderFrameBlend = !!preset.frame_blend;
       this.renderStabilize = !!preset.stabilize;
       this.renderColorGrade = preset.color_grade;
+      this.renderFrameStep = preset.frame_step || 1;
+      this.renderDaylightOnly = preset.daylight_only !== undefined ? preset.daylight_only : true;
       this.toast(`Preset "${preset.name}" applied`);
     },
 
@@ -800,6 +805,8 @@ document.addEventListener('alpine:init', () => {
         frame_blend: this.renderFrameBlend,
         stabilize: this.renderStabilize,
         color_grade: this.renderColorGrade,
+        frame_step: this.renderFrameStep,
+        daylight_only: this.renderDaylightOnly,
       };
       const r = await this.api('/api/presets', 'POST', payload);
       if (r) {
@@ -859,6 +866,8 @@ document.addEventListener('alpine:init', () => {
         frame_blend: this.renderFrameBlend,
         stabilize: this.renderStabilize,
         color_grade: this.renderColorGrade,
+        frame_step: this.renderFrameStep,
+        daylight_only: this.renderDaylightOnly,
       };
       if (label) payload.label = label;
       if (!renderType && this.rangeStart && this.rangeEnd) {
@@ -1113,11 +1122,13 @@ document.addEventListener('alpine:init', () => {
     lastRenderEstimate: null,
 
     updateRenderEstimate(framerate = 30) {
-      const fc = this.activeProject?.frame_count || 0;
+      const totalFc = this.activeProject?.frame_count || 0;
+      const step = Math.max(1, this.renderFrameStep || 1);
+      const fc = Math.ceil(totalFc / step);
       const dur = Math.round(fc / framerate);
-      this.lastRenderEstimate = fc > 0
-        ? `~${dur}s video · ${fc} frames`
-        : 'No frames yet';
+      let est = fc > 0 ? `~${dur}s video · ${fc.toLocaleString()} frames` : 'No frames yet';
+      if (step > 1 && totalFc > 0) est += ` (every ${step}${step===2?'nd':step===3?'rd':'th'} frame)`;
+      this.lastRenderEstimate = est;
     },
 
     // ── Render auto-refresh (UX10) ────────────────────────────────────────

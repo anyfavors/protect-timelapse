@@ -442,6 +442,14 @@ def _migrate_v14(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v15(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, "ALTER TABLE renders ADD COLUMN frame_step INTEGER NOT NULL DEFAULT 1")
+
+
+def _migrate_v16(conn: sqlite3.Connection) -> None:
+    _migrate_alter(conn, "ALTER TABLE renders ADD COLUMN daylight_only INTEGER NOT NULL DEFAULT 1")
+
+
 MIGRATIONS: dict[int, object] = {
     0: _migrate_v0,
     1: _migrate_v1,
@@ -458,6 +466,8 @@ MIGRATIONS: dict[int, object] = {
     12: _migrate_v12,
     13: _migrate_v13,
     14: _migrate_v14,
+    15: _migrate_v15,
+    16: _migrate_v16,
 }
 
 

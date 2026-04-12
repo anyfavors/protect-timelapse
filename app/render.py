@@ -188,6 +188,20 @@ async def _process_next_render() -> int:
         if not frame_paths:
             raise ValueError("No frames found for render")
 
+        # Apply user-requested frame step (use every Nth frame).
+        # Done before ffmpeg to reduce I/O and concat file size.
+        frame_step = max(1, int(render.get("frame_step") or 1))
+        if frame_step > 1:
+            frame_paths = frame_paths[::frame_step]
+            log.info(
+                "Render id=%d: frame_step=%d → %d frames after stepping",
+                render_id,
+                frame_step,
+                len(frame_paths),
+            )
+            if not frame_paths:
+                raise ValueError(f"No frames remaining after frame_step={frame_step}")
+
         if truncated_from:
             warn_msg = (
                 f"WARNING: project has {truncated_from:,} frames but only the first "
@@ -399,13 +413,18 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
             ).fetchall()
         return [r["output_path"] for r in rows if os.path.exists(r["output_path"])], 0
 
+    # Frame quality filter: daylight_only excludes dark frames (default),
+    # otherwise only exclude blurry frames.
+    daylight_only = bool(render.get("daylight_only", 1))
+    quality_filter = VALID_FRAME_SQL if daylight_only else "(is_blurry IS NULL OR is_blurry = 0)"
+
     # Standard / range / manual — JPEG frames
     if render_type == "range" and render.get("range_start") and render.get("range_end"):
         with get_connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND {VALID_FRAME_SQL}
+                WHERE project_id = ? AND {quality_filter}
                 AND captured_at BETWEEN ? AND ?
                 ORDER BY captured_at ASC
                 """,
@@ -416,7 +435,7 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
             rows = conn.execute(
                 f"""
                 SELECT file_path FROM frames
-                WHERE project_id = ? AND {VALID_FRAME_SQL}
+                WHERE project_id = ? AND {quality_filter}
                 ORDER BY captured_at ASC
                 """,
                 (project_id,),
@@ -834,7 +853,9 @@ async def _monitor_progress(  # pragma: no cover
 # -------------------------------------------------------------------------
 
 
-def estimate_render(project_id: int, framerate: int, render_type: str = "manual") -> dict:
+def estimate_render(
+    project_id: int, framerate: int, render_type: str = "manual", frame_step: int = 1
+) -> dict:
     """Return estimated render duration and output file size.
 
     Applies the same is_dark + is_blurry filters as the actual render so
@@ -850,14 +871,19 @@ def estimate_render(project_id: int, framerate: int, render_type: str = "manual"
     frame_count = row["cnt"] if row else 0
     avg_frame_size = row["avg_size"] or 200_000  # default 200 KB
 
-    duration_seconds = frame_count / max(framerate, 1)
+    # Account for frame_step: every Nth frame means fewer frames in output
+    step = max(1, frame_step)
+    effective_frames = math.ceil(frame_count / step) if frame_count > 0 else 0
+
+    duration_seconds = effective_frames / max(framerate, 1)
     # Empirical baseline: ~0.02s render time per frame at -preset fast
-    render_time = int(frame_count * 0.02)
+    render_time = int(effective_frames * 0.02)
     # CRF 23 H.264 typically ~15% of source JPEG size
-    file_size_bytes = int(frame_count * avg_frame_size * 0.15)
+    file_size_bytes = int(effective_frames * avg_frame_size * 0.15)
 
     return {
-        "frame_count": frame_count,
+        "frame_count": effective_frames,
+        "total_source_frames": frame_count,
         "estimated_duration_seconds": int(duration_seconds),
         "estimated_render_time_seconds": render_time,
         "estimated_file_size_bytes": file_size_bytes,

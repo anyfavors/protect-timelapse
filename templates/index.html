@@ -458,6 +458,7 @@
                   <span class="capitalize" x-text="r.render_type?.replace('_',' ')"></span>
                   <template x-if="r.resolution"><span x-text="' · ' + r.resolution"></span></template>
                   <template x-if="r.framerate"><span x-text="' · ' + r.framerate + ' fps'"></span></template>
+                  <template x-if="r.frame_step > 1"><span class="text-blue-400" x-text="' · step ' + r.frame_step"></span></template>
                 </p>
               </div>
               <!-- Status badge (non-done) -->
@@ -1004,6 +1005,28 @@
           </div>
         </div>
 
+        <!-- Frame step (use every Nth frame) -->
+        <div>
+          <label class="block text-xs text-slate-500 mb-1.5">Frame Step
+            <span class="text-slate-600">— use every Nth frame</span>
+          </label>
+          <div class="flex items-center gap-3">
+            <div class="flex flex-wrap gap-1.5">
+              <template x-for="fs in [1, 2, 3, 5, 10]" :key="fs">
+                <button @click="renderFrameStep = fs"
+                        :class="renderFrameStep === fs ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+                        class="px-3 py-1.5 rounded-lg text-xs transition">
+                  <span x-text="fs === 1 ? 'All' : 'Every ' + fs + (fs===2?'nd':fs===3?'rd':'th')"></span>
+                </button>
+              </template>
+            </div>
+            <input type="number" x-model.number="renderFrameStep" min="1" max="100"
+                   class="w-16 bg-slate-700 border border-slate-600 text-slate-200 text-xs rounded-lg px-2 py-1.5 text-center focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums" />
+          </div>
+          <p class="text-xs text-slate-600 mt-1" x-show="renderFrameStep > 1"
+             x-text="'Captured every ' + (activeProject?.interval_seconds || 60) + 's → effective interval: ' + ((activeProject?.interval_seconds || 60) * renderFrameStep) + 's'"></p>
+        </div>
+
         <!-- Resolution presets -->
         <div>
           <label class="block text-xs text-slate-500 mb-1.5">Resolution</label>
@@ -1070,8 +1093,12 @@
           </div>
         </div>
 
-        <!-- Toggles: frame blend + stabilize -->
+        <!-- Toggles: daylight, frame blend, stabilize -->
         <div class="flex flex-wrap gap-4">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="renderDaylightOnly" class="accent-yellow-500" />
+            <span class="text-xs text-slate-300">Daylight only <span class="text-slate-500">(skip dark frames)</span></span>
+          </label>
           <label class="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" x-model="renderFrameBlend" class="accent-blue-500" />
             <span class="text-xs text-slate-300">Motion blend <span class="text-slate-500">(cinematic)</span></span>
@@ -1089,11 +1116,15 @@
                   d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
           </svg>
           <span>
-            <span x-text="activeProject ? activeProject.frame_count.toLocaleString() : '—'"></span> frames
+            <span x-text="activeProject ? Math.ceil(activeProject.frame_count / Math.max(1, renderFrameStep)).toLocaleString() : '—'"></span> frames
+            <template x-if="renderFrameStep > 1">
+              <span class="text-blue-400">(every <span x-text="renderFrameStep"></span>
+                of <span x-text="activeProject ? activeProject.frame_count.toLocaleString() : '—'"></span>)</span>
+            </template>
             at <span x-text="renderFramerate"></span> fps =
             <strong class="text-slate-200"
                     x-text="activeProject && renderFramerate
-                      ? (() => { const s = Math.round(activeProject.frame_count / renderFramerate); const m = Math.floor(s/60); const sec = s%60; return m > 0 ? m+'m '+sec+'s' : sec+'s'; })()
+                      ? (() => { const fc = Math.ceil(activeProject.frame_count / Math.max(1, renderFrameStep)); const s = Math.round(fc / renderFramerate); const m = Math.floor(s/60); const sec = s%60; return m > 0 ? m+'m '+sec+'s' : sec+'s'; })()
                       : '—'">
             </strong>
             video

@@ -33,6 +33,16 @@ class RenderCreate(BaseModel):
     stabilize: bool = False
     color_grade: str = Field(default="none", pattern="^(none|neutral|warm|cool|cinematic)$")
     priority: int = Field(default=5, ge=1, le=10, description="Queue priority 1 (low) to 10 (high)")
+    frame_step: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+        description="Use every Nth frame (1 = all frames, 2 = every other, etc.)",
+    )
+    daylight_only: bool = Field(
+        default=True,
+        description="Exclude dark/night frames from the render",
+    )
 
 
 def _get_render_or_404(render_id: int) -> dict:
@@ -67,7 +77,9 @@ def create_render(request: Request, payload: RenderCreate) -> dict:
                 detail=f"A {payload.render_type} render is already pending for this project",
             )
 
-    estimate = estimate_render(payload.project_id, payload.framerate, payload.render_type)
+    estimate = estimate_render(
+        payload.project_id, payload.framerate, payload.render_type, payload.frame_step
+    )
 
     with get_connection() as conn:
         cur = conn.execute(
@@ -76,8 +88,9 @@ def create_render(request: Request, payload: RenderCreate) -> dict:
                 project_id, framerate, resolution, render_type, label,
                 range_start, range_end,
                 estimated_duration_seconds, estimated_file_size_bytes,
-                quality, flicker_reduction, frame_blend, stabilize, color_grade, priority
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                quality, flicker_reduction, frame_blend, stabilize, color_grade,
+                priority, frame_step, daylight_only
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload.project_id,
@@ -95,6 +108,8 @@ def create_render(request: Request, payload: RenderCreate) -> dict:
                 int(payload.stabilize),
                 payload.color_grade,
                 payload.priority,
+                payload.frame_step,
+                int(payload.daylight_only),
             ),
         )
         conn.commit()
@@ -297,6 +312,8 @@ def compare_renders(render_id_a: int, render_id_b: int) -> dict:
             "color_grade": r.get("color_grade"),
             "frame_blend": bool(r.get("frame_blend")),
             "stabilize": bool(r.get("stabilize")),
+            "frame_step": r.get("frame_step", 1),
+            "daylight_only": bool(r.get("daylight_only", 1)),
             "file_size_bytes": r.get("file_size"),
             "estimated_duration_seconds": r.get("estimated_duration_seconds"),
             "completed_at": r.get("completed_at"),
