@@ -293,14 +293,29 @@ async def _process_next_render() -> int:
             total_frames,
         )
 
+        # Broadcast initial state so UI immediately shows total_frames
+        from app.websocket import broadcast
+
+        await broadcast(
+            "render_progress",
+            {
+                "render_id": render_id,
+                "progress_pct": 0,
+                "current_frame": 0,
+                "total_frames": total_frames,
+                "speed": "",
+                "eta_seconds": None,
+                "elapsed_seconds": 0,
+            },
+        )
+
         # Progress monitoring (pass monotonic start time for ETA calculation)
         _render_monotonic_start = time.monotonic()
-        await _monitor_progress(
+        stderr_bytes = await _monitor_progress(
             proc, render_id, total_frames, adaptive_timeout, started_at=_render_monotonic_start
         )
 
         if proc.returncode != 0:
-            stderr_bytes = await proc.stderr.read() if proc.stderr else b""  # type: ignore[union-attr]
             raise RuntimeError(
                 f"ffmpeg exited {proc.returncode}: {stderr_bytes.decode(errors='replace')[:500]}"
             )
@@ -445,10 +460,10 @@ def _get_frame_paths(render: dict) -> tuple[list[str], int]:
             ).fetchall()
 
     # Apply solar daylight filter using astral sunrise/sunset times
-    if daylight_only:
-        paths = _filter_daylight_frames(rows)
-    else:
-        paths = [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+    paths = _filter_daylight_frames(rows) if daylight_only else [r["file_path"] for r in rows]
+
+    # Verify files exist on disk (after all filtering)
+    paths = [p for p in paths if os.path.exists(p)]
 
     # Cap frame list to prevent memory exhaustion on huge projects (#21)
     _MAX_FRAMES_PER_RENDER = 50_000
@@ -473,18 +488,31 @@ def _filter_daylight_frames(rows: list) -> list[str]:
     Caches sunrise/sunset per date so the astral calculation is done at most
     once per unique date in the frame set (not per frame).
     """
-    from app.capture import _get_location
-
     try:
         from astral import LocationInfo
         from astral.sun import sun
     except ImportError:
-        log.warning("astral not installed — daylight filter falling back to is_dark column")
+        log.warning("astral not installed — daylight filter disabled, using all frames")
         return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
 
-    tz_name, lat, lon = _get_location()
-    if not lat or not lon:
-        log.warning("No lat/lon configured — daylight filter disabled")
+    try:
+        from app.capture import _get_location
+
+        tz_name, lat, lon = _get_location()
+    except Exception as exc:
+        log.warning("Failed to get location for daylight filter: %s — using all frames", exc)
+        return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+
+    # lat/lon can be 0 near the equator/prime meridian — only skip if truly None
+    if lat is None or lon is None:
+        log.warning("No lat/lon configured — daylight filter disabled, using all frames")
+        return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (ValueError, TypeError):
+        log.warning("Invalid lat/lon (%r, %r) — daylight filter disabled", lat, lon)
         return [r["file_path"] for r in rows if os.path.exists(r["file_path"])]
 
     city = LocationInfo(
@@ -494,12 +522,10 @@ def _filter_daylight_frames(rows: list) -> list[str]:
     # Cache sunrise/sunset per date to avoid redundant astral calls
     sun_cache: dict[str, tuple[datetime, datetime]] = {}
     paths: list[str] = []
+    skipped = 0
 
     for row in rows:
         file_path = row["file_path"]
-        if not os.path.exists(file_path):
-            continue
-
         captured_at_str = row["captured_at"]
         if not captured_at_str:
             continue
@@ -517,20 +543,22 @@ def _filter_daylight_frames(rows: list) -> list[str]:
                 s = sun(city.observer, date=ts.date(), tzinfo=tz_name)
                 sun_cache[date_key] = (s["sunrise"], s["sunset"])
             except Exception:
-                # Polar day/night — include frame by default
+                # Polar day/night or astral error — include all frames for this date
                 sun_cache[date_key] = (
-                    ts.replace(hour=0, minute=0),
-                    ts.replace(hour=23, minute=59),
+                    ts.replace(hour=0, minute=0, second=0),
+                    ts.replace(hour=23, minute=59, second=59),
                 )
 
         sunrise, sunset = sun_cache[date_key]
         if sunrise <= ts <= sunset:
             paths.append(file_path)
+        else:
+            skipped += 1
 
     log.info(
-        "Daylight filter: %d/%d frames are in daylight (%d unique dates)",
+        "Daylight filter: kept %d, skipped %d night frames (%d unique dates)",
         len(paths),
-        len(rows),
+        skipped,
         len(sun_cache),
     )
     return paths
@@ -795,13 +823,15 @@ async def _monitor_progress(  # pragma: no cover
     total_frames: int,
     timeout_seconds: int,
     started_at: float | None = None,
-) -> None:
+) -> bytes:
     """Read ffmpeg ``-progress pipe:1`` output from stdout for reliable progress.
 
     ffmpeg writes ``\\r``-delimited lines to stderr (unreadable from a pipe), but
     ``-progress pipe:1`` emits clean ``\\n``-delimited key=value pairs to stdout.
 
     Also detects stalls (no progress for _STALL_TIMEOUT_SECONDS) and kills ffmpeg.
+
+    Returns captured stderr bytes for error reporting.
     """
     last_update = 0.0
     last_pct = -1
@@ -809,6 +839,7 @@ async def _monitor_progress(  # pragma: no cover
     current_speed = ""
     last_progress_change = time.monotonic()
     stalled = False
+    stderr_chunks: list[bytes] = []
 
     async def _drain_stderr() -> None:
         """Consume stderr in chunks so the pipe buffer doesn't block ffmpeg.
@@ -823,6 +854,7 @@ async def _monitor_progress(  # pragma: no cover
             chunk = await proc.stderr.read(65536)
             if not chunk:
                 break
+            stderr_chunks.append(chunk)
 
     async def _read_progress() -> None:
         nonlocal last_update, last_pct, current_frame, current_speed
@@ -923,6 +955,8 @@ async def _monitor_progress(  # pragma: no cover
 
     if stalled:
         raise RuntimeError(f"Render stalled: no ffmpeg progress for {_STALL_TIMEOUT_SECONDS}s")
+
+    return b"".join(stderr_chunks)
 
 
 # -------------------------------------------------------------------------
