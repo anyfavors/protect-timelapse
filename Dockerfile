@@ -1,5 +1,5 @@
 # ── Stage 1: Compile Tailwind CSS + minify app.js ───────────────────────────
-FROM node:25-slim AS css-build
+FROM node:26-slim AS css-build
 
 WORKDIR /src
 
