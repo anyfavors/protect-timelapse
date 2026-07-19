@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -52,7 +52,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -74,7 +74,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -93,15 +93,15 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache Trivy DB
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .trivy
           key: ${{ runner.os }}-trivy-${{ github.sha }}
           restore-keys: ${{ runner.os }}-trivy-
       - name: Run Trivy (filesystem)
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -132,14 +132,14 @@ jobs:
     outputs:
       version: ${{ steps.semver.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Calculate semantic version
         id: semver
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        uses: PaulHatch/semantic-version@v6.0.2
+        uses: PaulHatch/semantic-version@v6.0.3
         with:
           branch: main
           tag_prefix: v
@@ -226,13 +226,13 @@ jobs:
       security-events: write
     steps:
       - name: Cache Trivy DB
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .trivy
           key: ${{ runner.os }}-trivy-${{ github.sha }}
           restore-keys: ${{ runner.os }}-trivy-
       - name: Run Trivy (image)
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.version }}
           format: sarif
